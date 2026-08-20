@@ -39,6 +39,15 @@ async function main() {
     getProxyPort,
     getClaudeProxyBaseUrl,
     PROXY_IDLE_TIMEOUT_SECONDS,
+    formatModelFallbackNote,
+    formatModelRefusalNote,
+    formatModelMismatchNote,
+    formatNotificationNote,
+    formatSessionModelNote,
+    modelsMatch,
+    noticeChannel,
+    renderModelNotice,
+    renderModelNoticeBlock,
   } = await import("../src/proxy.ts");
 
   // Auth env stripping
@@ -1133,6 +1142,221 @@ async function main() {
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
 
+      // Model notes: formatters.
+      {
+        const sessionNote = formatModelFallbackNote({
+          original_model: "claude-fable-5",
+          fallback_model: "claude-opus-4-8",
+          api_refusal_category: "cyber",
+          direction: "sticky",
+          scope: "session",
+        });
+        assert.equal(
+          sessionNote,
+          "\n[model switched] claude-fable-5 → claude-opus-4-8 · safeguards [cyber] · sticky\n",
+        );
+        assert.match(
+          formatModelFallbackNote({ original_model: "a", fallback_model: "b", scope: "local" }),
+          /this response only/,
+        );
+        // Real wire event (CLI 2.1.197–2.1.237): snake_case, no scope, banner
+        // in `content`. Only the models and category are shown.
+        const realNote = formatModelFallbackNote({
+          type: "system",
+          subtype: "model_refusal_fallback",
+          trigger: "refusal",
+          direction: "retry",
+          original_model: "claude-fable-5",
+          fallback_model: "claude-opus-4-8",
+          api_refusal_category: "cyber",
+          api_refusal_explanation: null,
+          content: "Fable 5's safeguards flagged this message. Switched to Opus 4.8.",
+        });
+        assert.equal(realNote, "\n[model switched] claude-fable-5 → claude-opus-4-8 · safeguards [cyber]\n");
+        // camelCase (CLI transcript shape) is accepted too.
+        assert.match(
+          formatModelFallbackNote({ originalModel: "claude-fable-5", fallbackModel: "claude-opus-5" }),
+          /claude-fable-5 → claude-opus-5/,
+        );
+        const explained = formatModelFallbackNote({
+          original_model: "claude-fable-5",
+          fallback_model: "claude-opus-4-8",
+          api_refusal_explanation: "Working exploit code against a named target.",
+        });
+        assert.match(explained, /\nReason given by the API: Working exploit code/);
+
+        assert.equal(
+          formatModelRefusalNote({ original_model: "claude-fable-5", api_refusal_category: "bio" }),
+          "\n[model refused] claude-fable-5 · safeguards [bio] · no fallback, turn ended with an error\n",
+        );
+        assert.equal(
+          formatModelMismatchNote("claude-opus-4-8", "claude-fable-5"),
+          "\n[model mismatch] answered by claude-opus-4-8, you selected claude-fable-5\n",
+        );
+        assert.equal(
+          formatSessionModelNote("claude-opus-4-8", "fable"),
+          "\n[model mismatch] answer starts on claude-opus-4-8, you selected fable\n",
+        );
+
+        // Model ids: prefix/date-insensitive; a bare alias matches its versions.
+        assert.equal(modelsMatch("claude-haiku-4-5-20251001", "claude-haiku-4-5"), true);
+        assert.equal(modelsMatch("fable", "claude-fable-5"), true);
+
+        assert.equal(modelsMatch("opus", "claude-opus-4-8"), true);
+        assert.equal(modelsMatch("claude-fable-5", "claude-opus-4-8"), false);
+        assert.equal(modelsMatch("claude-opus-5", "claude-opus-4-8"), false);
+
+        // CLI notifications: medium plain, high tagged, low and empty dropped.
+        assert.equal(
+          formatNotificationNote({ text: "Opus 4.7 is deprecated", priority: "medium" }),
+          "\n[notice] Opus 4.7 is deprecated\n",
+        );
+        assert.equal(
+          formatNotificationNote({ text: "Session limit nearly reached", priority: "high" }),
+          "\n[notice:high] Session limit nearly reached\n",
+        );
+        assert.equal(formatNotificationNote({ text: "Try /btw", priority: "low" }), null);
+        assert.equal(formatNotificationNote({ priority: "high" }), null);
+
+        // Channel: content by default, reasoning via env.
+        const prevNotes = process.env.OPENCODE_CLAUDE_MODEL_NOTES;
+        delete process.env.OPENCODE_CLAUDE_MODEL_NOTES;
+        assert.equal(noticeChannel(), "content");
+        process.env.OPENCODE_CLAUDE_MODEL_NOTES = "reasoning";
+        assert.equal(noticeChannel(), "reasoning");
+        if (prevNotes === undefined) delete process.env.OPENCODE_CLAUDE_MODEL_NOTES;
+        else process.env.OPENCODE_CLAUDE_MODEL_NOTES = prevNotes;
+
+        // Rendering: blockquote callout for content, untouched for reasoning.
+        assert.equal(
+          renderModelNotice(realNote, "content"),
+          "\n\n> ⚠️ **model switched:** claude-fable-5 → claude-opus-4-8 · safeguards [cyber]\n\n",
+        );
+        assert.match(renderModelNotice(explained, "content"), /\n> _Reason given by the API: /);
+        assert.equal(renderModelNotice(sessionNote, "reasoning"), sessionNote);
+        assert.equal(renderModelNotice("\n\n", "content"), "");
+
+        // One note per turn: switch > refusal > session > answer, first wins.
+        const answerNote = formatModelMismatchNote("claude-opus-4-8", "claude-fable-5");
+        const block = renderModelNoticeBlock(
+          [
+            { tag: "answer", text: answerNote },
+            { tag: "session", text: formatSessionModelNote("S1", "fable") },
+            { tag: "switch", text: sessionNote },
+            { tag: "session", text: formatSessionModelNote("S2", "fable") },
+          ],
+          "content",
+        );
+        assert.match(block, /model switched:/);
+        assert.doesNotMatch(block, /S1|S2|answered by/);
+        assert.equal(renderModelNoticeBlock([], "content"), "");
+        assert.equal(
+          renderModelNoticeBlock([{ tag: "answer", text: answerNote }], "reasoning"),
+          answerNote,
+        );
+      }
+
+      // Model notes through the proxy.
+      const mockEvents = (events: unknown[]) =>
+        setClaudeQueryStarter(async () => ({
+          stream: (async function* () {
+            for (const ev of events) yield ev;
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        }));
+      const askFable = (session: string, stream: boolean) =>
+        fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": session,
+            "x-opencode-claude-directory": "/data/projects/infra",
+          },
+          body: JSON.stringify({
+            model: "fable",
+            stream,
+            messages: [{ role: "user", content: "anything" }],
+          }),
+        });
+      const textDelta = (text: string) => ({
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+      });
+      const assistantFrom = (model: string, text: string) => ({
+        type: "assistant",
+        message: {
+          id: `msg_${text}`,
+          model,
+          role: "assistant",
+          content: [{ type: "text", text }],
+          usage: { input_tokens: 5, output_tokens: 1 },
+        },
+      });
+      const result = {
+        type: "result",
+        is_error: false,
+        total_cost_usd: 0.001,
+        usage: { input_tokens: 5, output_tokens: 1 },
+      };
+
+      // Buffered: a fallback event becomes a callout after the answer text;
+      // the fallback model's own message does not add a second note; CLI
+      // notifications go to the reasoning trace (low priority stays silent).
+      mockEvents([
+        { type: "system", subtype: "init", session_id: "s-fb", model: "claude-fable-5" },
+        {
+          type: "system",
+          subtype: "model_refusal_fallback",
+          direction: "retry",
+          scope: "session",
+          original_model: "claude-fable-5",
+          fallback_model: "claude-opus-4-8",
+          api_refusal_category: "cyber",
+          content: "Switched to Opus",
+        },
+        textDelta("FALLBACK_ANSWER"),
+        assistantFrom("claude-opus-4-8", "FALLBACK_ANSWER"),
+        { type: "system", subtype: "notification", text: "Session limit nearly reached", priority: "high" },
+        { type: "system", subtype: "notification", text: "Try /btw", priority: "low" },
+        result,
+      ]);
+      const fbRes = await askFable("smoke-mock-fallback", false);
+      assert.equal(fbRes.status, 200);
+      const fbJson = (await fbRes.json()) as {
+        choices?: Array<{ message?: Record<string, unknown> }>;
+      };
+      const fbMsg = fbJson.choices?.[0]?.message ?? {};
+      const fbContent = String(fbMsg.content ?? "");
+      const fbReasoning = String(fbMsg.reasoning_content ?? "");
+      assert.match(
+        fbContent,
+        /^FALLBACK_ANSWER\n\n> ⚠️ \*\*model switched:\*\* claude-fable-5 → claude-opus-4-8 · safeguards \[cyber\]\n/,
+      );
+      assert.doesNotMatch(fbContent + fbReasoning, /Switched to Opus|answered by|Try \/btw/);
+      assert.match(fbReasoning, /\[notice:high\] Session limit nearly reached/);
+      assert.doesNotMatch(fbContent, /Session limit/);
+
+      // Streaming: a quiet switch (no fallback event) is caught from
+      // `assistant.message.model`, announced once, as a content chunk.
+      mockEvents([
+        { type: "system", subtype: "init", session_id: "s-mm", model: "claude-fable-5" },
+        assistantFrom("claude-opus-4-8", "STREAMED"),
+        textDelta("STREAMED"),
+        assistantFrom("claude-opus-4-8", "STREAMED2"),
+        result,
+      ]);
+      const mmStream = await askFable("smoke-mock-mismatch-stream", true);
+      assert.equal(mmStream.status, 200);
+      const mmSse = await mmStream.text();
+      assert.match(mmSse, /STREAMED/);
+      assert.equal(
+        mmSse.match(/answered by claude-opus-4-8, you selected claude-fable-5/g)?.length ?? 0,
+        1,
+      );
+      assert.match(mmSse, /"content":"[^"]*answered by claude-opus-4-8/);
+      assert.doesNotMatch(mmSse, /reasoning_content[^\n]*answered by/);
       // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
       // must answer with a truthful HTTP 429 (not a fake-200 error stream),
       // flip the store to limited, and fail fast on the next request.

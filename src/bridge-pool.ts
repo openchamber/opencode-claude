@@ -19,6 +19,10 @@ export type ParkedBridge = {
   pendingTools: Map<string, ParkedToolCall>;
   /** SDK assistant messages whose usage was already reported to OpenCode. */
   seenAssistantUsageIds: Set<string>;
+  /** Model the user was last told is answering (init model, then fallback target). */
+  announcedModel?: string | null;
+  /** Model OpenCode asked for on this turn. */
+  requestedModel?: string | null;
   createdAt: number;
   /** Continues consuming the SDK stream after tools resolve. */
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;
