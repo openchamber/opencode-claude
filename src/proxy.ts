@@ -937,10 +937,22 @@ async function collectTurnResponse(
     content += `\n\n[claude-code error] ${text}`;
   };
 
+  const modelNotices: ModelNotice[] = [];
+
   try {
+    bridge.requestedModel = model || null;
+
     for await (const event of events) {
-      const mapped = mapSdkEvent(event);
-      if (mapped.kind === "park") {
+      const mapped = mapSdkEvent(event, bridge);
+      if (
+        (mapped.kind === "usage-delta" || mapped.kind === "ignore") &&
+        mapped.note
+      ) {
+        modelNotices.push({ tag: mapped.noteTag ?? "answer", text: mapped.note });
+      }
+      if (mapped.kind === "notice") {
+        modelNotices.push({ tag: mapped.tag, text: mapped.text });
+      } else if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
         sawContent = true;
       } else if (mapped.kind === "text") {
@@ -970,6 +982,17 @@ async function collectTurnResponse(
     recordRateLimitErrorText(message);
     forgetDeadSession(bridge.conversationKey, message);
     noteError(message);
+  }
+
+  // One model note per leg, after the text (never mid-stream: it could land
+  // inside an open code fence).
+  {
+    const channel = noticeChannel();
+    const block = renderModelNoticeBlock(modelNotices, channel);
+    if (block) {
+      if (channel === "content") content += block;
+      else if (!suppressReasoning) reasoning += block;
+    }
   }
 
   const usage = resolveTurnUsage(turnUsage, resultUsage);
@@ -1292,9 +1315,26 @@ function streamOpenAIResponse(
         });
       };
 
+      const modelNotices: ModelNotice[] = [];
+
       try {
+        bridge.requestedModel = model || null;
+
         for await (const event of events) {
-          const mapped = mapSdkEvent(event);
+          const mapped = mapSdkEvent(event, bridge);
+          if (
+            (mapped.kind === "usage-delta" || mapped.kind === "ignore") &&
+            mapped.note
+          ) {
+            modelNotices.push({
+              tag: mapped.noteTag ?? "answer",
+              text: mapped.note,
+            });
+          }
+          if (mapped.kind === "notice") {
+            modelNotices.push({ tag: mapped.tag, text: mapped.text });
+            continue;
+          }
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
             for (let i = 0; i < mapped.tools.length; i++) {
@@ -1401,6 +1441,30 @@ function streamOpenAIResponse(
         finishReason = "stop";
       }
 
+      // One model note per leg, after the text (see collectTurnResponse).
+      if (!streamClosed) {
+        const channel = noticeChannel();
+        const block = renderModelNoticeBlock(modelNotices, channel);
+        if (block && (channel === "content" || !suppressReasoning)) {
+          send({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [
+              {
+                index: 0,
+                delta:
+                  channel === "content"
+                    ? { content: block }
+                    : { reasoning_content: block },
+                finish_reason: null,
+              },
+            ],
+          });
+        }
+      }
+
       const usage = resolveTurnUsage(turnUsage, resultUsage);
       if (!streamClosed) {
         send({
@@ -1436,14 +1500,49 @@ function streamOpenAIResponse(
   return new Response(readable, { headers: SSE_HEADERS });
 }
 
+/** Model-note kinds, most authoritative first. */
+type ModelNoticeTag = "switch" | "refusal" | "session" | "answer";
+
 type MappedEvent =
   | { kind: "text"; text: string }
   | { kind: "reasoning"; text: string }
+  | { kind: "notice"; text: string; tag: ModelNoticeTag }
   | { kind: "park"; tools: ParkedToolCall[] }
   | { kind: "usage"; usage: OpenAIUsage }
-  | { kind: "usage-delta"; usage: OpenAIUsage; messageId: string | null }
+  | {
+      kind: "usage-delta";
+      usage: OpenAIUsage;
+      messageId: string | null;
+      note?: string;
+      noteTag?: ModelNoticeTag;
+    }
   | { kind: "error"; text: string; usage?: OpenAIUsage | null }
-  | { kind: "ignore" };
+  | { kind: "ignore"; note?: string; noteTag?: ModelNoticeTag };
+
+type ModelNotice = { tag: ModelNoticeTag; text: string };
+
+const MODEL_NOTICE_PRIORITY: ModelNoticeTag[] = [
+  "switch",
+  "refusal",
+  "session",
+  "answer",
+];
+
+/**
+ * Pick the one note a turn shows: highest-priority tag, first occurrence.
+ * A fallback event beats the id-derived notes for the same switch.
+ */
+export function renderModelNoticeBlock(
+  notices: ModelNotice[],
+  channel: "content" | "reasoning",
+): string {
+  for (const tag of MODEL_NOTICE_PRIORITY) {
+    const hit = notices.find((n) => n.tag === tag);
+    if (!hit) continue;
+    return renderModelNotice(hit.text, channel);
+  }
+  return "";
+}
 
 /** Text carried by Claude's synthetic assistant API-error message. */
 function assistantErrorText(event: Record<string, unknown>): string | null {
@@ -1483,18 +1582,195 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
 }
 
 /**
+ * Where model notes go: `content` (default, a Markdown callout in the
+ * answer) or `reasoning` (the thinking trace, like compact/rate-limit notes).
+ */
+export function noticeChannel(): "content" | "reasoning" {
+  const value = (process.env.OPENCODE_CLAUDE_MODEL_NOTES ?? "")
+    .trim()
+    .toLowerCase();
+  return value === "reasoning" ? "reasoning" : "content";
+}
+
+/** `[tag] headline\nmore` → blockquote callout for content; as-is for reasoning. */
+export function renderModelNotice(
+  text: string,
+  channel: "content" | "reasoning",
+): string {
+  if (channel === "reasoning") return text;
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return "";
+  const [head, ...rest] = lines;
+  const headline = head.replace(/^\[([^\]]+)\]\s*/, "⚠️ **$1:** ");
+  const body = rest.map((line) => `_${line}_`);
+  return `\n\n> ${[headline, ...body].join("\n> ")}\n\n`;
+}
+
+/** First non-empty string among the keys (SDK is snake_case, CLI transcripts camelCase). */
+function stringField(
+  e: Record<string, unknown>,
+  ...keys: string[]
+): string | null {
+  for (const key of keys) {
+    const value = e[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+/**
+ * `system/model_refusal_fallback`: safety classifiers refused the request on
+ * the selected model and the CLI re-ran it on a fallback (e.g. Fable 5 →
+ * Opus 4.8). Scope `session` (or absent) means later turns stay on the
+ * fallback too.
+ */
+export function formatModelFallbackNote(e: Record<string, unknown>): string {
+  const from = stringField(e, "original_model", "originalModel") ?? "unknown";
+  const to = stringField(e, "fallback_model", "fallbackModel") ?? "unknown";
+  const category = stringField(e, "api_refusal_category", "apiRefusalCategory");
+  const explanation = stringField(
+    e,
+    "api_refusal_explanation",
+    "apiRefusalExplanation",
+  );
+  const direction = stringField(e, "direction");
+  log.warn("[opencode-claude] model fallback", {
+    from,
+    to,
+    category,
+    scope: e.scope ?? "session",
+    direction,
+    explanation,
+  });
+  // Models, category, and only the unusual flags; the CLI banner is not repeated.
+  const parts = [
+    `${from} → ${to}`,
+    ...(category ? [`safeguards [${category}]`] : []),
+    ...(e.scope === "local" ? ["this response only"] : []),
+    ...(direction && direction !== "retry" ? [direction] : []),
+  ];
+  return (
+    `\n[model switched] ${parts.join(" · ")}\n` +
+    (explanation ? `Reason given by the API: ${explanation}\n` : "")
+  );
+}
+
+/**
+ * Compare model ids ignoring the provider prefix (`claude-code/`), the
+ * `claude-` prefix and a date suffix. A bare alias (`opus`, `fable`) matches
+ * any of its versions, so a note is only raised when the ids are
+ * unambiguously different. The user's pick can reach here provider-prefixed
+ * (see `selectionFromRequest`), so that prefix must be stripped too.
+ */
+export function modelsMatch(a: string, b: string): boolean {
+  const norm = (id: string) =>
+    id
+      .trim()
+      .toLowerCase()
+      .replace(/^claude-code\//, "")
+      .replace(/^claude-/, "")
+      .replace(/-\d{8}$/, "")
+      .replace(/-latest$/, "");
+  const x = norm(a);
+  const y = norm(b);
+  if (!x || !y || x === y) return true;
+  const bareAlias = (id: string) => !/\d/.test(id);
+  if (bareAlias(x) && y.startsWith(`${x}-`)) return true;
+  if (bareAlias(y) && x.startsWith(`${y}-`)) return true;
+  return false;
+}
+
+/** An assistant message came from a model other than the one last announced. */
+export function formatModelMismatchNote(
+  actual: string,
+  selected: string,
+): string {
+  log.warn("[opencode-claude] answer came from a different model", {
+    actual,
+    selected,
+  });
+  return `\n[model mismatch] answered by ${actual}, you selected ${selected}\n`;
+}
+
+/** `init.model` differs from the user's pick: the session is latched on a fallback. */
+export function formatSessionModelNote(
+  sessionModel: string,
+  selected: string,
+): string {
+  log.warn("[opencode-claude] session is on a different model than selected", {
+    sessionModel,
+    selected,
+  });
+  return `\n[model mismatch] answer starts on ${sessionModel}, you selected ${selected}\n`;
+}
+
+/** `system/notification`: the CLI's own notices (deprecations, limits). Low = tips, dropped. */
+export function formatNotificationNote(
+  e: Record<string, unknown>,
+): string | null {
+  const text = stringField(e, "text");
+  if (!text) return null;
+  const priority = stringField(e, "priority") ?? "medium";
+  if (priority === "low") return null;
+  log.warn("[opencode-claude] CLI notification", {
+    key: stringField(e, "key"),
+    priority,
+    text,
+  });
+  return `\n[notice${priority === "medium" ? "" : `:${priority}`}] ${text}\n`;
+}
+
+/** `model_refusal_no_fallback`: refused, no retry; the turn ends with the CLI's error. */
+export function formatModelRefusalNote(e: Record<string, unknown>): string {
+  const from = stringField(e, "original_model", "originalModel") ?? "unknown";
+  const category = stringField(e, "api_refusal_category", "apiRefusalCategory");
+  log.warn("[opencode-claude] model refusal without fallback", {
+    from,
+    category,
+  });
+  const parts = [
+    from,
+    ...(category ? [`safeguards [${category}]`] : []),
+    "no fallback, turn ended with an error",
+  ];
+  return `\n[model refused] ${parts.join(" · ")}\n`;
+}
+
+/**
  * Map Claude Agent SDK events to OpenAI-style deltas.
  *
  * Prefer `stream_event` content_block_delta for text/reasoning. Full
  * `assistant` message payloads repeat the same content after partials and
  * would double-print if both were forwarded.
  */
-function mapSdkEvent(event: unknown): MappedEvent {
+function mapSdkEvent(event: unknown, bridge?: ParkedBridge): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
 
   if (e.type === "__park__" && Array.isArray(e.tools)) {
     return { kind: "park", tools: e.tools as ParkedToolCall[] };
+  }
+
+  // init comes on every turn. After a sticky fallback the CLI may report the
+  // fallback as the session model, which is itself worth a note.
+  if (e.type === "system" && e.subtype === "init") {
+    if (bridge) {
+      const requested = bridge.requestedModel ?? null;
+      const sessionModel = stringField(e, "model");
+      if (requested && sessionModel && !modelsMatch(sessionModel, requested)) {
+        bridge.announcedModel = sessionModel;
+        return {
+          kind: "ignore",
+          note: formatSessionModelNote(sessionModel, requested),
+          noteTag: "session",
+        };
+      }
+      bridge.announcedModel = sessionModel ?? requested;
+    }
+    return { kind: "ignore" };
   }
 
   // Structured subscription limit telemetry from the Agent SDK — record for
@@ -1509,6 +1785,23 @@ function mapSdkEvent(event: unknown): MappedEvent {
     const state = recordRateLimitInfo(rawInfo);
     const note = maybeRateLimitNote(state, rawInfo);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
+  }
+
+  // Safety-classifier fallback: the CLI swaps the model silently, OpenCode
+  // keeps showing the requested one.
+  if (e.type === "system" && e.subtype === "model_refusal_fallback") {
+    const to = stringField(e, "fallback_model", "fallbackModel");
+    if (bridge && to) bridge.announcedModel = to;
+    return { kind: "notice", text: formatModelFallbackNote(e), tag: "switch" };
+  }
+
+  if (e.type === "system" && e.subtype === "model_refusal_no_fallback") {
+    return { kind: "notice", text: formatModelRefusalNote(e), tag: "refusal" };
+  }
+
+  if (e.type === "system" && e.subtype === "notification") {
+    const text = formatNotificationNote(e);
+    return text ? { kind: "reasoning", text } : { kind: "ignore" };
   }
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.
@@ -1575,14 +1868,35 @@ function mapSdkEvent(event: unknown): MappedEvent {
       }
       return { kind: "error", text: note, usage };
     }
+    // Catch-all: `message.model` is what actually answered. Announce a change
+    // once (the fallback note already set announcedModel to its target).
+    let note: string | undefined;
+    const actualModel =
+      message && typeof message.model === "string" && message.model.trim()
+        ? message.model.trim()
+        : null;
+    if (bridge && actualModel) {
+      const announced = bridge.announcedModel;
+      if (announced && !modelsMatch(actualModel, announced)) {
+        // Name the user's pick, not a previously announced fallback target.
+        const requested = bridge.requestedModel;
+        const selected =
+          requested && !modelsMatch(requested, announced) ? requested : announced;
+        note = formatModelMismatchNote(actualModel, selected);
+      }
+      bridge.announcedModel = actualModel;
+    }
     if (usage) {
       return {
         kind: "usage-delta",
         usage,
         messageId: typeof message?.id === "string" ? message.id : null,
+        ...(note ? { note, noteTag: "answer" as const } : {}),
       };
     }
-    return { kind: "ignore" };
+    return note
+      ? { kind: "ignore", note, noteTag: "answer" }
+      : { kind: "ignore" };
   }
 
   if (e.type === "result") {
