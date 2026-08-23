@@ -46,7 +46,7 @@ Subscription limit state is tracked with its reset time. `GET /v1/rate-limit` an
 
 ## Quick start
 
-`claude-code` is **not** a built-in OpenCode provider. Install the plugin first, or `opencode auth login --provider claude-code` fails with `Unknown provider "claude-code"`.
+`claude-code` is **not** a built-in OpenCode provider. Install the plugin before trying to sign in.
 
 ### 1. Install the plugin
 
@@ -54,19 +54,27 @@ Subscription limit state is tracked with its reset time. `GET /v1/rate-limit` an
 npm install -g @openchamber/opencode-claude
 ```
 
-Or with OpenCode:
+Or with OpenCode V2:
 
 ```bash
-# global (recommended)
-opencode plugin @openchamber/opencode-claude -g
-
-# or project-local (writes .opencode/opencode.json)
-opencode plugin @openchamber/opencode-claude
+opencode2 plugin add @openchamber/opencode-claude
 ```
 
 ### 2. Register it in OpenCode
 
-Add (or merge) this into `~/.config/opencode/opencode.json`:
+OpenCode V2 uses the package's native `./server` entrypoint. Add (or merge) this into `~/.config/opencode/opencode.json`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["@openchamber/opencode-claude"],
+  "providers": {
+    "claude-code": { "name": "Claude Code" }
+  }
+}
+```
+
+OpenCode V1 continues to use the root entrypoint and legacy field names:
 
 ```jsonc
 {
@@ -81,15 +89,17 @@ Add (or merge) this into `~/.config/opencode/opencode.json`:
 ### 3. Authenticate
 
 ```bash
-claude auth login
-opencode auth login --provider claude-code
+claude auth login --claudeai
+opencode2 auth login
 # pick "Sign in with Claude Code CLI"
 ```
+
+On OpenCode V1, use `opencode auth login --provider claude-code` instead.
 
 ### 4. Run a Claude model
 
 ```bash
-opencode run "Summarise this repository in five bullets." --model claude-code/sonnet
+opencode2 run "Summarise this repository in five bullets." --model claude-code/sonnet
 ```
 
 In the TUI, pick provider **claude-code**, choose a model, and set the **effort** variant (`low` / `medium` / `high` / `xhigh` / `max`) when you want deeper thinking.
@@ -111,12 +121,12 @@ opencode plugin file://$PWD
 | **Install Claude Code CLI and sign in** | Shown only when the CLI is missing: runs the official installer (`npm i -g @anthropic-ai/claude-code`, official install script as fallback), then continues with the sign-in relay |
 | Paste the code from the Claude page | Goes straight to the CLI's stdin; the CLI does the token exchange and owns the result |
 | `claude auth login --claudeai` | Terminal alternative, always called out in the instructions — also the offered fallback when the CLI is missing (with the install command alongside) |
-| Successful verification | Completes without writing to OpenCode's auth store |
+| Successful verification | V1 stores nothing; V2 stores only a non-secret connection marker because its integration API requires a credential record |
 | Access expires | Claude Code refreshes its own credentials |
 
 Signing in is either the link and its code or the terminal command — the sign-in page the CLI asks for is the only URL the plugin ever hands to the host.
 
-The plugin does not implement OAuth, inspect Claude credential files, inject tokens, or call Anthropic inference endpoints directly.
+The plugin does not implement OAuth, inspect Claude credential files, inject tokens, or call Anthropic inference endpoints directly. In V2, the stored marker contains no Claude credential and is never used to authenticate with Anthropic.
 
 ## Architecture
 
@@ -147,7 +157,7 @@ The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit 
 
 ## Requirements
 
-- [OpenCode V1](https://opencode.ai) (`@opencode-ai/plugin` 1.18.x). OpenCode V2 is not yet supported because it uses a different plugin API.
+- [OpenCode V1](https://opencode.ai) or OpenCode V2 beta `0.0.0-beta-17595`
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — on `PATH` or installed via the provider's install action (npm is used, or the official install script); the plugin also checks `~/.local/bin` and the npm global bin for a CLI the server PATH cannot see
 - Claude plan supported by Claude Code
 - Bun (plugin runtime) · Node.js ≥ 18
@@ -175,8 +185,8 @@ Optional knobs:
 | Symptom | Fix |
 | --- | --- |
 | Unknown provider `claude-code` | Install `@openchamber/opencode-claude` and restart OpenCode |
-| Claude Code missing from provider list | Confirm `plugin` includes `@openchamber/opencode-claude` and restart OpenCode |
-| Authentication error | Run `claude auth login`, verify `claude auth status --json`, then restart OpenCode |
+| Claude Code missing from provider list | Confirm V2 `plugins` (or V1 `plugin`) includes `@openchamber/opencode-claude` and restart OpenCode |
+| Authentication error | Run `claude auth login --claudeai`, verify `claude auth status --json`, then restart OpenCode |
 | 429 / rate-limit | Poll `GET /v1/rate-limit` or wait until `resetsAt`; the next turn resumes the same session |
 | Tools hang or invent output | Update to the latest plugin — park/resume MCP bridging is required |
 | Attachments ignored | Use a current build; image/PDF parts are converted to Claude blocks |

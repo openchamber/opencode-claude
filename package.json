@@ -12,6 +12,11 @@
       "types": "./dist/index.d.ts",
       "import": "./opencode-claude.js",
       "default": "./opencode-claude.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js",
+      "default": "./dist/server.js"
     }
   },
   "files": [
@@ -21,7 +26,7 @@
   "scripts": {
     "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json",
-    "test": "bun test/smoke.ts",
+    "test": "bun test test/plugin-v2.test.ts && bun test/smoke.ts",
     "test:haiku": "bun test/haiku-live.ts",
     "prepublishOnly": "npm run build"
   },
@@ -55,7 +60,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.224",
-    "@opencode-ai/plugin": "^1.18.15",
+    "@opencode-ai/plugin": "0.0.0-beta-17595",
     "zod": "^4.4.3"
   },
   "devDependencies": {

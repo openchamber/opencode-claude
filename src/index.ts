@@ -9,7 +9,7 @@
  * Register in opencode.json:
  *   { "plugin": ["@openchamber/opencode-claude"] }
  */
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin/v1";
 import {
   DEFAULT_MODEL_ID,
   DIRECTORY_HEADER,
