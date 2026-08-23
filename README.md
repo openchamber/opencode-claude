@@ -147,10 +147,20 @@ The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit 
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai)
+- [OpenCode](https://opencode.ai) — V1 (`@opencode-ai/plugin` 1.18.x) and V2 (`@opencode-ai/client` ≥ 0.0.0-beta-17595) both supported
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — on `PATH` or installed via the provider's install action (npm is used, or the official install script); the plugin also checks `~/.local/bin` and the npm global bin for a CLI the server PATH cannot see
 - Claude plan supported by Claude Code
 - Bun (plugin runtime) · Node.js ≥ 18
+
+## OpenCode V2 compatibility
+
+Verified with CodeNomad's V2 foundation (`MIGRATION_V2.md`, `0.0.0-beta-17595`):
+
+- **Host client:** V2 replaces `@opencode-ai/sdk` with the native `@opencode-ai/client` Promise API (`@opencode-ai/client/solid` + `createData`). This plugin does **not** depend on `@opencode-ai/client` at runtime (optional peer `>=0.0.0-beta-17595`), only the host does — no code change required in the plugin.
+- **Global service:** V2 runs one shared OpenCode daemon for all workspaces/clients (see [opencode#43898](https://github.com/anomalyco/opencode/issues/43898#issuecomment-5372607267)). The plugin's `Bun.serve` proxy binds an ephemeral port by default and reuses an existing healthy listener on `OPENCODE_CLAUDE_PROXY_PORT` if pinned, so it coexists with the single global daemon — no per-workspace Bun runtime.
+- **No `packages/opencode-plugin`:** CodeNomad V2 deletes its own `packages/opencode-plugin`, custom plugin channels, and per-workspace runtimes; external plugins like this one are unaffected.
+- **Registration unchanged:** still `plugin: ["@openchamber/opencode-claude"]` in `~/.config/opencode/opencode.json` (global) or `.opencode/opencode.json` (project). The provider remains `claude-code`.
+- **Quota:** CodeNomad V2 (`e2b784f2`) now surfaces Claude subscription quota via its auth-file plugin — `api.anthropic.com/api/oauth/usage` with `retry-after` cooldown (5 m–1 h) — alongside the existing `claude-code` proxy rate-limit gate (`GET /v1/rate-limit`). No model guessing required.
 
 ## Development
 

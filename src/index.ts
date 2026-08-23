@@ -8,6 +8,11 @@
  *
  * Register in opencode.json:
  *   { "plugin": ["@openchamber/opencode-claude"] }
+ *
+ * OpenCode V2: compatible with the native @opencode-ai/client Promise API
+ * (0.0.0-beta-17595+) and the single global daemon model. The proxy binds an
+ * ephemeral Bun.serve port and publishes the live URL via the config hook so
+ * the global service always hits the owning listener — no per-workspace runtime.
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {

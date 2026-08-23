@@ -7,6 +7,11 @@
  * Tool calls from OpenCode are exposed as an in-process MCP server. When Claude
  * invokes one, the stream parks (Cursor bridge-pool pattern) and returns
  * tool_calls; the follow-up request with tool results resumes the turn.
+ *
+ * OpenCode V2: the proxy is a single global listener (Bun.serve, ephemeral port
+ * by default) that coexists with V2's one shared daemon — no per-workspace
+ * runtime. A pinned OPENCODE_CLAUDE_PROXY_PORT reuses a healthy sibling
+ * listener via /v1/models health check.
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
