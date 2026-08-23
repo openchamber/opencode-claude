@@ -4,11 +4,17 @@ import { DIRECTORY_HEADER, EFFORT_HEADER, SESSION_HEADER } from "../src/constant
 import { decodeClaudeModelSelection } from "../src/model-selection.ts";
 import { getClaudeModels } from "../src/models.ts";
 import { getProxyPort, stopProxy } from "../src/proxy.ts";
-import { setupV2 } from "../src/server.ts";
+import serverPlugin, { setupV2 } from "../src/server.ts";
 
 afterEach(stopProxy);
 
 test("V2 registers Claude catalog, CLI login, and request routing", async () => {
+  expect(serverPlugin).toMatchObject({
+    id: "opencode.provider.claude-code",
+    setup: setupV2,
+    server: expect.any(Function),
+  });
+
   const provider: any = {
     id: "claude-code",
     name: "claude-code",

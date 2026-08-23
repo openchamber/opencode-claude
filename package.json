@@ -60,7 +60,8 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.224",
-    "@opencode-ai/plugin": "0.0.0-beta-17595",
+    "@opencode-ai/plugin": "beta",
+    "@opencode-ai/plugin-v1": "npm:@opencode-ai/plugin@^1.18.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

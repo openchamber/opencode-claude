@@ -7,7 +7,7 @@ import {
   SESSION_HEADER,
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
-import { buildAuthMethods } from "./index.js";
+import { buildAuthMethods, ClaudeCodePlugin } from "./index.js";
 import {
   encodeClaudeModelSelection,
   resolveClaudeModelSelection,
@@ -149,7 +149,11 @@ export async function setupV2(ctx: Plugin.Context) {
   return stopProxy;
 }
 
-export default Plugin.define({
-  id: "opencode.provider.claude-code",
-  setup: setupV2,
-});
+// V1 package loaders also prefer ./server, so expose their handler here.
+export default Object.assign(
+  Plugin.define({
+    id: "opencode.provider.claude-code",
+    setup: setupV2,
+  }),
+  { server: ClaudeCodePlugin },
+);

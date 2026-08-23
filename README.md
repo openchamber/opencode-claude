@@ -54,10 +54,14 @@ Subscription limit state is tracked with its reset time. `GET /v1/rate-limit` an
 npm install -g @openchamber/opencode-claude
 ```
 
-Or with OpenCode V2:
+For OpenCode V2, install it beside the global configuration so the explicit
+server entrypoint can resolve its dependencies while the package root remains
+compatible with OpenCode V1:
 
 ```bash
-opencode2 plugin add @openchamber/opencode-claude
+mkdir -p ~/.config/opencode
+cd ~/.config/opencode
+bun add @openchamber/opencode-claude
 ```
 
 ### 2. Register it in OpenCode
@@ -67,7 +71,7 @@ OpenCode V2 uses the package's native `./server` entrypoint. Add (or merge) this
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["@openchamber/opencode-claude"],
+  "plugins": ["./node_modules/@openchamber/opencode-claude/dist/server.js"],
   "providers": {
     "claude-code": { "name": "Claude Code" }
   }
@@ -157,7 +161,7 @@ The proxy records Agent SDK `rate_limit_event` telemetry and hard session-limit 
 
 ## Requirements
 
-- [OpenCode V1](https://opencode.ai) or OpenCode V2 beta `0.0.0-beta-17595`
+- [OpenCode V1](https://opencode.ai) or the latest OpenCode V2 beta
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — on `PATH` or installed via the provider's install action (npm is used, or the official install script); the plugin also checks `~/.local/bin` and the npm global bin for a CLI the server PATH cannot see
 - Claude plan supported by Claude Code
 - Bun (plugin runtime) · Node.js ≥ 18
@@ -185,7 +189,7 @@ Optional knobs:
 | Symptom | Fix |
 | --- | --- |
 | Unknown provider `claude-code` | Install `@openchamber/opencode-claude` and restart OpenCode |
-| Claude Code missing from provider list | Confirm V2 `plugins` (or V1 `plugin`) includes `@openchamber/opencode-claude` and restart OpenCode |
+| Claude Code missing from provider list | Confirm V2 `plugins` points to the installed `dist/server.js` (or V1 `plugin` includes `@openchamber/opencode-claude`) and restart OpenCode |
 | Authentication error | Run `claude auth login --claudeai`, verify `claude auth status --json`, then restart OpenCode |
 | 429 / rate-limit | Poll `GET /v1/rate-limit` or wait until `resetsAt`; the next turn resumes the same session |
 | Tools hang or invent output | Update to the latest plugin — park/resume MCP bridging is required |
