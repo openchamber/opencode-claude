@@ -12,8 +12,8 @@ test("V2 registers Claude catalog, CLI login, and request routing", async () => 
   expect(serverPlugin).toMatchObject({
     id: "opencode.provider.claude-code",
     setup: setupV2,
-    server: expect.any(Function),
   });
+  expect("server" in serverPlugin).toBeFalse();
 
   const provider: any = {
     id: "claude-code",
@@ -88,6 +88,7 @@ test("V2 registers Claude catalog, CLI login, and request routing", async () => 
   expect(getProxyPort()).toBeNumber();
   expect(provider).toMatchObject({
     name: "Claude Code",
+    integrationID: "claude-code",
     package: "@opencode-ai/ai/providers/openai-compatible",
     settings: { apiKey: "managed-by-claude-code-cli" },
   });

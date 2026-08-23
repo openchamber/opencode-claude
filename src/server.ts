@@ -7,7 +7,7 @@ import {
   SESSION_HEADER,
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
-import { buildAuthMethods, ClaudeCodePlugin } from "./index.js";
+import { buildAuthMethods } from "./index.js";
 import {
   encodeClaudeModelSelection,
   resolveClaudeModelSelection,
@@ -71,6 +71,7 @@ export async function setupV2(ctx: Plugin.Context) {
     await ctx.catalog.transform((catalog) => {
       catalog.provider.update(PROVIDER_ID, (provider) => {
         if (provider.name === PROVIDER_ID) provider.name = "Claude Code";
+        provider.integrationID = Integration.ID.make(PROVIDER_ID);
         provider.package = PROVIDER_PACKAGE;
         provider.settings = {
           ...provider.settings,
@@ -149,11 +150,7 @@ export async function setupV2(ctx: Plugin.Context) {
   return stopProxy;
 }
 
-// V1 package loaders also prefer ./server, so expose their handler here.
-export default Object.assign(
-  Plugin.define({
-    id: "opencode.provider.claude-code",
-    setup: setupV2,
-  }),
-  { server: ClaudeCodePlugin },
-);
+export default Plugin.define({
+  id: "opencode.provider.claude-code",
+  setup: setupV2,
+});

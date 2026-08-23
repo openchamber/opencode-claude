@@ -54,24 +54,18 @@ Subscription limit state is tracked with its reset time. `GET /v1/rate-limit` an
 npm install -g @openchamber/opencode-claude
 ```
 
-For OpenCode V2, install it beside the global configuration so the explicit
-server entrypoint can resolve its dependencies while the package root remains
-compatible with OpenCode V1:
-
 ```bash
-mkdir -p ~/.config/opencode
-cd ~/.config/opencode
-bun add @openchamber/opencode-claude
+opencode2 plugin add @openchamber/opencode-claude
 ```
 
 ### 2. Register it in OpenCode
 
-OpenCode V2 uses the package's native `./server` entrypoint. Add (or merge) this into `~/.config/opencode/opencode.json`:
+OpenCode V2 uses the package's native `./server` entrypoint. The command above adds it to `~/.config/opencode/opencode.json`; the resulting configuration is:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["./node_modules/@openchamber/opencode-claude/dist/server.js"],
+  "plugins": ["@openchamber/opencode-claude"],
   "providers": {
     "claude-code": { "name": "Claude Code" }
   }
@@ -189,7 +183,7 @@ Optional knobs:
 | Symptom | Fix |
 | --- | --- |
 | Unknown provider `claude-code` | Install `@openchamber/opencode-claude` and restart OpenCode |
-| Claude Code missing from provider list | Confirm V2 `plugins` points to the installed `dist/server.js` (or V1 `plugin` includes `@openchamber/opencode-claude`) and restart OpenCode |
+| Claude Code missing from provider list | Confirm V2 `plugins` (or V1 `plugin`) includes `@openchamber/opencode-claude` and restart OpenCode |
 | Authentication error | Run `claude auth login --claudeai`, verify `claude auth status --json`, then restart OpenCode |
 | 429 / rate-limit | Poll `GET /v1/rate-limit` or wait until `resetsAt`; the next turn resumes the same session |
 | Tools hang or invent output | Update to the latest plugin — park/resume MCP bridging is required |
