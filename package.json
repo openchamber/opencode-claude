@@ -58,14 +58,6 @@
     "@opencode-ai/plugin": "^1.18.15",
     "zod": "^4.4.3"
   },
-  "peerDependencies": {
-    "@opencode-ai/client": ">=0.0.0-beta-17595"
-  },
-  "peerDependenciesMeta": {
-    "@opencode-ai/client": {
-      "optional": true
-    }
-  },
   "devDependencies": {
     "@types/bun": "^1.3.11",
     "@types/node": "^22.15.0",
