@@ -55,6 +55,37 @@ async function main() {
   assert.equal(cleaned.KEEP, "1");
   assert.equal(cleaned.PATH, "/usr/bin");
 
+  // Root may only combine bypassPermissions with Claude's dangerous-skip flag
+  // when the child process is explicitly marked as sandboxed.
+  {
+    const { startClaudeQuery } = await import("../src/query.ts");
+    let capturedOptions: Record<string, unknown> | undefined;
+    const stream = {
+      async *[Symbol.asyncIterator]() {},
+    };
+    const handle = await startClaudeQuery({
+      prompt: "test",
+      cwd: process.cwd(),
+      env: { PATH: "/usr/bin" },
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      queryImpl: () => ({ options }) => {
+        capturedOptions = options as Record<string, unknown>;
+        return stream;
+      },
+    });
+    const childEnv = capturedOptions?.env as
+      | Record<string, string | undefined>
+      | undefined;
+    assert.equal(
+      childEnv?.IS_SANDBOX,
+      typeof process.getuid === "function" && process.getuid() === 0
+        ? "1"
+        : undefined,
+    );
+    handle.close();
+  }
+
   // The UI login relays the official CLI flow: its authorize URL comes back to
   // the host, and the code the user pastes goes into the CLI's stdin.
   {
