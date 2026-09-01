@@ -354,6 +354,7 @@ async function main() {
   // Multimodal prompt conversion
   const {
     openaiContentToAnthropicBlocks,
+    openaiToolResultToMcpContent,
     latestUserPrompt: buildPrompt,
     contentHasAttachments,
   } = await import("../src/prompt.ts");
@@ -447,6 +448,24 @@ async function main() {
     },
   ]);
   assert.equal(typeof multi === "object" && multi !== null && multi.type === "user", true);
+
+  // OpenCode read-tool attachments must survive the parked Claude SDK tool
+  // bridge. The MCP result shape uses { data, mimeType }, not Anthropic's
+  // message-level { source } shape.
+  const mcpToolResult = openaiToolResultToMcpContent([
+    { type: "text", text: "Image read successfully" },
+    {
+      type: "file",
+      file: {
+        filename: "pixel.png",
+        file_data: `data:image/png;base64,${png}`,
+      },
+    },
+  ]);
+  assert.deepEqual(mcpToolResult, [
+    { type: "text", text: "Image read successfully" },
+    { type: "image", data: png, mimeType: "image/png" },
+  ]);
 
   // Conversation key stability
   const key = conversationKeyFromMessages([

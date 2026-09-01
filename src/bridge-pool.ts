@@ -3,12 +3,13 @@
  * (Cursor bridge-pool pattern).
  */
 import type { ClaudeQueryHandle } from "./query.js";
+import type { McpToolResultContent } from "./prompt.js";
 
 export type ParkedToolCall = {
   id: string;
   name: string;
   arguments: string;
-  resolve: (result: string) => void;
+  resolve: (result: McpToolResultContent[]) => void;
   reject: (error: Error) => void;
 };
 

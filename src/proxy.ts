@@ -56,10 +56,12 @@ import {
   buildConversationTranscript,
   extractTextContent,
   latestUserPrompt,
+  openaiToolResultToMcpContent,
   priorMessagesOf,
   promptAsStream,
   withConversationContext,
   type SdkUserPrompt,
+  type McpToolResultContent,
 } from "./prompt.js";
 import {
   detectMetaRequestKind,
@@ -325,11 +327,14 @@ async function handleRequest(req: Request): Promise<Response> {
 
 function collectToolResults(
   messages: OpenAIMessage[],
-): Map<string, string> {
-  const results = new Map<string, string>();
+): Map<string, McpToolResultContent[]> {
+  const results = new Map<string, McpToolResultContent[]>();
   for (const msg of messages) {
     if (msg.role !== "tool" || !msg.tool_call_id) continue;
-    results.set(msg.tool_call_id, extractTextContent(msg.content));
+    results.set(
+      msg.tool_call_id,
+      openaiToolResultToMcpContent(msg.content),
+    );
   }
   return results;
 }
@@ -869,16 +874,18 @@ async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
-              pending.resolve = resolve;
-              pending.reject = reject;
-            });
+            const resultPromise = new Promise<McpToolResultContent[]>(
+              (resolve, reject) => {
+                pending.resolve = resolve;
+                pending.reject = reject;
+              },
+            );
             // Register before notifying so the stream consumer sees the tool.
             pendingTools.set(id, pending);
             onPark();
             const result = await resultPromise;
             return {
-              content: [{ type: "text", text: result }],
+              content: result,
             };
           },
           { alwaysLoad: true },
