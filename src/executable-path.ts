@@ -34,7 +34,7 @@ function knownClaudeLocations(
   env: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): string[] {
   const home = typeof env.HOME === "string" && env.HOME ? env.HOME : homedir();
-  const candidates = [join(home, ".local", "bin", "claude")];
+  const candidates = executableVariants(join(home, ".local", "bin", "claude"));
 
   try {
     const prefix = spawnSync("npm", ["prefix", "-g"], {
@@ -44,11 +44,19 @@ function knownClaudeLocations(
       stdio: ["ignore", "pipe", "ignore"],
     });
     const dir = `${prefix.stdout || ""}`.trim();
-    if (dir) candidates.push(join(dir, "bin", "claude"));
+    if (dir) {
+      const globalBin = process.platform === "win32" ? dir : join(dir, "bin");
+      candidates.push(...executableVariants(join(globalBin, "claude")));
+    }
   } catch {
     // no npm prefix available — PATH and ~/.local/bin remain
   }
   return candidates;
+}
+
+function executableVariants(base: string): string[] {
+  if (process.platform !== "win32") return [base];
+  return [`${base}.cmd`, `${base}.exe`, `${base}.bat`, base];
 }
 
 export function findBinaryOnPath(
@@ -62,7 +70,7 @@ export function findBinaryOnPath(
   for (const dir of parts) {
     if (!dir) continue;
     for (const ext of exts) {
-      const candidate = `${dir.replace(/[/\\]$/, "")}/${name}${ext}`;
+      const candidate = join(dir, `${name}${ext}`);
       if (probeClaude(candidate, env)) return candidate;
     }
   }
