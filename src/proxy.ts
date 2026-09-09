@@ -547,7 +547,12 @@ async function handleChatCompletions(
       ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
       : undefined;
 
-  const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
+  // Only bridge to mcp__opencode__* when the MCP server actually built.
+  // buildOpenCodeMcpServer swallows its own errors (logs a warning, returns
+  // undefined) — without this guard the session still disables native tools
+  // and demands mcp__opencode__* even when none were ever registered,
+  // leaving the agent with no filesystem access at all.
+  const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0 && Boolean(mcpServers);
   const openCodeToolNames = openCodeTools
     .map((t) => t.function?.name)
     .filter((n): n is string => typeof n === "string" && n.length > 0);
