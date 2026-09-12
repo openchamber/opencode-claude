@@ -4,7 +4,9 @@
  */
 import type { ClaudeQueryHandle } from "./query.js";
 import type { ClaudePromptInput } from "./prompt-input.js";
+import type { ExclusivePumpGate } from "./serialized-iterator.js";
 import type { OpenAIUsage } from "./usage.js";
+import { log } from "./log.js";
 
 export type ParkedToolCall = {
   id: string;
@@ -25,7 +27,11 @@ export type ParkedBridge = {
   lastAssistantUsage?: OpenAIUsage;
   createdAt: number;
   /** Continues consuming the SDK stream after tools resolve. */
-  continueStream?: () => AsyncGenerator<unknown, void, unknown>;
+  continueStream?: (
+    releasePump?: () => void,
+    requestSignal?: AbortSignal,
+  ) => AsyncGenerator<unknown, void, unknown>;
+  pumpGate: ExclusivePumpGate;
   input?: ClaudePromptInput;
   streamIterator?: AsyncIterator<unknown>;
   persistent?: boolean;
@@ -112,9 +118,20 @@ export function deleteBridge(id: string): void {
   for (const tool of bridge.pendingTools.values()) {
     tool.reject(new Error("Bridge closed"));
   }
+  bridge.pendingTools.clear();
   closeInputDeferred(bridge);
-  bridge.handle.close();
-  bridges.delete(id);
+  try {
+    bridge.handle.close();
+  } catch {
+    log.warn("[opencode-claude] bridge handle close failed", { bridgeId: id });
+  } finally {
+    bridges.delete(id);
+    log.info("[opencode-claude] bridge close", {
+      bridgeId: id,
+      conversationKey: bridge.conversationKey,
+      pendingTools: bridge.pendingTools.size,
+    });
+  }
 }
 
 export function clearAllBridges(): void {

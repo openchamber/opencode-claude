@@ -12,13 +12,19 @@ const { putBridge, deleteBridge, getBridge } = await import("../src/bridge-pool.
 
 type CloseLog = { inputClosed: boolean; handleClosed: boolean };
 
-function makeBridge(id: string, conversationKey: string, log: CloseLog) {
+function makeBridge(
+  id: string,
+  conversationKey: string,
+  log: CloseLog,
+  handleCloseThrows = false,
+) {
   return {
     id,
     conversationKey,
     handle: {
       close() {
         log.handleClosed = true;
+        if (handleCloseThrows) throw new Error("close failed");
       },
     },
     pendingTools: new Map(),
@@ -58,5 +64,17 @@ assert.equal(superseded.handleClosed, true, "superseded handle.close() still run
 
 await nextMacrotask();
 assert.equal(superseded.inputClosed, true, "superseded input.close() must still run");
+
+const throwing: CloseLog = { inputClosed: false, handleClosed: false };
+putBridge(makeBridge("bridge-throwing", "conv-throwing", throwing, true));
+assert.doesNotThrow(
+  () => deleteBridge("bridge-throwing"),
+  "handle close failure must not abort bridge removal",
+);
+assert.equal(
+  getBridge("bridge-throwing"),
+  undefined,
+  "bridge must leave the pool even when handle.close() throws",
+);
 
 console.log("bridge-teardown-regression: ok");
