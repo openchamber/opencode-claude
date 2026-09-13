@@ -9,10 +9,13 @@ export type ClaudeModel = {
   reasoning: boolean;
   contextWindow: number;
   maxTokens: number;
+  inputWindow?: number;
   resolvedId?: string;
 };
 
-const LIMIT_1M = { context: 1_000_000, output: 128_000 } as const;
+// Declare an input window so OpenCode's auto-compaction trigger (input − reserved)
+// fires predictably (~90%) instead of falling back to (context − output).
+const LIMIT_1M = { context: 1_000_000, input: 900_000, output: 128_000 } as const;
 const LIMIT_200K = { context: 200_000, output: 64_000 } as const;
 
 /** OpenCode may inject these before merging plugin variants — disable extras. */
@@ -29,7 +32,7 @@ export const GENERATED_VARIANT_KEYS = [
 function model(
   id: string,
   name: string,
-  limit: { context: number; output: number },
+  limit: { context: number; input?: number; output: number },
   resolvedId?: string,
 ): ClaudeModel {
   return {
@@ -38,6 +41,7 @@ function model(
     reasoning: true,
     contextWindow: limit.context,
     maxTokens: limit.output,
+    ...(limit.input ? { inputWindow: limit.input } : {}),
     ...(resolvedId ? { resolvedId } : {}),
   };
 }
