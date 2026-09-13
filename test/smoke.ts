@@ -331,6 +331,14 @@ async function main() {
   assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
 
+  // 1M models declare an input window so OpenCode's auto-compaction trigger
+  // (limit.input minus reserved) fires predictably; 200K models stay untouched.
+  const aliasModel = (id: string) => CLAUDE_CODE_MODELS.find((m) => m.id === id)!;
+  assert.equal(aliasModel("fable").inputWindow, 900_000);
+  assert.equal(aliasModel("opus").inputWindow, 900_000);
+  assert.equal(aliasModel("sonnet").inputWindow, 900_000);
+  assert.equal(aliasModel("haiku").inputWindow, undefined);
+
   const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
   const variants = buildEffortVariants(sonnet);
   for (const level of EFFORT_LEVELS) {
