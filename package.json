@@ -1,6 +1,6 @@
 {
   "name": "@openchamber/opencode-claude",
-  "version": "0.14.0",
+  "version": "0.14.0-fix.1",
   "description": "Claude Code in OpenCode — local CLI auth, Agent SDK harness, effort variants, tools/MCP, images & compact.",
   "license": "MIT",
   "type": "module",
@@ -21,7 +21,7 @@
   "scripts": {
     "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json",
-    "test": "bun test/smoke.ts",
+    "test": "bun test/smoke.ts && bun test/usage-regression.ts && bun test/request-kind-regression.ts && bun test/compaction-resume-regression.ts && bun test/persistent-query-regression.ts && bun test/bridge-teardown-regression.ts && bun test/persistent-park-race-regression.ts && bun test/persistent-pump-concurrency-regression.ts && bun test/persistent-continuation-lifecycle-regression.ts && bun test/lifecycle-instrumentation-regression.ts && bun test/pump-gate-regression.ts && bun test/iterator-race-regression.ts",
     "test:haiku": "bun test/haiku-live.ts",
     "prepublishOnly": "npm run build"
   },

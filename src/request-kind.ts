@@ -11,6 +11,9 @@ type MessageLike = {
   content?: unknown;
 };
 
+const OPENCODE_UPDATE_SUMMARY_PATTERN =
+  /here is the conversation so far:\s*<conversation>[\s\S]*?<\/conversation>\s*here is the summary of the conversation before the <conversation> above:\s*<prior-summary>[\s\S]*?<\/prior-summary>\s*the <prior-summary> summarizes everything that happened before the <conversation>\. construct a new summary that combines both\.\s*output exactly the markdown structure shown inside <template>/;
+
 export function metaSystemPrompt(messages: MessageLike[]): string {
   return messages
     .filter((m) => m.role === "system")
@@ -49,6 +52,7 @@ export function isSummaryGenerationRequest(messages: MessageLike[]): boolean {
 
   const user = userText(messages).toLowerCase();
   return (
+    OPENCODE_UPDATE_SUMMARY_PATTERN.test(user) ||
     user.includes(
       "this summary will be the only context available when the conversation continues",
     ) ||
@@ -57,7 +61,8 @@ export function isSummaryGenerationRequest(messages: MessageLike[]): boolean {
     ) ||
     user.includes("anchored summary from the conversation history") ||
     user.includes("anchored summary below using the conversation history") ||
-    user.includes("<previous-summary>")
+    user.includes("<previous-summary>") ||
+    user.includes("<prior-summary>")
   );
 }
 

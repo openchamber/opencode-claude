@@ -349,6 +349,10 @@ export async function startClaudeQuery(
   const close = () => {
     if (closed) return;
     closed = true;
+    if (result && typeof result.close === "function") {
+      result.close();
+      return;
+    }
     killProcessTree(getPid(), { signal: "SIGTERM", force: true });
     if (result && typeof result.return === "function") {
       try {

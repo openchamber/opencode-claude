@@ -34,7 +34,11 @@ function knownClaudeLocations(
   env: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): string[] {
   const home = typeof env.HOME === "string" && env.HOME ? env.HOME : homedir();
-  const candidates = [join(home, ".local", "bin", "claude")];
+  const names =
+    process.platform === "win32"
+      ? ["claude.cmd", "claude.exe", "claude.bat", "claude"]
+      : ["claude"];
+  const candidates = names.map((name) => join(home, ".local", "bin", name));
 
   try {
     const prefix = spawnSync("npm", ["prefix", "-g"], {
@@ -44,7 +48,9 @@ function knownClaudeLocations(
       stdio: ["ignore", "pipe", "ignore"],
     });
     const dir = `${prefix.stdout || ""}`.trim();
-    if (dir) candidates.push(join(dir, "bin", "claude"));
+    if (dir) {
+      for (const name of names) candidates.push(join(dir, "bin", name));
+    }
   } catch {
     // no npm prefix available — PATH and ~/.local/bin remain
   }

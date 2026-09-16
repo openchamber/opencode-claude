@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { fileURLToPath } from "node:url";
 
 async function main() {
   const { buildClaudeCodeChildEnv } = await import("../src/auth-env.ts");
@@ -215,9 +216,8 @@ async function main() {
 
   // CLI resolution finds install locations a clean server PATH misses.
   {
-    const { mkdtempSync, writeFileSync, chmodSync, mkdirSync } = await import(
-      "node:fs"
-    );
+    const { mkdtempSync, writeFileSync, copyFileSync, chmodSync, mkdirSync } =
+      await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const { resolveClaudeCli } = await import("../src/executable-path.ts");
@@ -225,20 +225,25 @@ async function main() {
     const home = mkdtempSync(join(tmpdir(), "oc-claude-home-"));
     const binDir = join(home, ".local", "bin");
     mkdirSync(binDir, { recursive: true });
-    const fake = join(binDir, "claude");
-    writeFileSync(
-      fake,
-      '#!/bin/sh\necho "2.1.226 (Claude Code)"\n',
-      { mode: 0o755 },
+    const fake = join(
+      binDir,
+      process.platform === "win32" ? "claude.exe" : "claude",
     );
-    chmodSync(fake, 0o755);
+    if (process.platform === "win32") {
+      copyFileSync(process.execPath, fake);
+    } else {
+      writeFileSync(fake, '#!/bin/sh\necho "2.1.226 (Claude Code)"\n', {
+        mode: 0o755,
+      });
+    }
+    if (process.platform !== "win32") chmodSync(fake, 0o755);
 
-    assert.equal(resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }), fake);
+    const resolverEnv = { ...process.env, PATH: "/usr/bin:/bin", HOME: home };
+    const resolved = resolveClaudeCli(resolverEnv);
+    assert.equal(resolved, fake);
+    assert.ok(resolved);
     // And PATH itself still wins when the CLI is on it.
-    assert.equal(
-      resolveClaudeCli({ PATH: "/usr/bin:/bin", HOME: home }).length > 0,
-      true,
-    );
+    assert.equal(resolved.length > 0, true);
   }
 
   // The one-click install path: official npm package, script as fallback.
@@ -330,6 +335,14 @@ async function main() {
   assert.ok(models.some((m) => m.id === "opus"));
   assert.equal(resolveClaudeModelId("haiku"), "claude-haiku-4-5");
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
+
+  // 1M models declare an input window so OpenCode's auto-compaction trigger
+  // (limit.input minus reserved) fires predictably; 200K models stay untouched.
+  const aliasModel = (id: string) => CLAUDE_CODE_MODELS.find((m) => m.id === id)!;
+  assert.equal(aliasModel("fable").inputWindow, 900_000);
+  assert.equal(aliasModel("opus").inputWindow, 900_000);
+  assert.equal(aliasModel("sonnet").inputWindow, 900_000);
+  assert.equal(aliasModel("haiku").inputWindow, undefined);
 
   const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
   const variants = buildEffortVariants(sonnet);
@@ -723,13 +736,13 @@ async function main() {
     if (existsSync(logPath)) unlinkSync(logPath);
 
     const off = spawnSync(
-      "bun",
+      process.execPath,
       [
         "-e",
         `import { log } from "./src/log.ts"; log.info("SILENT_INFO"); log.error("ALWAYS_ERROR");`,
       ],
       {
-        cwd: new URL("..", import.meta.url).pathname,
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
         env: { ...process.env, OPENCODE_CLAUDE_DEBUG: "0" },
       },
@@ -739,13 +752,13 @@ async function main() {
     assert.match(off.stderr, /ALWAYS_ERROR/);
 
     const on = spawnSync(
-      "bun",
+      process.execPath,
       [
         "-e",
         `import { log } from "./src/log.ts"; log.info("DEBUG_INFO", { ok: true });`,
       ],
       {
-        cwd: new URL("..", import.meta.url).pathname,
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
         env: { ...process.env, OPENCODE_CLAUDE_DEBUG: "1" },
       },
@@ -823,9 +836,9 @@ async function main() {
   // Title meta requests use a constrained, tool-free Agent SDK turn.
   {
     const { setClaudeQueryStarter } = await import("../src/proxy.ts");
-    let titleOptions: Record<string, unknown> | null = null;
+    const titleOptions = { value: null as Record<string, unknown> | null };
     setClaudeQueryStarter(async (params) => {
-      titleOptions = params as unknown as Record<string, unknown>;
+      titleOptions.value = params as unknown as Record<string, unknown>;
       return {
         stream: (async function* () {
           yield {
@@ -870,23 +883,26 @@ async function main() {
       assert.match(titleBody, /data: /);
       assert.match(titleBody, /\[DONE\]/);
       assert.match(titleBody, /Binary search trees/);
-      assert.ok(titleOptions, "title request reached Agent SDK");
+      const capturedTitleOptions = titleOptions.value;
+      if (!capturedTitleOptions) {
+        throw new Error("title request did not reach Agent SDK");
+      }
       assert.equal(
-        (titleOptions!.env as Record<string, unknown>).CLAUDE_CODE_OAUTH_TOKEN,
+        (capturedTitleOptions.env as Record<string, unknown>).CLAUDE_CODE_OAUTH_TOKEN,
         undefined,
       );
-      assert.deepEqual(titleOptions!.tools, []);
-      assert.deepEqual(titleOptions!.settingSources, []);
-      assert.deepEqual(titleOptions!.skills, []);
-      assert.equal(titleOptions!.maxTurns, 1);
-      assert.equal(titleOptions!.autoCompactEnabled, false);
-      assert.deepEqual(titleOptions!.thinking, { type: "disabled" });
-      assert.equal(titleOptions!.resume, undefined);
+      assert.deepEqual(capturedTitleOptions.tools, []);
+      assert.deepEqual(capturedTitleOptions.settingSources, []);
+      assert.deepEqual(capturedTitleOptions.skills, []);
+      assert.equal(capturedTitleOptions.maxTurns, 1);
+      assert.equal(capturedTitleOptions.autoCompactEnabled, false);
+      assert.deepEqual(capturedTitleOptions.thinking, { type: "disabled" });
+      assert.equal(capturedTitleOptions.resume, undefined);
       assert.equal(
-        titleOptions!.systemPrompt,
+        capturedTitleOptions.systemPrompt,
         "You generate short session titles. Follow the requested output format exactly.",
       );
-      assert.match(String(titleOptions!.prompt), /<request>\nExplain how binary search trees work\n<\/request>/);
+      assert.match(String(capturedTitleOptions.prompt), /<request>\nExplain how binary search trees work\n<\/request>/);
     } finally {
       setClaudeQueryStarter(null);
     }
@@ -903,7 +919,6 @@ async function main() {
       normalizeClaudeErrorText,
       parseResetTimeFromText,
       rateLimitGate,
-      recordRateLimitErrorText,
       recordRateLimitInfo,
     } = await import("../src/rate-limit.ts");
     const { setClaudeQueryStarter } = await import("../src/proxy.ts");
@@ -1027,9 +1042,9 @@ async function main() {
       // Proxy + mock SDK: successful turn streams text, note, usage — and the
       // todowrite alias + plan-persistence prompt reach the query starter.
       __resetRateLimitNoteDedupe();
-      let seenParams: Record<string, unknown> | null = null;
+      const seenParams = { value: null as Record<string, unknown> | null };
       setClaudeQueryStarter(async (params) => {
-        seenParams = params as unknown as Record<string, unknown>;
+        seenParams.value = params as unknown as Record<string, unknown>;
         const events = [
           { type: "system", subtype: "init", session_id: "mock-sess-1" },
           {
@@ -1123,13 +1138,16 @@ async function main() {
       assert.equal(okJson.usage?.prompt_tokens, 11);
 
       // Query starter received the todo alias + plan-persistence append
-      assert.ok(seenParams, "query starter params captured");
-      assert.equal(seenParams.cwd, "/data/projects/infra");
-      const aliases = (seenParams as { toolAliases?: Record<string, string> })
+      const capturedSeenParams = seenParams.value;
+      if (!capturedSeenParams) {
+        throw new Error("query starter params not captured");
+      }
+      assert.equal(capturedSeenParams.cwd, "/data/projects/infra");
+      const aliases = (capturedSeenParams as { toolAliases?: Record<string, string> })
         .toolAliases;
       assert.equal(aliases?.TodoWrite, "mcp__opencode__todowrite");
       assert.equal(aliases?.todowrite, "mcp__opencode__todowrite");
-      const sysPrompt = seenParams.systemPrompt as { append?: string };
+      const sysPrompt = capturedSeenParams.systemPrompt as { append?: string };
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
 
@@ -1471,7 +1489,7 @@ async function main() {
       assert.match(String(res1Json.choices?.[0]?.message?.content ?? ""), /MOCK_OK/);
       assert.ok(seen1.params, "query starter called");
       assert.equal(seen1.params!.resume, undefined);
-      const promptText = String(seen1.params!.prompt ?? "");
+      const promptText = await readPromptText(seen1.params!.prompt);
       assert.match(promptText, /<conversation_history>/);
       assert.match(promptText, /AXIOM-9042/);
       assert.match(promptText, /Latest user message:\nwhat is the codename\?/);
@@ -1500,7 +1518,7 @@ async function main() {
       await res2.text();
       assert.equal(seen2.params!.resume, "mock-sess-live");
       assert.doesNotMatch(
-        String(seen2.params!.prompt ?? ""),
+        await readPromptText(seen2.params!.prompt),
         /<conversation_history>/,
       );
       rmSync(fakeProjectsDir, { recursive: true, force: true });
@@ -1514,7 +1532,10 @@ async function main() {
       assert.equal(res3.status, 200);
       await res3.text();
       assert.equal(seen3.params!.resume, undefined);
-      assert.match(String(seen3.params!.prompt ?? ""), /<conversation_history>/);
+      assert.match(
+        await readPromptText(seen3.params!.prompt),
+        /<conversation_history>/,
+      );
       assert.equal(getForeignSessionId("smoke-history-dead"), undefined);
 
       clearForeignSessionId("smoke-history-fresh");
@@ -1712,8 +1733,14 @@ async function main() {
   // ---- Turn stall watchdog + client-cancel teardown + CLI resolution cache ----
   {
     const { setClaudeQueryStarter } = await import("../src/proxy.ts");
-    const { mkdtempSync, rmSync, writeFileSync, chmodSync, unlinkSync } =
-      await import("node:fs");
+    const {
+      mkdtempSync,
+      rmSync,
+      writeFileSync,
+      copyFileSync,
+      chmodSync,
+      unlinkSync,
+    } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join: joinPath } = await import("node:path");
     const { resolveClaudeCli, resetClaudeCliResolutionCache } = await import(
@@ -1835,15 +1862,26 @@ async function main() {
     // child processes that hard-block the host's event loop on every query.
     const binDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-bin-"));
     try {
-      const fakeCli = joinPath(binDir, "claude");
-      writeFileSync(fakeCli, "#!/bin/sh\necho 9.9.9-smoke\n");
-      chmodSync(fakeCli, 0o755);
+      const fakeCli = joinPath(
+        binDir,
+        process.platform === "win32" ? "claude.exe" : "claude",
+      );
+      if (process.platform === "win32") {
+        copyFileSync(process.execPath, fakeCli);
+      } else {
+        writeFileSync(fakeCli, "#!/bin/sh\necho 9.9.9-smoke\n");
+      }
+      if (process.platform !== "win32") chmodSync(fakeCli, 0o755);
       // HOME points at the temp dir so the well-known-location fallback
       // (~/.local/bin/claude on this dev box) cannot mask a negative result.
-      const env = { PATH: binDir, HOME: binDir };
+      const env = { ...process.env, PATH: binDir, HOME: binDir };
       resetClaudeCliResolutionCache();
       const first = resolveClaudeCli(env);
-      assert.ok(first && first.endsWith("claude"), "fake CLI resolved");
+      assert.ok(
+        first &&
+          /[\\/]claude(?:\.(?:cmd|exe|bat))?$/.test(first),
+        `fake CLI resolved: ${String(first)}`,
+      );
       unlinkSync(fakeCli);
       const second = resolveClaudeCli(env);
       assert.equal(second, first, "resolution must be memoized");
@@ -1862,8 +1900,8 @@ async function main() {
   await stopProxy();
 
   // TypeScript build
-  const build = spawnSync("bun", ["run", "build"], {
-    cwd: new URL("..", import.meta.url).pathname,
+  const build = spawnSync(process.execPath, ["run", "build"], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
     encoding: "utf8",
   });
   if (build.status !== 0) {
@@ -1873,6 +1911,30 @@ async function main() {
   }
 
   console.log("ok — opencode-claude smoke tests passed");
+}
+
+async function readPromptText(prompt: unknown): Promise<string> {
+  if (typeof prompt === "string") return prompt;
+  if (prompt && typeof prompt === "object" && Symbol.asyncIterator in prompt) {
+    const next = await (prompt as AsyncIterable<unknown>)[
+      Symbol.asyncIterator
+    ]().next();
+    if (
+      next.value &&
+      typeof next.value === "object" &&
+      "message" in next.value &&
+      next.value.message &&
+      typeof next.value.message === "object" &&
+      "content" in next.value.message &&
+      typeof next.value.message.content === "string"
+    ) {
+      return next.value.message.content;
+    }
+    return typeof next.value === "string"
+      ? next.value
+      : (JSON.stringify(next.value) ?? String(next.value));
+  }
+  return String(prompt ?? "");
 }
 
 main().catch((err) => {

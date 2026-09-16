@@ -10,12 +10,15 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
+  clearAllBridges,
   deleteBridge,
+  deleteBridgesByConversation,
   findBridgeByConversation,
   findBridgeByPendingTool,
   putBridge,
   type ParkedBridge,
   type ParkedToolCall,
+  type ToolResultPayload,
 } from "./bridge-pool.js";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import {
@@ -55,23 +58,31 @@ import {
 import {
   buildConversationTranscript,
   extractTextContent,
+  extractToolResultImages,
   latestUserPrompt,
   priorMessagesOf,
   promptAsStream,
   withConversationContext,
   type SdkUserPrompt,
 } from "./prompt.js";
+import { createClaudePromptInput } from "./prompt-input.js";
+import {
+  ExclusivePumpGate,
+  SerializedAsyncIterator,
+} from "./serialized-iterator.js";
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
   requestKeyNamespace,
 } from "./request-kind.js";
 import {
-  addUniqueAssistantUsage,
+  addUniqueAssistantUsageState,
   formatCompactNote,
-  resolveTurnUsage,
+  resolveOpenCodeUsage,
   usageFromAssistantEvent,
   usageFromSdkResult,
+  usageFromSdkTurnResult,
+  type AssistantUsageState,
   type OpenAIUsage,
 } from "./usage.js";
 
@@ -258,6 +269,7 @@ export async function startProxy(): Promise<number> {
 }
 
 export async function stopProxy(): Promise<void> {
+  clearAllBridges();
   if (server) {
     server.stop(true);
     server = null;
@@ -325,13 +337,47 @@ async function handleRequest(req: Request): Promise<Response> {
 
 function collectToolResults(
   messages: OpenAIMessage[],
-): Map<string, string> {
-  const results = new Map<string, string>();
+): Map<string, ToolResultPayload> {
+  const results = new Map<string, ToolResultPayload>();
   for (const msg of messages) {
     if (msg.role !== "tool" || !msg.tool_call_id) continue;
-    results.set(msg.tool_call_id, extractTextContent(msg.content));
+    const attachments = extractToolResultImages(msg.content);
+    if (attachments.length > 0) {
+      log.info("[opencode-claude] tool result attachments", {
+        toolCallId: msg.tool_call_id,
+        count: attachments.length,
+        mimeTypes: attachments.map((a) => a.mimeType),
+      });
+    }
+    results.set(msg.tool_call_id, {
+      text: extractTextContent(msg.content),
+      attachments,
+    });
   }
   return results;
+}
+
+/**
+ * OpenCode promotes tool-result media (images/PDFs) into a synthetic user
+ * message ("Attached media from tool result:") for providers that cannot carry
+ * media inside tool results — which includes every openai-compatible provider.
+ * In the parked-bridge path that message would otherwise be dropped, because
+ * the turn resumes by resolving the parked MCP call only. Relay its images
+ * with the tool result so Claude actually sees them.
+ */
+const SYNTHETIC_TOOL_MEDIA_PROMPT = "Attached media from tool result:";
+
+function collectSyntheticToolMedia(
+  messages: OpenAIMessage[],
+): Array<{ type: "image"; data: string; mimeType: string }> {
+  const media: Array<{ type: "image"; data: string; mimeType: string }> = [];
+  for (const msg of messages) {
+    if (msg.role !== "user") continue;
+    if (extractTextContent(msg.content).trim() !== SYNTHETIC_TOOL_MEDIA_PROMPT)
+      continue;
+    media.push(...extractToolResultImages(msg.content));
+  }
+  return media;
 }
 
 function selectionFromRequest(
@@ -354,15 +400,45 @@ async function handleChatCompletions(
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const metaKind = detectMetaRequestKind(messages);
   const sessionHeader = req.headers.get(SESSION_HEADER);
+  const baseConversationKey =
+    sessionHeader || conversationKeyFromMessages(messages);
   const conversationKey =
-    requestKeyNamespace(metaKind) +
-    (sessionHeader || conversationKeyFromMessages(messages));
+    requestKeyNamespace(metaKind) + baseConversationKey;
+  if (metaKind === "summary") {
+    // OpenCode has compacted its history; resuming the old Claude session would
+    // restore the pre-compaction context and make the next usage snapshot jump.
+    deleteBridgesByConversation(baseConversationKey);
+    clearForeignSessionId(baseConversationKey);
+  }
   const selection = selectionFromRequest(req, body);
   const model = resolveClaudeModelId(selection.modelId);
   const stream = body.stream !== false;
+  const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
+  const cwd =
+    process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
 
   // Resume a parked bridge if OpenCode returned tool results.
   const toolResults = collectToolResults(messages);
+  // Media promoted by OpenCode to a synthetic "Attached media from tool result:"
+  // user message must ride the resolved tool call, or the parked turn resumes
+  // without the image attached.
+  const syntheticMedia = collectSyntheticToolMedia(messages);
+  if (syntheticMedia.length > 0) {
+    if (toolResults.size === 1) {
+      const only = [...toolResults.values()][0];
+      if (only.attachments.length === 0) {
+        only.attachments = syntheticMedia;
+        log.info("[opencode-claude] attached promoted tool-result media", {
+          count: syntheticMedia.length,
+        });
+      }
+    } else {
+      log.warn("[opencode-claude] promoted tool media could not be mapped", {
+        toolResults: toolResults.size,
+        count: syntheticMedia.length,
+      });
+    }
+  }
   let existing = findBridgeByConversation(conversationKey);
   // Fallback: match by tool_call_id when the session header is missing/changed.
   if ((!existing || existing.pendingTools.size === 0) && toolResults.size > 0) {
@@ -375,47 +451,49 @@ async function handleChatCompletions(
     }
   }
   if (existing && existing.pendingTools.size > 0) {
-    let resolved = 0;
-    for (const [toolId, tool] of existing.pendingTools) {
-      const result = toolResults.get(toolId);
-      if (result !== undefined) {
-        tool.resolve(result);
-        existing.pendingTools.delete(toolId);
-        resolved++;
+    const releasePump = await existing.pumpGate.acquire();
+    let handedOff = false;
+    try {
+      if (!existing.closed) {
+        let resolved = 0;
+        for (const [toolId, tool] of existing.pendingTools) {
+          const result = toolResults.get(toolId);
+          if (result !== undefined) {
+            tool.resolve(result);
+            existing.pendingTools.delete(toolId);
+            resolved++;
+          }
+        }
+        if (existing.pendingTools.size === 0 && existing.continueStream) {
+          log.info("[opencode-claude] resuming parked bridge", {
+            conversationKey: existing.conversationKey,
+            resolved,
+          });
+          const continued = existing.continueStream(releasePump, req.signal);
+          handedOff = true;
+          return stream
+            ? streamOpenAIResponse(continued, body.model || model, existing)
+            : collectTurnResponse(continued, body.model || model, existing);
+        }
+        // Still parked — do not start a parallel Claude turn (OpenCode may retry
+        // or send a follow-up before tool results arrive). Re-emit pending calls.
+        // Also covers partial tool results (resolved > 0 but others still pending).
+        if (existing.pendingTools.size > 0) {
+          log.info("[opencode-claude] re-emitting parked tool_calls", {
+            conversationKey: existing.conversationKey,
+            pending: existing.pendingTools.size,
+            resolved,
+          });
+          const parkedEvents = (async function* () {
+            yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
+          })();
+          return stream
+            ? streamOpenAIResponse(parkedEvents, body.model || model, existing)
+            : collectTurnResponse(parkedEvents, body.model || model, existing);
+        }
       }
-    }
-    if (existing.pendingTools.size === 0 && existing.continueStream) {
-      log.info("[opencode-claude] resuming parked bridge", {
-        conversationKey: existing.conversationKey,
-        resolved,
-      });
-      return stream
-        ? streamOpenAIResponse(
-            existing.continueStream(),
-            body.model || model,
-            existing,
-          )
-        : collectTurnResponse(
-            existing.continueStream(),
-            body.model || model,
-            existing,
-          );
-    }
-    // Still parked — do not start a parallel Claude turn (OpenCode may retry
-    // or send a follow-up before tool results arrive). Re-emit pending calls.
-    // Also covers partial tool results (resolved > 0 but others still pending).
-    if (existing.pendingTools.size > 0) {
-      log.info("[opencode-claude] re-emitting parked tool_calls", {
-        conversationKey: existing.conversationKey,
-        pending: existing.pendingTools.size,
-        resolved,
-      });
-      const parkedEvents = (async function* () {
-        yield { type: "__park__", tools: [...existing!.pendingTools.values()] };
-      })();
-      return stream
-        ? streamOpenAIResponse(parkedEvents, body.model || model, existing)
-        : collectTurnResponse(parkedEvents, body.model || model, existing);
+    } finally {
+      if (!handedOff) releasePump();
     }
   }
 
@@ -433,9 +511,6 @@ async function handleChatCompletions(
 
   const openCodeTools = Array.isArray(body.tools) ? body.tools : [];
   const isMetaRequest = metaKind !== null;
-  const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
-  const cwd =
-    process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
   const pendingTools = new Map<string, ParkedToolCall>();
   let handle: ClaudeQueryHandle | null = null;
@@ -444,6 +519,11 @@ async function handleChatCompletions(
 
   const notifyPark = () => {
     parked = true;
+    log.info("[opencode-claude] MCP park", {
+      bridgeId,
+      conversationKey,
+      pendingTools: pendingTools.size,
+    });
     const waiters = parkWaiters;
     parkWaiters = [];
     for (const resolve of waiters) resolve();
@@ -513,6 +593,42 @@ async function handleChatCompletions(
     );
   }
 
+  if (
+    existing?.persistent &&
+    !existing.closed &&
+    existing.input &&
+    existing.continueStream
+  ) {
+    if (existing.modelId !== model || existing.cwd !== cwd) {
+      deleteBridge(existing.id);
+      existing = undefined;
+    } else {
+      const input = existing.input;
+      const continueStream = existing.continueStream;
+      log.info("[opencode-claude] reusing persistent bridge", {
+        bridgeId: existing.id,
+        conversationKey: existing.conversationKey,
+        model,
+      });
+      const releasePump = await existing.pumpGate.acquire();
+      let handedOff = false;
+      try {
+        if (existing.closed) {
+          existing = undefined;
+        } else {
+          input.push(toSdkUserPrompt(prompt));
+          const continued = continueStream(releasePump, req.signal);
+          handedOff = true;
+          return stream
+            ? streamOpenAIResponse(continued, body.model || model, existing)
+            : collectTurnResponse(continued, body.model || model, existing);
+        }
+      } finally {
+        if (!handedOff) releasePump();
+      }
+    }
+  }
+
   let resume = getForeignSessionId(conversationKey);
   if (resume && !findClaudeSessionFile(resume)) {
     // The claude CLI resumes by looking the session up on disk. A missing
@@ -576,7 +692,7 @@ async function handleChatCompletions(
   const titleSource = [...messages]
     .reverse()
     .find((message) => message.role === "user");
-  const queryPrompt: string | AsyncIterable<SdkUserPrompt> = metaKind === "title"
+  const queryPrompt: string | SdkUserPrompt = metaKind === "title"
     ? [
         "Create a concise 3-7 word session title for the request quoted below.",
         "Output only the title, with no quotation marks or punctuation at the end.",
@@ -588,7 +704,15 @@ async function handleChatCompletions(
       ].join("\n")
     : typeof contextualPrompt === "string"
       ? contextualPrompt || " "
-      : promptAsStream(contextualPrompt);
+      : contextualPrompt;
+  const persistentInput = isMetaRequest
+    ? undefined
+    : createClaudePromptInput(toSdkUserPrompt(queryPrompt));
+  const sdkPrompt: string | AsyncIterable<SdkUserPrompt> = persistentInput
+    ? persistentInput.stream
+    : typeof queryPrompt === "string"
+      ? queryPrompt
+      : promptAsStream(queryPrompt);
 
   const hasTodoWrite = openCodeToolNames.includes("todowrite");
   const utilitySystemPrompt = isMetaRequest
@@ -599,8 +723,16 @@ async function handleChatCompletions(
           "This is a single-turn text transformation. Return only the requested summary. Do not inspect files, execute commands, or use tools.",
         ].filter(Boolean).join("\n\n")
     : undefined;
+  log.info("[opencode-claude] query start", {
+    bridgeId,
+    conversationKey,
+    model,
+    persistent: !isMetaRequest,
+    hasMcp: mcpServers !== undefined,
+    resumed: resume !== undefined,
+  });
   handle = await queryStarter({
-    prompt: queryPrompt,
+    prompt: sdkPrompt,
     cwd,
     model,
     resume: isMetaRequest ? undefined : resume,
@@ -649,6 +781,26 @@ async function handleChatCompletions(
         : {}),
     },
   });
+  log.info("[opencode-claude] query acquired", {
+    bridgeId,
+    conversationKey,
+    model,
+  });
+  const streamIterator = handle.stream[Symbol.asyncIterator]();
+  const serializedIterator = new SerializedAsyncIterator(streamIterator, {
+    onNextStart: (shared) => {
+      log.info("[opencode-claude] iterator next start", { bridgeId, shared });
+    },
+    onNextFinish: (done) => {
+      log.info("[opencode-claude] iterator next finish", { bridgeId, done });
+    },
+    onNextError: () => {
+      log.info("[opencode-claude] iterator next error", { bridgeId });
+    },
+    onRelease: () => {
+      log.info("[opencode-claude] iterator next release", { bridgeId });
+    },
+  });
 
   const bridge: ParkedBridge = {
     id: bridgeId,
@@ -657,11 +809,35 @@ async function handleChatCompletions(
     pendingTools,
     seenAssistantUsageIds: new Set(),
     createdAt: Date.now(),
+    input: persistentInput,
+    streamIterator: serializedIterator,
+    pumpGate: new ExclusivePumpGate(),
+    persistent: !isMetaRequest,
+    modelId: model,
+    cwd,
   };
   putBridge(bridge);
 
-  async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {
-    const iterator = handle!.stream[Symbol.asyncIterator]();
+  async function* consumeStream(
+    suppliedReleasePump?: () => void,
+    requestSignal: AbortSignal = req.signal,
+  ): AsyncGenerator<unknown, void, unknown> {
+    const iterator = serializedIterator;
+    const releasePump =
+      suppliedReleasePump ?? (await bridge.pumpGate.acquire());
+    let keepBridge = false;
+    let sawFirstSdkEvent = false;
+    const noteFirstSdkEvent = (event: unknown) => {
+      if (sawFirstSdkEvent) return;
+      sawFirstSdkEvent = true;
+      const type =
+        event &&
+        typeof event === "object" &&
+        typeof (event as { type?: unknown }).type === "string"
+          ? (event as { type: string }).type
+          : typeof event;
+      log.info("[opencode-claude] first SDK event", { bridgeId, type });
+    };
     try {
       while (true) {
         const parkControl = {
@@ -698,6 +874,12 @@ async function handleChatCompletions(
           }, ms);
           stallTimer.unref?.();
         });
+        let requestAbortHandler: (() => void) | undefined;
+        const requestAbortPromise = new Promise<never>((_, reject) => {
+          requestAbortHandler = () => reject(new Error("Claude request aborted"));
+          if (requestSignal.aborted) requestAbortHandler();
+          else requestSignal.addEventListener("abort", requestAbortHandler, { once: true });
+        });
 
         const nextPromise = iterator.next();
         let raced:
@@ -708,45 +890,64 @@ async function handleChatCompletions(
             nextPromise.then((value) => ({ kind: "event" as const, value })),
             parkPromise.then(() => ({ kind: "park" as const })),
             stallPromise,
+            requestAbortPromise,
           ]);
         } catch (error) {
           // Stall watchdog fired — the turn is dead. Swallow the late
           // iterator settlement so it cannot surface as an unhandled
           // rejection after we throw.
+          parkControl.cancel?.();
           nextPromise.then(
             () => {},
             () => {},
           );
+          log.warn("[opencode-claude] stream wait interrupted", {
+            bridgeId,
+            reason: requestSignal.aborted ? "client-abort" : "watchdog-or-iterator-error",
+          });
           throw error;
         } finally {
           if (stallTimer) clearTimeout(stallTimer);
+          if (requestAbortHandler) {
+            requestSignal.removeEventListener("abort", requestAbortHandler);
+          }
         }
 
         if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
+          keepBridge = true;
           parkControl.cancel?.();
           await Promise.resolve();
           // The iterator's pending next() may already have consumed the
           // assistant event that carries the parked tool call (and its
           // per-call usage). Forward it before parking so usage accounting
           // and session binding stay intact.
-          if (raced.kind === "event" && !raced.value.done) {
-            const pendingEvent = raced.value.value;
-            const pendingSessionId = extractSessionId(pendingEvent);
-            if (pendingSessionId) {
-              setForeignSessionId(conversationKey, pendingSessionId, {
-                modelId: model,
-                cwd,
-              });
+          if (raced.kind === "event") {
+            iterator.release(nextPromise);
+            if (!raced.value.done) {
+              const pendingEvent = raced.value.value;
+              noteFirstSdkEvent(pendingEvent);
+              const pendingSessionId = extractSessionId(pendingEvent);
+              if (pendingSessionId) {
+                setForeignSessionId(conversationKey, pendingSessionId, {
+                  modelId: model,
+                  cwd,
+                });
+              }
+              yield pendingEvent;
             }
-            yield pendingEvent;
           }
           yield { type: "__park__", tools: [...pendingTools.values()] };
           return;
         }
 
         parkControl.cancel?.();
-        if (raced.value.done) break;
+        if (raced.value.done) {
+          iterator.release(nextPromise);
+          break;
+        }
         const event = raced.value.value;
+        iterator.release(nextPromise);
+        noteFirstSdkEvent(event);
         const sessionId = extractSessionId(event);
         if (sessionId) {
           setForeignSessionId(conversationKey, sessionId, {
@@ -755,19 +956,28 @@ async function handleChatCompletions(
           });
         }
         yield event;
+        if (isTurnBoundary(event)) {
+          keepBridge = bridge.persistent === true && !isErrorResult(event);
+          return;
+        }
       }
     } finally {
-      if (!parked) {
-        handle?.close();
+      releasePump();
+      if (!keepBridge && !bridge.closed) {
         deleteBridge(bridgeId);
       }
     }
   }
 
-  bridge.continueStream = async function* () {
+  bridge.continueStream = async function* (suppliedReleasePump, requestSignal) {
+    log.info("[opencode-claude] bridge continuation", {
+      bridgeId,
+      conversationKey,
+      suppliedPump: suppliedReleasePump !== undefined,
+    });
     parked = false;
     parkWaiters = [];
-    yield* consumeStream();
+    yield* consumeStream(suppliedReleasePump, requestSignal);
   };
 
   // A turn that dies BEFORE producing any content (bad token, session limit,
@@ -783,6 +993,32 @@ async function handleChatCompletions(
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
   return collectTurnResponse(consumeStream(), body.model || model, bridge);
+}
+
+function toSdkUserPrompt(prompt: string | SdkUserPrompt): SdkUserPrompt {
+  if (typeof prompt !== "string") return prompt;
+  return {
+    type: "user",
+    message: { role: "user", content: prompt },
+    parent_tool_use_id: null,
+  };
+}
+
+function isTurnBoundary(event: unknown): boolean {
+  return (
+    !!event &&
+    typeof event === "object" &&
+    (event as { type?: unknown }).type === "result"
+  );
+}
+
+function isErrorResult(event: unknown): boolean {
+  return (
+    !!event &&
+    typeof event === "object" &&
+    (event as { type?: unknown; is_error?: unknown }).type === "result" &&
+    (event as { is_error?: unknown }).is_error === true
+  );
 }
 
 
@@ -869,16 +1105,25 @@ async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
-              pending.resolve = resolve;
-              pending.reject = reject;
-            });
+            const resultPromise = new Promise<ToolResultPayload>(
+              (resolve, reject) => {
+                pending.resolve = resolve;
+                pending.reject = reject;
+              },
+            );
             // Register before notifying so the stream consumer sees the tool.
             pendingTools.set(id, pending);
             onPark();
             const result = await resultPromise;
             return {
-              content: [{ type: "text", text: result }],
+              content: [
+                { type: "text" as const, text: result.text },
+                ...result.attachments.map((attachment) => ({
+                  type: "image" as const,
+                  data: attachment.data,
+                  mimeType: attachment.mimeType,
+                })),
+              ],
             };
           },
           { alwaysLoad: true },
@@ -922,7 +1167,10 @@ async function collectTurnResponse(
 
   let content = "";
   let reasoning = "";
-  let turnUsage: OpenAIUsage | null = null;
+  let usageState: AssistantUsageState = {
+    aggregate: null,
+    latest: bridge.lastAssistantUsage ?? null,
+  };
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
   let errorText: string | null = null;
@@ -949,12 +1197,13 @@ async function collectTurnResponse(
       } else if (mapped.kind === "reasoning") {
         if (!suppressReasoning) reasoning += mapped.text;
       } else if (mapped.kind === "usage-delta") {
-        turnUsage = addUniqueAssistantUsage(
-          turnUsage,
+        usageState = addUniqueAssistantUsageState(
+          usageState,
           mapped.usage,
           mapped.messageId,
           bridge.seenAssistantUsageIds,
         );
+        if (usageState.latest) bridge.lastAssistantUsage = usageState.latest;
       } else if (mapped.kind === "usage") {
         resultUsage = mapped.usage;
       } else if (mapped.kind === "error") {
@@ -972,7 +1221,7 @@ async function collectTurnResponse(
     noteError(message);
   }
 
-  const usage = resolveTurnUsage(turnUsage, resultUsage);
+  const usage = resolveOpenCodeUsage(usageState, resultUsage);
 
   // Buffered responses have not committed HTTP headers yet. Even if an agent
   // produced partial work first, preserve the real 429 so OpenCode starts its
@@ -1248,7 +1497,10 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
-      let turnUsage: OpenAIUsage | null = null;
+      let usageState: AssistantUsageState = {
+        aggregate: null,
+        latest: bridge.lastAssistantUsage ?? null,
+      };
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
       const sendError = (text: string) => {
@@ -1362,12 +1614,13 @@ function streamOpenAIResponse(
           }
 
           if (mapped.kind === "usage-delta") {
-            turnUsage = addUniqueAssistantUsage(
-              turnUsage,
+            usageState = addUniqueAssistantUsageState(
+              usageState,
               mapped.usage,
               mapped.messageId,
               bridge.seenAssistantUsageIds,
             );
+            if (usageState.latest) bridge.lastAssistantUsage = usageState.latest;
           }
 
           if (mapped.kind === "usage") {
@@ -1401,7 +1654,7 @@ function streamOpenAIResponse(
         finishReason = "stop";
       }
 
-      const usage = resolveTurnUsage(turnUsage, resultUsage);
+      const usage = resolveOpenCodeUsage(usageState, resultUsage);
       if (!streamClosed) {
         send({
           id: completionId,
@@ -1429,6 +1682,10 @@ function streamOpenAIResponse(
       // the turn down instead of leaking the CLI process and the bridge.
       streamClosed = true;
       if (heartbeat) clearInterval(heartbeat);
+      log.info("[opencode-claude] client stream cancel", {
+        bridgeId: bridge.id,
+        conversationKey: bridge.conversationKey,
+      });
       deleteBridge(bridge.id);
     },
   });
@@ -1586,7 +1843,16 @@ function mapSdkEvent(event: unknown): MappedEvent {
   }
 
   if (e.type === "result") {
-    const usage = usageFromSdkResult(event);
+    const turnUsage = usageFromSdkTurnResult(event);
+    const accountingUsage = usageFromSdkResult(event);
+    const usage = turnUsage
+      ? {
+          ...turnUsage,
+          ...(accountingUsage?.model_usage !== undefined
+            ? { model_usage: accountingUsage.model_usage }
+            : {}),
+        }
+      : null;
     if (e.is_error) {
       const text =
         typeof e.result === "string"

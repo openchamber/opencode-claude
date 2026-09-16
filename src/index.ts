@@ -108,6 +108,7 @@ function buildProviderModel(
     cost: zeroCost(),
     limit: {
       context: model.contextWindow,
+      ...(model.inputWindow ? { input: model.inputWindow } : {}),
       output: model.maxTokens,
     },
     status: "active",
@@ -142,6 +143,7 @@ function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
     },
     limit: {
       context: model.contextWindow,
+      ...(model.inputWindow ? { input: model.inputWindow } : {}),
       output: model.maxTokens,
     },
     options: {
