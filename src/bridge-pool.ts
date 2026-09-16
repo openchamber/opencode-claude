@@ -7,12 +7,19 @@ import type { ClaudePromptInput } from "./prompt-input.js";
 import type { ExclusivePumpGate } from "./serialized-iterator.js";
 import type { OpenAIUsage } from "./usage.js";
 import { log } from "./log.js";
+import type { ToolResultAttachment } from "./prompt.js";
+
+/** Resolved payload for a parked tool call, including image attachments. */
+export type ToolResultPayload = {
+  text: string;
+  attachments: ToolResultAttachment[];
+};
 
 export type ParkedToolCall = {
   id: string;
   name: string;
   arguments: string;
-  resolve: (result: string) => void;
+  resolve: (result: ToolResultPayload) => void;
   reject: (error: Error) => void;
 };
 

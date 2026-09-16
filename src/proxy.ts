@@ -18,6 +18,7 @@ import {
   putBridge,
   type ParkedBridge,
   type ParkedToolCall,
+  type ToolResultPayload,
 } from "./bridge-pool.js";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import {
@@ -57,6 +58,7 @@ import {
 import {
   buildConversationTranscript,
   extractTextContent,
+  extractToolResultImages,
   latestUserPrompt,
   priorMessagesOf,
   promptAsStream,
@@ -335,13 +337,47 @@ async function handleRequest(req: Request): Promise<Response> {
 
 function collectToolResults(
   messages: OpenAIMessage[],
-): Map<string, string> {
-  const results = new Map<string, string>();
+): Map<string, ToolResultPayload> {
+  const results = new Map<string, ToolResultPayload>();
   for (const msg of messages) {
     if (msg.role !== "tool" || !msg.tool_call_id) continue;
-    results.set(msg.tool_call_id, extractTextContent(msg.content));
+    const attachments = extractToolResultImages(msg.content);
+    if (attachments.length > 0) {
+      log.info("[opencode-claude] tool result attachments", {
+        toolCallId: msg.tool_call_id,
+        count: attachments.length,
+        mimeTypes: attachments.map((a) => a.mimeType),
+      });
+    }
+    results.set(msg.tool_call_id, {
+      text: extractTextContent(msg.content),
+      attachments,
+    });
   }
   return results;
+}
+
+/**
+ * OpenCode promotes tool-result media (images/PDFs) into a synthetic user
+ * message ("Attached media from tool result:") for providers that cannot carry
+ * media inside tool results — which includes every openai-compatible provider.
+ * In the parked-bridge path that message would otherwise be dropped, because
+ * the turn resumes by resolving the parked MCP call only. Relay its images
+ * with the tool result so Claude actually sees them.
+ */
+const SYNTHETIC_TOOL_MEDIA_PROMPT = "Attached media from tool result:";
+
+function collectSyntheticToolMedia(
+  messages: OpenAIMessage[],
+): Array<{ type: "image"; data: string; mimeType: string }> {
+  const media: Array<{ type: "image"; data: string; mimeType: string }> = [];
+  for (const msg of messages) {
+    if (msg.role !== "user") continue;
+    if (extractTextContent(msg.content).trim() !== SYNTHETIC_TOOL_MEDIA_PROMPT)
+      continue;
+    media.push(...extractToolResultImages(msg.content));
+  }
+  return media;
 }
 
 function selectionFromRequest(
@@ -383,6 +419,26 @@ async function handleChatCompletions(
 
   // Resume a parked bridge if OpenCode returned tool results.
   const toolResults = collectToolResults(messages);
+  // Media promoted by OpenCode to a synthetic "Attached media from tool result:"
+  // user message must ride the resolved tool call, or the parked turn resumes
+  // without the image attached.
+  const syntheticMedia = collectSyntheticToolMedia(messages);
+  if (syntheticMedia.length > 0) {
+    if (toolResults.size === 1) {
+      const only = [...toolResults.values()][0];
+      if (only.attachments.length === 0) {
+        only.attachments = syntheticMedia;
+        log.info("[opencode-claude] attached promoted tool-result media", {
+          count: syntheticMedia.length,
+        });
+      }
+    } else {
+      log.warn("[opencode-claude] promoted tool media could not be mapped", {
+        toolResults: toolResults.size,
+        count: syntheticMedia.length,
+      });
+    }
+  }
   let existing = findBridgeByConversation(conversationKey);
   // Fallback: match by tool_call_id when the session header is missing/changed.
   if ((!existing || existing.pendingTools.size === 0) && toolResults.size > 0) {
@@ -1049,16 +1105,25 @@ async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
-              pending.resolve = resolve;
-              pending.reject = reject;
-            });
+            const resultPromise = new Promise<ToolResultPayload>(
+              (resolve, reject) => {
+                pending.resolve = resolve;
+                pending.reject = reject;
+              },
+            );
             // Register before notifying so the stream consumer sees the tool.
             pendingTools.set(id, pending);
             onPark();
             const result = await resultPromise;
             return {
-              content: [{ type: "text", text: result }],
+              content: [
+                { type: "text" as const, text: result.text },
+                ...result.attachments.map((attachment) => ({
+                  type: "image" as const,
+                  data: attachment.data,
+                  mimeType: attachment.mimeType,
+                })),
+              ],
             };
           },
           { alwaysLoad: true },

@@ -376,6 +376,115 @@ export function contentHasAttachments(content: unknown): boolean {
     );
   });
 }
+/**
+ * Extract image parts from an OpenAI-compatible tool result content array so
+ * they can be re-attached as MCP image content blocks when a parked tool call
+ * is resolved (tool-result images otherwise never reach Claude).
+ * Text stays in `extractTextContent`; this only collects binaries. Remote
+ * http(s) image URLs are skipped — MCP image content requires base64 data.
+ */
+export type ToolResultAttachment = {
+  type: "image";
+  data: string;
+  mimeType: string;
+};
+
+export function extractToolResultImages(
+  content: unknown,
+): ToolResultAttachment[] {
+  if (!Array.isArray(content)) return [];
+  const images: ToolResultAttachment[] = [];
+  const push = (mediaType: string, data: string): void => {
+    if (!data || !mediaLooksLikeImage(mediaType)) return;
+    images.push({ type: "image", data, mimeType: mediaType });
+  };
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as Record<string, unknown>;
+    const type = typeof p.type === "string" ? p.type : "";
+
+    if (type === "image_url" || type === "input_image") {
+      const imageUrl = p.image_url;
+      const url =
+        typeof imageUrl === "string"
+          ? imageUrl
+          : imageUrl &&
+              typeof imageUrl === "object" &&
+              typeof (imageUrl as { url?: unknown }).url === "string"
+            ? (imageUrl as { url: string }).url
+            : null;
+      const parsed = url ? parseDataUrl(url) : null;
+      if (parsed) push(parsed.mediaType, parsed.data);
+      continue;
+    }
+
+    if (type === "file" || type === "input_file") {
+      const file = (
+        p.file && typeof p.file === "object" ? p.file : p
+      ) as Record<string, unknown>;
+      const fileData =
+        typeof file.file_data === "string" ? file.file_data : null;
+      const url =
+        typeof file.url === "string"
+          ? file.url
+          : fileData && /^data:/i.test(fileData)
+            ? fileData
+            : null;
+      const data =
+        typeof file.data === "string"
+          ? file.data
+          : fileData && !/^data:/i.test(fileData)
+            ? fileData
+            : null;
+      const mediaType =
+        typeof file.media_type === "string"
+          ? file.media_type
+          : typeof file.mime_type === "string"
+            ? file.mime_type
+            : typeof file.mime === "string"
+              ? file.mime
+              : "";
+      const parsed = url
+        ? parseDataUrl(url)
+        : data && /^data:/i.test(data)
+          ? parseDataUrl(data)
+          : null;
+      if (parsed) push(parsed.mediaType, parsed.data);
+      else if (data && mediaType) push(mediaType, data);
+      continue;
+    }
+
+    if (type === "image") {
+      const mediaType =
+        typeof p.media_type === "string"
+          ? p.media_type
+          : typeof p.mimeType === "string"
+            ? p.mimeType
+            : typeof p.mime === "string"
+              ? p.mime
+              : "image/png";
+      const source = p.source;
+      if (source && typeof source === "object") {
+        const s = source as Record<string, unknown>;
+        if (s.type === "base64" && typeof s.data === "string")
+          push(mediaType, s.data);
+        else if (s.type === "url" && typeof s.url === "string") {
+          const parsed = parseDataUrl(s.url);
+          if (parsed) push(parsed.mediaType, parsed.data);
+        }
+        continue;
+      }
+      const image = p.image;
+      if (typeof image === "string") {
+        const parsed = parseDataUrl(image);
+        if (parsed) push(parsed.mediaType, parsed.data);
+        else push(mediaType, image);
+      }
+      continue;
+    }
+  }
+  return images;
+}
 
 export function openaiContentToAnthropicBlocks(
   content: unknown,
