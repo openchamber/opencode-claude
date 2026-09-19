@@ -29,6 +29,7 @@ import {
   EFFORT_HEADER,
 } from "./model-selection.js";
 import { resolveClaudeModelId } from "./models.js";
+import { fitToolDescription } from "./tool-description.js";
 import {
   DIRECTORY_HEADER,
   SESSION_HEADER,
@@ -852,7 +853,7 @@ async function buildOpenCodeMcpServer(
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
-        const description = t.function?.description || name;
+        const description = fitToolDescription(t.function?.description || name);
         const shape = jsonSchemaToZodShape(
           t.function?.parameters as Record<string, unknown> | undefined,
         );
