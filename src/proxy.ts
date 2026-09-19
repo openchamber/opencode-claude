@@ -839,7 +839,11 @@ async function buildOpenCodeMcpServer(
         else if (type === "number" || type === "integer") field = z.number();
         else if (type === "boolean") field = z.boolean();
         else if (type === "array") field = z.array(z.any());
-        else if (type === "object") field = z.record(z.string(), z.any());
+        // Not z.record: the SDK converts shapes with its own bundled zod, and
+        // a newer plugin-side zod (4.5.x) emits records through a processor
+        // the older converter cannot run, which breaks tools/list for every
+        // tool (#12). An open object serialises identically across versions.
+        else if (type === "object") field = z.object({}).catchall(z.any());
         if (!required.has(key)) {
           field = (field as { optional: () => unknown }).optional();
         }
