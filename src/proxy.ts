@@ -29,6 +29,7 @@ import {
   EFFORT_HEADER,
 } from "./model-selection.js";
 import { resolveClaudeModelId } from "./models.js";
+import { collectSteeringText, withSteering } from "./steering.js";
 import {
   DIRECTORY_HEADER,
   SESSION_HEADER,
@@ -376,13 +377,31 @@ async function handleChatCompletions(
   }
   if (existing && existing.pendingTools.size > 0) {
     let resolved = 0;
+    // Deliver queued user messages with the last tool result resolved now,
+    // so they reach Claude exactly once.
+    const steering = collectSteeringText(messages);
+    const resolvable = [...existing.pendingTools.keys()].filter((id) =>
+      toolResults.has(id),
+    );
+    const steeringToolId =
+      steering && resolvable.length > 0
+        ? resolvable[resolvable.length - 1]
+        : undefined;
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        tool.resolve(result);
+        tool.resolve(
+          toolId === steeringToolId ? withSteering(result, steering) : result,
+        );
         existing.pendingTools.delete(toolId);
         resolved++;
       }
+    }
+    if (steeringToolId) {
+      log.info("[opencode-claude] forwarding mid-turn user steering", {
+        conversationKey: existing.conversationKey,
+        steeringChars: steering.length,
+      });
     }
     if (existing.pendingTools.size === 0 && existing.continueStream) {
       log.info("[opencode-claude] resuming parked bridge", {
