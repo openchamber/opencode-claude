@@ -30,6 +30,10 @@ import {
 } from "./model-selection.js";
 import { resolveClaudeModelId } from "./models.js";
 import {
+  openCodeSystemContext,
+  systemContextForwardingEnabled,
+} from "./system-context.js";
+import {
   DIRECTORY_HEADER,
   SESSION_HEADER,
   type ClaudeEffort,
@@ -591,6 +595,10 @@ async function handleChatCompletions(
       : promptAsStream(contextualPrompt);
 
   const hasTodoWrite = openCodeToolNames.includes("todowrite");
+  const openCodeContext =
+    isMetaRequest || !systemContextForwardingEnabled()
+      ? ""
+      : openCodeSystemContext(messages);
   const utilitySystemPrompt = isMetaRequest
     ? metaKind === "title"
       ? "You generate short session titles. Follow the requested output format exactly."
@@ -644,9 +652,11 @@ async function handleChatCompletions(
                     "For any multi-step work, ALWAYS write the plan with the mcp__opencode__todowrite tool and keep it updated as you progress. A plan that only exists in your text is lost when the session is restored or handed to another agent.",
                   ]
                 : []),
-            ].join(" "),
+            ].join(" ") + (openCodeContext ? `\n\n${openCodeContext}` : ""),
           }
-        : {}),
+        : openCodeContext
+          ? { append: openCodeContext }
+          : {}),
     },
   });
 
