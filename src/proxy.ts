@@ -84,6 +84,13 @@ const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
  * design), which wedges the OpenCode session as "busy" until the host's
  * supervisor force-restarts the whole server — the 2026-08-18 hang.
  */
+const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
+
+function structuredOutputReapMs(): number {
+  const raw = Number(process.env.OPENCODE_CLAUDE_STRUCTURED_OUTPUT_REAP_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 60_000;
+}
+
 function turnStallMs(): number {
   const raw = Number(process.env.OPENCODE_CLAUDE_TURN_STALL_MS);
   return Number.isFinite(raw) && raw >= 1_000 ? raw : 600_000;
@@ -660,6 +667,30 @@ async function handleChatCompletions(
   };
   putBridge(bridge);
 
+  // OpenCode treats a StructuredOutput call as the end of the request and
+  // never sends a tool result back, so a turn parked only on StructuredOutput
+  // is never resumed and its Claude Code process leaks (one per structured
+  // request). Close the bridge if nothing resumed it within the grace period.
+  function scheduleStructuredOutputReap(): void {
+    const parkedTools = [...pendingTools.values()];
+    if (
+      parkedTools.length === 0 ||
+      !parkedTools.every((t) => t.name === STRUCTURED_OUTPUT_TOOL)
+    ) {
+      return;
+    }
+    const ids = parkedTools.map((t) => t.id);
+    const reaper = setTimeout(() => {
+      if (parked && ids.every((id) => pendingTools.has(id))) {
+        log.info("[opencode-claude] reaping unresumed StructuredOutput park", {
+          conversationKey,
+        });
+        deleteBridge(bridgeId);
+      }
+    }, structuredOutputReapMs());
+    reaper.unref?.();
+  }
+
   async function* consumeStream(): AsyncGenerator<unknown, void, unknown> {
     const iterator = handle!.stream[Symbol.asyncIterator]();
     try {
@@ -740,6 +771,7 @@ async function handleChatCompletions(
             }
             yield pendingEvent;
           }
+          scheduleStructuredOutputReap();
           yield { type: "__park__", tools: [...pendingTools.values()] };
           return;
         }
