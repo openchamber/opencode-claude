@@ -797,6 +797,9 @@ function extractSessionId(event: unknown): string | null {
   return null;
 }
 
+/** JSON Schema (stringified) -> SDK-verified zod shape, or null. */
+const faithfulShapeCache = new Map<string, Record<string, unknown> | null>();
+
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -812,6 +815,48 @@ async function buildOpenCodeMcpServer(
       log.warn("[opencode-claude] SDK MCP helpers unavailable; OpenCode tools disabled");
       return undefined;
     }
+
+    // Full conversion of an OpenCode JSON Schema (descriptions, enums,
+    // nested item shapes and required fields) into a zod shape. The SDK
+    // re-serialises shapes with its own bundled zod, and one construct it
+    // cannot handle makes tools/list fail for EVERY tool, so each converted
+    // shape is dry-run through a throwaway SDK server and used only if it
+    // lists cleanly. Returns null to fall back to the primitive mapping.
+    const faithfulShape = async (
+      schema: Record<string, unknown> | undefined,
+    ): Promise<Record<string, unknown> | null> => {
+      const fromJSONSchema = (z as { fromJSONSchema?: Function }).fromJSONSchema;
+      if (!schema || typeof schema !== "object" || typeof fromJSONSchema !== "function") {
+        return null;
+      }
+      const key = JSON.stringify(schema);
+      if (faithfulShapeCache.has(key)) return faithfulShapeCache.get(key) ?? null;
+      let verified: Record<string, unknown> | null = null;
+      try {
+        const full = fromJSONSchema(schema) as { shape?: unknown };
+        if (full?.shape && typeof full.shape === "object") {
+          const shape = full.shape as Record<string, unknown>;
+          const probe = createSdkMcpServer({
+            name: "probe",
+            tools: [toolFactory("probe", "probe", shape, async () => ({ content: [] }))],
+          }) as { instance?: any };
+          const handlers =
+            probe.instance?.server?._requestHandlers ??
+            probe.instance?._requestHandlers;
+          const list = handlers?.get?.("tools/list");
+          if (typeof list === "function") {
+            const listed = await list({ method: "tools/list", params: {} }, {});
+            if (Array.isArray(listed?.tools) && listed.tools.length === 1) {
+              verified = shape;
+            }
+          }
+        }
+      } catch {
+        verified = null;
+      }
+      faithfulShapeCache.set(key, verified);
+      return verified;
+    };
 
     const jsonSchemaToZodShape = (
       schema: Record<string, unknown> | undefined,
@@ -848,14 +893,21 @@ async function buildOpenCodeMcpServer(
       return shape;
     };
 
+    const shapes = new Map<OpenAITool, Record<string, unknown>>();
+    for (const t of tools) {
+      if (!t.function?.name) continue;
+      const params = t.function?.parameters as
+        | Record<string, unknown>
+        | undefined;
+      shapes.set(t, (await faithfulShape(params)) ?? jsonSchemaToZodShape(params));
+    }
+
     const mcpTools = tools
       .map((t) => {
         const name = t.function?.name;
         if (!name) return null;
         const description = t.function?.description || name;
-        const shape = jsonSchemaToZodShape(
-          t.function?.parameters as Record<string, unknown> | undefined,
-        );
+        const shape = shapes.get(t) ?? {};
         return toolFactory(
           name,
           description,
