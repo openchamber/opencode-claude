@@ -169,6 +169,7 @@ Optional knobs:
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
 - `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` — budget for transferred conversation history when a Claude session cannot be resumed (default `400000`; newest messages are kept, `0` disables transfer)
+- `OPENCODE_CLAUDE_FORWARD_SYSTEM_CONTEXT` — `0` stops forwarding the OpenCode agent prompt, instructions files, MCP notes and skills list to Claude (default: forwarded, appended to the Claude Code preset)
 
 ## Troubleshooting
 
