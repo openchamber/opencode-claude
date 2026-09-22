@@ -76,6 +76,12 @@ import {
 } from "./usage.js";
 
 const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
+/**
+ * A parked turn waits for the assistant message to close so that every tool
+ * call of that message reaches OpenCode in one response (see
+ * PARALLEL_SAFE_TOOLS). This much silence from the CLI ends the wait.
+ */
+const PARK_QUIET_MS = 3_000;
 
 /**
  * Max silence from the Claude Agent SDK before the turn is declared dead.
@@ -441,6 +447,24 @@ async function handleChatCompletions(
   let handle: ClaudeQueryHandle | null = null;
   let parked = false;
   let parkWaiters: Array<() => void> = [];
+  // The assistant message is still streaming: sibling tool calls may follow
+  // the one that parked, so the park is held until the message closes.
+  let messageOpen = false;
+  // next() that was in flight when the turn parked; consumed on resume so
+  // the event it carries is not lost.
+  let pendingNext: Promise<IteratorResult<unknown>> | null = null;
+
+  const trackMessageState = (event: unknown) => {
+    if (!event || typeof event !== "object") return;
+    const e = event as Record<string, unknown>;
+    // Only the stream's message_stop closes the message: the CLI emits an
+    // `assistant` event after every content block, not once per message.
+    if (e.type === "stream_event" && e.event && typeof e.event === "object") {
+      const type = (e.event as { type?: unknown }).type;
+      if (type === "message_start") messageOpen = true;
+      if (type === "message_stop") messageOpen = false;
+    }
+  };
 
   const notifyPark = () => {
     parked = true;
@@ -664,19 +688,32 @@ async function handleChatCompletions(
     const iterator = handle!.stream[Symbol.asyncIterator]();
     try {
       while (true) {
+        // Parked and the message is closed: hand every collected call to
+        // OpenCode in one response. Claude Code already grouped the calls it
+        // may run side by side (read-only ones); here they are only forwarded.
+        const holding = parked && pendingTools.size > 0;
+        if (holding && !messageOpen) {
+          yield { type: "__park__", tools: [...pendingTools.values()] };
+          return;
+        }
         const parkControl = {
           cancel: null as (() => void) | null,
         };
         const parkPromise = new Promise<void>((resolve) => {
-          if (parked && pendingTools.size > 0) {
-            resolve();
-            return;
-          }
+          // Already parked: the message close decides, not another park.
+          if (holding) return;
           const entry = () => resolve();
           parkWaiters.push(entry);
           parkControl.cancel = () => {
             parkWaiters = parkWaiters.filter((w) => w !== entry);
           };
+        });
+        // Holding and the CLI went quiet: the message will not close by itself.
+        let quietTimer: ReturnType<typeof setTimeout> | null = null;
+        const quietPromise = new Promise<void>((resolve) => {
+          if (!holding) return;
+          quietTimer = setTimeout(resolve, PARK_QUIET_MS);
+          quietTimer.unref?.();
         });
 
         // Watchdog: total silence from the CLI (dead process, stuck compact,
@@ -699,14 +736,17 @@ async function handleChatCompletions(
           stallTimer.unref?.();
         });
 
-        const nextPromise = iterator.next();
+        const nextPromise = pendingNext ?? iterator.next();
+        pendingNext = null;
         let raced:
           | { kind: "event"; value: IteratorResult<unknown> }
-          | { kind: "park" };
+          | { kind: "park" }
+          | { kind: "quiet" };
         try {
           raced = await Promise.race([
             nextPromise.then((value) => ({ kind: "event" as const, value })),
             parkPromise.then(() => ({ kind: "park" as const })),
+            quietPromise.then(() => ({ kind: "quiet" as const })),
             stallPromise,
           ]);
         } catch (error) {
@@ -720,33 +760,23 @@ async function handleChatCompletions(
           throw error;
         } finally {
           if (stallTimer) clearTimeout(stallTimer);
-        }
-
-        if (raced.kind === "park" || (parked && pendingTools.size > 0)) {
-          parkControl.cancel?.();
-          await Promise.resolve();
-          // The iterator's pending next() may already have consumed the
-          // assistant event that carries the parked tool call (and its
-          // per-call usage). Forward it before parking so usage accounting
-          // and session binding stay intact.
-          if (raced.kind === "event" && !raced.value.done) {
-            const pendingEvent = raced.value.value;
-            const pendingSessionId = extractSessionId(pendingEvent);
-            if (pendingSessionId) {
-              setForeignSessionId(conversationKey, pendingSessionId, {
-                modelId: model,
-                cwd,
-              });
-            }
-            yield pendingEvent;
-          }
-          yield { type: "__park__", tools: [...pendingTools.values()] };
-          return;
+          if (quietTimer) clearTimeout(quietTimer);
         }
 
         parkControl.cancel?.();
+        if (raced.kind === "park") {
+          // Keep the in-flight next(); the loop top decides whether to hold.
+          pendingNext = nextPromise;
+          continue;
+        }
+        if (raced.kind === "quiet") {
+          pendingNext = nextPromise;
+          messageOpen = false;
+          continue;
+        }
         if (raced.value.done) break;
         const event = raced.value.value;
+        trackMessageState(event);
         const sessionId = extractSessionId(event);
         if (sessionId) {
           setForeignSessionId(conversationKey, sessionId, {
@@ -796,6 +826,32 @@ function extractSessionId(event: unknown): string | null {
   }
   return null;
 }
+
+/**
+ * OpenCode tools that only read, annotated `readOnlyHint: true` for Claude
+ * Code. The CLI runs MCP tool calls one at a time unless the tool carries
+ * that annotation; annotated calls that sit next to each other in one
+ * assistant message form a group the CLI starts together (a non-annotated
+ * call in between splits the group). The plugin does not group anything: it
+ * forwards what the CLI started within one message as one response, and
+ * OpenCode runs those calls side by side (see consumeStream).
+ * `task` is listed on purpose (Claude Code's own Agent tool is concurrency
+ * safe). Tools that write (edit, write, patch, bash, ...) must stay out.
+ */
+const PARALLEL_SAFE_TOOLS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "codesearch",
+  "webfetch",
+  "websearch",
+  "todoread",
+  "skill",
+  "lsp_diagnostics",
+  "lsp_hover",
+  "task",
+]);
 
 async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
@@ -856,6 +912,10 @@ async function buildOpenCodeMcpServer(
         const shape = jsonSchemaToZodShape(
           t.function?.parameters as Record<string, unknown> | undefined,
         );
+        const extras: Record<string, unknown> = { alwaysLoad: true };
+        if (PARALLEL_SAFE_TOOLS.has(name)) {
+          extras.annotations = { readOnlyHint: true };
+        }
         return toolFactory(
           name,
           description,
@@ -881,7 +941,7 @@ async function buildOpenCodeMcpServer(
               content: [{ type: "text", text: result }],
             };
           },
-          { alwaysLoad: true },
+          extras,
         );
       })
       .filter(Boolean);

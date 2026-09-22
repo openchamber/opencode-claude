@@ -34,7 +34,7 @@ Aliases `fable` / `opus` / `sonnet` / `haiku` plus pinned ids. Native OpenCode v
 
 ### Keep agent loops moving
 
-OpenCode tools bridge as in-process MCP. Calls park and resume instead of deadlocking or inventing output. Streaming, MCP, and sticky Claude session IDs keep follow-ups on the same Agent SDK turn.
+OpenCode tools bridge as in-process MCP. Calls park and resume instead of deadlocking or inventing output. Streaming, MCP, and sticky Claude session IDs keep follow-ups on the same Agent SDK turn. Read-only tools (`read`, `glob`, `grep`, `task`, …) are annotated `readOnlyHint`, and all tool calls of one message reach OpenCode in a single `tool_calls` response, so two subagents from one turn run at the same time.
 
 ### Attachments, compact, and history
 

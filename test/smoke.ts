@@ -1709,6 +1709,171 @@ async function main() {
     }
   }
 
+  // ---- Parallel tool calls: every call of one assistant message reaches
+  // OpenCode in one response; read-only tools carry readOnlyHint ----
+  {
+    const { setClaudeQueryStarter } = await import("../src/proxy.ts");
+    type RegisteredTool = {
+      annotations?: { readOnlyHint?: boolean };
+      handler: (
+        args: Record<string, unknown>,
+        extra: unknown,
+      ) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const toolSchema = (name: string) => ({
+      type: "function",
+      function: {
+        name,
+        description: name,
+        parameters: {
+          type: "object",
+          properties: { filePath: { type: "string" } },
+          required: ["filePath"],
+        },
+      },
+    });
+    const postTools = (messages: unknown[]) =>
+      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-opencode-claude-session": "smoke-parallel-tools",
+        },
+        body: JSON.stringify({
+          model: "sonnet",
+          stream: true,
+          tools: [toolSchema("read"), toolSchema("edit")],
+          messages,
+        }),
+      });
+    const readSse = async (res: Response) => {
+      const text = await res.text();
+      const calls = new Map<number, { id: string; name: string; args: string }>();
+      let content = "";
+      let finish: string | null = null;
+      for (const line of text.split("\n")) {
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        const chunk = JSON.parse(line.slice(6)) as {
+          choices?: Array<{
+            delta?: {
+              content?: string;
+              tool_calls?: Array<{
+                index: number;
+                id: string;
+                function: { name: string; arguments: string };
+              }>;
+            };
+            finish_reason?: string | null;
+          }>;
+        };
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+        if (choice.delta?.content) content += choice.delta.content;
+        for (const tc of choice.delta?.tool_calls ?? []) {
+          calls.set(tc.index, {
+            id: tc.id,
+            name: tc.function.name,
+            args: tc.function.arguments,
+          });
+        }
+        if (choice.finish_reason) finish = choice.finish_reason;
+      }
+      return { content, calls: [...calls.values()], finish };
+    };
+
+    let registered: Record<string, RegisteredTool> = {};
+    setClaudeQueryStarter(async (params) => {
+      const server = (
+        params.mcpServers as
+          | { opencode?: { instance?: { _registeredTools?: unknown } } }
+          | undefined
+      )?.opencode?.instance;
+      registered = (server?._registeredTools ?? {}) as Record<string, RegisteredTool>;
+      return {
+        stream: (async function* () {
+          yield { type: "system", subtype: "init", session_id: "par-sess" };
+          yield { type: "stream_event", event: { type: "message_start" } };
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "reading two files" },
+            },
+          };
+          // The CLI starts read-only calls while the message still streams:
+          // the second one arrives after the first has already parked.
+          const first = registered.read!.handler({ filePath: "a.txt" }, {});
+          // The CLI emits an `assistant` event per completed content block;
+          // it must not be taken for the end of the message.
+          yield {
+            type: "assistant",
+            message: { role: "assistant", content: [] },
+          };
+          await sleep(150);
+          const second = registered.read!.handler({ filePath: "b.txt" }, {});
+          await sleep(50);
+          yield { type: "stream_event", event: { type: "message_stop" } };
+          const results = await Promise.all([first, second]);
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: {
+                type: "text_delta",
+                text: `GOT ${results.map((r) => r.content[0]!.text).join("+")}`,
+              },
+            },
+          };
+          yield { type: "result", is_error: false, result: "" };
+        })(),
+        interrupt: async () => {},
+        close: () => {},
+        getPid: () => null,
+      };
+    });
+    try {
+      const userTurn = [{ role: "user", content: "read a.txt and b.txt" }];
+      const first = await readSse(await postTools(userTurn));
+      assert.equal(first.finish, "tool_calls");
+      assert.match(first.content, /reading two files/);
+      assert.equal(first.calls.length, 2, "both calls of the message in one response");
+      assert.deepEqual(
+        first.calls.map((c) => c.name),
+        ["read", "read"],
+      );
+      assert.deepEqual(
+        first.calls.map((c) => JSON.parse(c.args).filePath),
+        ["a.txt", "b.txt"],
+      );
+      // Annotation: only read-only tools may run side by side.
+      assert.equal(registered.read!.annotations?.readOnlyHint, true);
+      assert.equal(registered.edit!.annotations?.readOnlyHint, undefined);
+
+      // Results resume the turn; each lands in its own handler.
+      const second = await readSse(
+        await postTools([
+          ...userTurn,
+          {
+            role: "assistant",
+            content: first.content,
+            tool_calls: first.calls.map((c) => ({
+              id: c.id,
+              type: "function",
+              function: { name: c.name, arguments: c.args },
+            })),
+          },
+          { role: "tool", tool_call_id: first.calls[0]!.id, content: "A" },
+          { role: "tool", tool_call_id: first.calls[1]!.id, content: "B" },
+        ]),
+      );
+      assert.equal(second.finish, "stop");
+      assert.match(second.content, /GOT A\+B/);
+    } finally {
+      setClaudeQueryStarter(null);
+    }
+  }
+
   // ---- Turn stall watchdog + client-cancel teardown + CLI resolution cache ----
   {
     const { setClaudeQueryStarter } = await import("../src/proxy.ts");
