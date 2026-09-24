@@ -17,6 +17,7 @@ import {
   OPENAI_COMPATIBLE_NPM,
   PROVIDER_ID,
 } from "./constants.js";
+import { deleteBridge, findBridgeByConversation } from "./bridge-pool.js";
 import { detectClaudeCode } from "./detect.js";
 import { installClaudeCli } from "./cli-install.js";
 import {
@@ -24,6 +25,7 @@ import {
   submitClaudeCliLoginCode,
 } from "./cli-login.js";
 import { log } from "./log.js";
+import { requestKeyNamespace } from "./request-kind.js";
 import {
   encodeClaudeModelSelection,
   resolveClaudeModelSelection,
@@ -234,6 +236,39 @@ async function loadClaudeRuntime(
 }
 
 /**
+ * Tear down any bridge still live for a session that OpenCode reports idle.
+ *
+ * When the user aborts a turn (Esc-Esc / session.abort) while the bridge is
+ * parked waiting for an OpenCode tool result, there is no in-flight proxy
+ * request whose SSE cancel() could clean up: the Claude CLI child would stay
+ * alive until the next turn for the same conversation supersedes it. OpenCode
+ * publishes `session.idle` when the runner finishes OR is interrupted, so
+ * idle is the authoritative signal that a still-parked bridge was abandoned.
+ * Normal turns delete their bridge before idle fires, making this a no-op.
+ *
+ * Returns the conversation keys that were torn down (for tests/logging).
+ */
+export function teardownBridgesForSession(sessionID: string): string[] {
+  const tornDown: string[] = [];
+  const keys = [
+    sessionID,
+    `${requestKeyNamespace("title")}${sessionID}`,
+    `${requestKeyNamespace("summary")}${sessionID}`,
+  ];
+  for (const key of keys) {
+    const bridge = findBridgeByConversation(key);
+    if (!bridge) continue;
+    log.info(
+      "[opencode-claude] session went idle with a live bridge (aborted turn) — tearing it down",
+      { conversationKey: key, bridgeId: bridge.id },
+    );
+    deleteBridge(bridge.id);
+    tornDown.push(key);
+  }
+  return tornDown;
+}
+
+/**
  * OpenCode plugin that provides Claude Code authentication and model access.
  *
  * The auth methods are chosen once at load from the CLI's presence: a host
@@ -262,6 +297,17 @@ export const ClaudeCodePlugin: Plugin = async (
         config as Record<string, any>,
         getClaudeModels(),
       );
+    },
+
+    async event({ event }) {
+      const busEvent = event as unknown as {
+        type?: unknown;
+        properties?: { sessionID?: unknown };
+      };
+      if (busEvent?.type !== "session.idle") return;
+      const sessionID = busEvent.properties?.sessionID;
+      if (typeof sessionID !== "string" || !sessionID) return;
+      teardownBridgesForSession(sessionID);
     },
 
     "chat.headers": async (hookInput, output) => {
