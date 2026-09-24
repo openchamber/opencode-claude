@@ -604,7 +604,11 @@ async function handleChatCompletions(
     cwd,
     model,
     resume: isMetaRequest ? undefined : resume,
-    effort: selection.effort,
+    // Meta requests run with thinking force-disabled below, and the API
+    // rejects effort "max" in that mode ("output_config.effort 'max' is not
+    // supported when thinking is disabled"). Normal turns keep the selected
+    // effort; startClaudeQuery pairs it with adaptive thinking.
+    effort: isMetaRequest ? undefined : selection.effort,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
     autoCompactEnabled: !isMetaRequest,
