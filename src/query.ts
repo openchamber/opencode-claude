@@ -231,6 +231,9 @@ export async function startClaudeQuery(
     permissionMode === "bypassPermissions"
   ) {
     options.allowDangerouslySkipPermissions = true;
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      env.IS_SANDBOX = "1";
+    }
   }
 
   const effort = trimmedString(params.effort);
