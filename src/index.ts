@@ -41,8 +41,8 @@ import {
 import { listClaudeSupportedModels } from "./query.js";
 import {
   getClaudeProxyBaseUrl,
+  retainProxy,
   startProxy,
-  stopProxy,
 } from "./proxy.js";
 
 export function applyClaudeRequestContextHeaders(
@@ -203,7 +203,9 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       });
     });
 
-    return () => stopProxy();
+    // The proxy is shared by every location in the process; unloading this
+    // one only stops it when no other location still holds it.
+    return retainProxy();
   },
 };
 

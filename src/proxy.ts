@@ -192,8 +192,33 @@ type ChatCompletionRequest = {
   temperature?: number;
 };
 
-let server: ReturnType<typeof Bun.serve> | null = null;
-let proxyPort: number | null = null;
+/**
+ * OpenCode 2 imports the plugin module once per location, so module-level
+ * state is not process-wide: every location used to bind its own listener.
+ * The runtime lives on `globalThis`, so all locations in the process share
+ * one proxy. `stopOwner` belongs to the module copy whose `handleRequest`
+ * serves the listener: its bridge pool holds the parked turns.
+ */
+type ProxyRuntime = {
+  server: ReturnType<typeof Bun.serve> | null;
+  port: number | null;
+  users: number;
+  stopOwner: (() => void) | null;
+};
+
+const SHARED_PROXY_KEY = Symbol.for("opencode-claude.proxy.runtime");
+
+function sharedProxyRuntime(): ProxyRuntime {
+  const store = globalThis as typeof globalThis & {
+    [SHARED_PROXY_KEY]?: ProxyRuntime;
+  };
+  return (store[SHARED_PROXY_KEY] ??= {
+    server: null,
+    port: null,
+    users: 0,
+    stopOwner: null,
+  });
+}
 
 /** Injectable for smoke tests — production path always uses startClaudeQuery. */
 let queryStarter: typeof startClaudeQuery = startClaudeQuery;
@@ -205,7 +230,8 @@ export function setClaudeQueryStarter(
 }
 
 export function getClaudeProxyBaseUrl(): string {
-  const port = proxyPort ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
+  const port =
+    sharedProxyRuntime().port ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
   if (!port) {
     throw new Error(
       "Claude proxy is not listening yet — call startProxy() before getClaudeProxyBaseUrl()",
@@ -215,7 +241,7 @@ export function getClaudeProxyBaseUrl(): string {
 }
 
 export function getProxyPort(): number | null {
-  return proxyPort;
+  return sharedProxyRuntime().port;
 }
 
 function isAddrInUseError(err: unknown): boolean {
@@ -256,15 +282,16 @@ async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
 }
 
 export async function startProxy(): Promise<number> {
-  if (server && proxyPort) return proxyPort;
+  const runtime = sharedProxyRuntime();
+  if (runtime.server && runtime.port) return runtime.port;
 
   // Only reuse a sibling listener when the operator pinned a port.
   if (REQUESTED_PROXY_PORT > 0) {
     const pinnedUrl = `http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`;
     if (await isProxyHealthyAt(pinnedUrl)) {
-      proxyPort = REQUESTED_PROXY_PORT;
+      runtime.port = REQUESTED_PROXY_PORT;
       log.info(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
-      return proxyPort;
+      return runtime.port;
     }
   }
 
@@ -272,7 +299,7 @@ export async function startProxy(): Promise<number> {
   const bindPort = REQUESTED_PROXY_PORT; // 0 → ephemeral
 
   try {
-    server = Bun.serve({
+    const server = Bun.serve({
       hostname,
       port: bindPort,
       idleTimeout: PROXY_IDLE_TIMEOUT_SECONDS,
@@ -280,35 +307,59 @@ export async function startProxy(): Promise<number> {
         return handleRequest(req);
       },
     });
-    proxyPort = server.port ?? null;
-    if (!proxyPort) {
+    runtime.server = server;
+    runtime.port = server.port ?? null;
+    // Parked turns each hold a live claude CLI child; nothing resumes them
+    // once the listener is gone.
+    runtime.stopOwner = clearAllBridges;
+    if (!runtime.port) {
       throw new Error("Failed to bind Claude proxy to a port");
     }
     log.info(`[opencode-claude] proxy listening on ${getClaudeProxyBaseUrl()}`);
-    return proxyPort;
+    return runtime.port;
   } catch (err) {
     if (
       REQUESTED_PROXY_PORT > 0 &&
       isAddrInUseError(err) &&
       (await isProxyHealthyAt(`http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`))
     ) {
-      proxyPort = REQUESTED_PROXY_PORT;
+      runtime.port = REQUESTED_PROXY_PORT;
       log.info(
         `[opencode-claude] port ${REQUESTED_PROXY_PORT} in use; reusing existing proxy`,
       );
-      return proxyPort;
+      return runtime.port;
     }
     throw err;
   }
 }
 
+/**
+ * Hold the shared proxy for one plugin location. The returned release stops
+ * the proxy only when the last location lets go, so unloading one location
+ * never kills turns that another location is running.
+ */
+export function retainProxy(): () => Promise<void> {
+  const runtime = sharedProxyRuntime();
+  runtime.users++;
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    runtime.users = Math.max(0, runtime.users - 1);
+    if (runtime.users === 0) await stopProxy();
+  };
+}
+
+/** Stop the process-wide proxy now, whoever else holds it. */
 export async function stopProxy(): Promise<void> {
-  // Parked turns each hold a live claude CLI child; nothing resumes them now.
-  clearAllBridges();
-  if (server) {
-    server.stop(true);
-    server = null;
-    proxyPort = null;
+  const runtime = sharedProxyRuntime();
+  const stopOwner = runtime.stopOwner ?? clearAllBridges;
+  runtime.stopOwner = null;
+  stopOwner();
+  if (runtime.server) {
+    runtime.server.stop(true);
+    runtime.server = null;
+    runtime.port = null;
   }
 }
 
