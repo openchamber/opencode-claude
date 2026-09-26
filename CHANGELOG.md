@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1 - 2026-09-26
+
+- **Fix: phantom "attachments" while tools run**: OpenCode 2.x sends images a
+  tool returns (screenshots, `read` on a PNG) as a text-less message right
+  after the tool result. The plugin took it for a message from the user, so
+  Claude was told "the user sent attachments" that never arrived. That media
+  now counts as part of the tool result.
+
 ## 1.1.0 - 2026-09-26
 
 Several fixes in this release were found and first built by Bryan Galdámez

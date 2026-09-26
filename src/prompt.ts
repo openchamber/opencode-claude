@@ -354,13 +354,24 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
  */
 export const SYNTHETIC_TOOL_MEDIA_PROMPT = "Attached media from tool result:";
 
-export function isSyntheticToolMediaMessage(msg: {
-  role?: string;
-  content?: unknown;
-}): boolean {
+/**
+ * OpenCode 1.x labels promoted tool media with SYNTHETIC_TOOL_MEDIA_PROMPT.
+ * OpenCode 2.x sends the media alone: a user message with no text right
+ * after the tool results (openai-chat `flushAttachments`). Pass the previous
+ * message so that shape is recognised too; a real user message always
+ * carries text or follows something other than a tool result.
+ */
+export function isSyntheticToolMediaMessage(
+  msg: { role?: string; content?: unknown },
+  previous?: { role?: string; content?: unknown },
+): boolean {
+  if (msg?.role !== "user") return false;
+  const text = extractTextContent(msg.content).trim();
+  if (text === SYNTHETIC_TOOL_MEDIA_PROMPT) return true;
   return (
-    msg?.role === "user" &&
-    extractTextContent(msg.content).trim() === SYNTHETIC_TOOL_MEDIA_PROMPT
+    !text &&
+    previous?.role === "tool" &&
+    contentHasAttachments(msg.content)
   );
 }
 
@@ -486,7 +497,10 @@ function latestUserTurn(
     if (msg?.role === "assistant") {
       if (turn.length > 0) break;
       toolStep = true;
-    } else if (msg?.role === "user" && !isSyntheticToolMediaMessage(msg)) {
+    } else if (
+      msg?.role === "user" &&
+      !isSyntheticToolMediaMessage(msg, messages[i - 1])
+    ) {
       turn.unshift(i);
       if (toolStep) break;
     }
@@ -576,7 +590,7 @@ export function collectSteeringMessages(
   const occurrences = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg)) continue;
+    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
     const identity = JSON.stringify(msg.content ?? null);
     const nth = occurrences.get(identity) ?? 0;
     occurrences.set(identity, nth + 1);
@@ -673,7 +687,8 @@ export function answeredToolStepPrompt(
     (assistant.tool_calls ?? []).map((call) => [call?.id, call?.function]),
   );
   const userBlocks: AnthropicContentBlock[] = [];
-  for (const msg of messages.slice(assistantIndex + 1)) {
+  const stepMessages = messages.slice(assistantIndex + 1);
+  for (const [index, msg] of stepMessages.entries()) {
     if (msg?.role === "tool" && msg.tool_call_id) {
       const call = calls.get(msg.tool_call_id);
       const blocks = openaiContentToAnthropicBlocks(msg.content);
@@ -684,7 +699,7 @@ export function answeredToolStepPrompt(
         },
         ...(blocks.length > 0 ? blocks : [{ type: "text" as const, text: "(no output)" }]),
       );
-    } else if (msg && isSyntheticToolMediaMessage(msg)) {
+    } else if (msg && isSyntheticToolMediaMessage(msg, stepMessages[index - 1] ?? messages[assistantIndex])) {
       content.push(
         { type: "text", text: "Media attached to these tool results:" },
         ...openaiContentToAnthropicBlocks(msg.content).filter(

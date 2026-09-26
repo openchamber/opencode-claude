@@ -19,8 +19,34 @@ const png = "iVBORw0KGgo=";
 const pdf = "JVBERi0xLjQK";
 
 async function main() {
-  const { openaiToolResultToMcpContent, SYNTHETIC_TOOL_MEDIA_PROMPT } =
-    await import("../src/prompt.ts");
+  const {
+    openaiToolResultToMcpContent,
+    SYNTHETIC_TOOL_MEDIA_PROMPT,
+    isSyntheticToolMediaMessage,
+    collectSteering,
+    latestUserPrompt,
+  } = await import("../src/prompt.ts");
+
+  // OpenCode 2.x promotes tool media as a text-less user message right after
+  // the tool results. It is tool output, not a message from the user: no
+  // steering, and the prompt stays the user's real request.
+  {
+    const messages = [
+      { role: "user", content: "Take a screenshot of the page" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: "{}" } }],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "Image read successfully" },
+      { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }] },
+    ];
+    assert.equal(isSyntheticToolMediaMessage(messages[3]!, messages[2]!), true);
+    assert.deepEqual(collectSteering(messages as any), []);
+    assert.equal(latestUserPrompt(messages as any), "Take a screenshot of the page");
+    // A text-less image the user sends outside a tool step is still theirs.
+    assert.equal(isSyntheticToolMediaMessage(messages[3]!, messages[0]!), false);
+  }
 
   // The MCP result shape uses { data, mimeType }, not Anthropic's { source }.
   assert.deepEqual(

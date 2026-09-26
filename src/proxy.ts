@@ -424,7 +424,9 @@ function attachPromotedToolMedia(
   }
   const step = messages.slice(lastAssistant + 1);
   const media = step
-    .filter((msg) => isSyntheticToolMediaMessage(msg))
+    .filter((msg, index) =>
+      isSyntheticToolMediaMessage(msg, step[index - 1] ?? messages[lastAssistant]),
+    )
     .flatMap((msg) =>
       openaiToolResultToMcpContent(msg.content).filter(
         (block) => block.type !== "text",
