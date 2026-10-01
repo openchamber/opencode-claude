@@ -144,7 +144,7 @@ async function main() {
   // Code Mode catalog: only that section of OpenCode's system prompt is kept
   {
     const { codeModeCatalog } = await import("../src/request-kind.ts");
-    const system = "You are an AI agent running in OpenCode.\n\n# Your Model\nclaude-code\n\n# Code Mode\n\nUse the `execute` tool to call the tools listed below.\n\n## Available tools\ntools.openchamber - Control OpenChamber\n\n# Skills\nfoo";
+    const system = "You are an AI agent running in OpenCode.\n\n# Your Model\nclaude-code\n\n# Code Mode\n\nUse the `execute` tool to call the tools listed below.\n\n## Available tools\n\n- openchamber (1 tool)\n  - tools.openchamber.read({ path: string }): Promise<string> // Read\n\n# Skills\nfoo";
     const catalog = codeModeCatalog([{ role: "system", content: system }, { role: "user", content: "hi" }]);
     assert.match(catalog, /^# Code Mode/);
     assert.match(catalog, /tools\.openchamber/);

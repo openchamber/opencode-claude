@@ -90,9 +90,21 @@ export function requestKeyNamespace(kind: MetaRequestKind): string {
  */
 export function codeModeCatalog(messages: MessageLike[]): string {
   const system = metaSystemPrompt(messages);
-  const start = system.indexOf("# Code Mode");
-  if (start < 0) return "";
-  const rest = system.slice(start);
-  const next = rest.slice(1).search(/\n# /);
-  return (next < 0 ? rest : rest.slice(0, next + 1)).trim();
+  const heading = /^# Code Mode[\t ]*\r?$/m.exec(system);
+  if (!heading) return "";
+  const rest = system.slice(heading.index);
+  const toolsHeading = /^## Available tools[\t ]*\r?$/m.exec(rest);
+  if (!toolsHeading) return "";
+
+  // OpenCode renders namespace/tool listings as one block, separated from
+  // subsequent instructions by a blank line. A level-one heading alone is
+  // not a boundary: date, environment, and skills need not have headings.
+  const afterHeading = toolsHeading.index + toolsHeading[0].length;
+  const leadingWhitespace = /^(?:[\t ]*\r?\n)+/.exec(rest.slice(afterHeading));
+  const catalogStart = afterHeading + (leadingWhitespace?.[0].length ?? 0);
+  const catalog = rest.slice(catalogStart);
+  if (!/^- /m.test(catalog.split(/\r?\n/, 1)[0])) return "";
+  const boundary = /\r?\n[\t ]*\r?\n|\r?\n#{1,6} /.exec(catalog);
+  const end = catalogStart + (boundary ? boundary.index : catalog.length);
+  return rest.slice(0, end).trim();
 }
