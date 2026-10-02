@@ -171,7 +171,9 @@ export function stopGraceMs(): number {
  * else reads a parked turn), and closes after that or after the grace.
  *
  * The stream is wrapped once; its iterator is shared, so events read by
- * stop() and by the proxy's consumer all pass the onEvent listeners.
+ * stop() and by the proxy's consumer all pass the onEvent listeners. Pulls
+ * are serialized through one queue, so a stop() drain never overlaps the
+ * consumer's in-flight next().
  */
 export function withGracefulStop(handle: ClaudeQueryHandle): StoppableClaudeQueryHandle {
   if (typeof handle.stop === "function" && typeof handle.onEvent === "function") {
@@ -193,17 +195,28 @@ export function withGracefulStop(handle: ClaudeQueryHandle): StoppableClaudeQuer
       }
     }
   };
+  // Serialize raw pulls through one queue: the proxy's response consumer and
+  // stop()'s settle drain both read this iterator, and two concurrent next()
+  // calls on the same SDK iterator race (observed as overlapping pulls during
+  // rapid cancel+resume). Each caller still receives its own distinct result;
+  // a pull queued after the stream ended resolves done without a raw pull.
+  let pullQueue: Promise<unknown> = Promise.resolve();
   const tap: AsyncIterableIterator<unknown> = {
-    async next() {
-      try {
-        const next = await inner.next();
-        if (next.done) ended = true;
-        else observe(next.value);
-        return next;
-      } catch (error) {
-        ended = true;
-        throw error;
-      }
+    next() {
+      const pull = pullQueue.then(async (): Promise<IteratorResult<unknown>> => {
+        if (ended) return { done: true, value: undefined };
+        try {
+          const next = await inner.next();
+          if (next.done) ended = true;
+          else observe(next.value);
+          return next;
+        } catch (error) {
+          ended = true;
+          throw error;
+        }
+      });
+      pullQueue = pull.catch(() => undefined);
+      return pull;
     },
     async return(value?: unknown) {
       ended = true;
