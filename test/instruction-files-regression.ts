@@ -51,6 +51,30 @@ assert.equal(openCodeInstructionFiles(system([block(globalAgents, "Global rules.
 // A path whose text isn't in the prompt (changed on disk since) is not sent.
 assert.equal(openCodeInstructionFiles(system([block(opencodeGlobal, "Older text.")]), onlyAgents), "");
 
+// The global CLAUDE.md imports the OpenCode-only file with `@path`: Claude
+// Code expands the import itself, so the file is not forwarded again.
+const imports = join(root, "imports");
+mkdirSync(imports);
+writeFileSync(join(imports, "chain-b.md"), "Chained rules.\n");
+writeFileSync(join(imports, "chain-a.md"), "See @./chain-b.md for the chain.\n");
+const chained = join(root, "chained-AGENTS.md");
+writeFileSync(chained, "Chained rules.\n");
+const other = join(root, "other-AGENTS.md");
+writeFileSync(other, "Other rules.\n");
+writeFileSync(
+  join(process.env.CLAUDE_CONFIG_DIR, "CLAUDE.md"),
+  `@${opencodeGlobal}\n\n- chain @${join(imports, "chain-a.md")}\n- literal \`@${other}\`\n`,
+);
+const forwarded = openCodeInstructionFiles(
+  system([
+    block(opencodeGlobal, "OpenCode-only rules."),
+    block(chained, "Chained rules."),
+    block(other, "Other rules."),
+  ]),
+  onlyAgents,
+);
+assert.equal(forwarded, `Instructions from: ${other}\nOther rules.`);
+
 const mcp = "<mcp_instructions>\n  <server name=\"linear\">\n    Use tools.\n  </server>\n</mcp_instructions>";
 assert.equal(mcpInstructions(system(["# Code Mode", mcp, "Today's date: x"])), mcp);
 assert.equal(mcpInstructions(system(["Today's date: x"])), "");

@@ -6,7 +6,7 @@
  */
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, parse } from "node:path";
+import { dirname, isAbsolute, join, parse } from "node:path";
 import { metaSystemPrompt } from "./request-kind.js";
 
 type MessageLike = { role?: string; content?: unknown };
@@ -71,18 +71,64 @@ function claudeMdFiles(cwd: string): string[] {
   return files;
 }
 
+/** Claude Code follows `@path` imports from a CLAUDE.md up to four hops deep. */
+const IMPORT_DEPTH = 4;
+/** An `@path` import: at the start of a line or after whitespace, `\ ` keeps a space. */
+const IMPORT = /(?<=^|\s)@((?:\\ |\S)+)/g;
+
+/** Text without Markdown code spans and fenced blocks, where imports aren't parsed. */
+function stripCode(text: string): string {
+  return text.replace(/```[\s\S]*?(?:```|$)/g, "").replace(/`[^`\n]*`/g, "");
+}
+
+/** Files a CLAUDE.md imports: `~/` is the home directory, relative paths are from the file. */
+function importsOf(file: string, text: string): string[] {
+  const out: string[] = [];
+  for (const match of stripCode(text).matchAll(IMPORT)) {
+    let target = match[1]!.replace(/\\ /g, " ");
+    if (target === "~" || target.startsWith("~/") || target.startsWith("~\\")) {
+      target = join(homedir(), target.slice(1));
+    }
+    out.push(isAbsolute(target) ? target : join(dirname(file), target));
+  }
+  return out;
+}
+
+/**
+ * The CLAUDE.md files plus everything their `@path` imports pull in, the way
+ * Claude Code expands them (nested, at most IMPORT_DEPTH hops, each file once).
+ */
+function withImports(files: string[]): string[] {
+  const out = [...files];
+  const seen = new Set(files.map(realPath));
+  const walk = (file: string, depth: number) => {
+    if (depth > IMPORT_DEPTH) return;
+    const text = readText(file);
+    if (!text) return;
+    for (const target of importsOf(file, text)) {
+      const real = realPath(target);
+      if (seen.has(real)) continue;
+      seen.add(real);
+      out.push(target);
+      walk(target, depth + 1);
+    }
+  };
+  for (const file of files) walk(file, 1);
+  return out;
+}
+
 /**
  * OpenCode's instruction files that Claude Code doesn't load itself (the
  * global ~/.config/opencode/AGENTS.md, configured `instructions`) as
  * "Instructions from: <path>" blocks, the way OpenCode renders them.
  * A file is read from disk and forwarded only when its text is in OpenCode's
  * prompt, so it is exactly what OpenCode loaded. Files Claude Code already
- * reads as CLAUDE.md (the same file through a symlink, or the same text)
- * are skipped so the rules don't arrive twice.
+ * reads as CLAUDE.md (the same file through a symlink or an `@path` import,
+ * or the same text) are skipped so the rules don't arrive twice.
  */
 export function openCodeInstructionFiles(messages: MessageLike[], cwd: string): string {
   const system = metaSystemPrompt(messages);
-  const loaded = claudeMdFiles(cwd);
+  const loaded = withImports(claudeMdFiles(cwd));
   const loadedPaths = new Set(loaded.map(realPath));
   const loadedTexts = new Set(
     loaded.map((file) => readText(file)?.trim()).filter((text): text is string => !!text),
