@@ -287,6 +287,11 @@ function usageGrowth(a: OpenAIUsage, b: OpenAIUsage | null): OpenAIUsage | null 
  * message_delta arrives; the resumed response then sees that delta and
  * reports only the growth over the earlier snapshot, so nothing is counted
  * twice and the final output tokens are not lost.
+ *
+ * Output tokens add up over the calls of a response. Prompt tokens don't:
+ * OpenCode reads them as the size of the context, and compacts when they
+ * reach the model's input limit, so they are the last call's prompt (the
+ * context as it stands), not the sum of every call's prompt.
  */
 export class TurnUsageTracker {
   private readonly byId = new Map<
@@ -314,12 +319,28 @@ export class TurnUsageTracker {
 
   total(): OpenAIUsage | null {
     let sum = this.anonymous ? { ...this.anonymous } : null;
+    let last: OpenAIUsage | null = null;
     for (const { baseline, max } of this.byId.values()) {
+      last = max;
       const growth = usageGrowth(max, baseline);
       if (growth) sum = addOpenAIUsage(sum, growth);
     }
-    return sum;
+    if (!sum || !last) return sum;
+    return withPromptOf(sum, last);
   }
+}
+
+/** `usage` with the prompt side (context size) taken from `call`. */
+function withPromptOf(usage: OpenAIUsage, call: OpenAIUsage): OpenAIUsage {
+  const { prompt_tokens_details: _dropped, ...rest } = usage;
+  return {
+    ...rest,
+    prompt_tokens: call.prompt_tokens,
+    total_tokens: call.prompt_tokens + usage.completion_tokens,
+    ...(call.prompt_tokens_details
+      ? { prompt_tokens_details: { ...call.prompt_tokens_details } }
+      : {}),
+  };
 }
 
 /** Count a replayed SDK assistant message only once across tool continuations. */
