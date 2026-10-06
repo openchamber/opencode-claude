@@ -30,7 +30,7 @@ export type ParkedBridge = {
   forwardedSteering: Set<string>;
   createdAt: number;
   /** Continues consuming the SDK stream after tools resolve. */
-  continueStream?: () => AsyncGenerator<unknown, void, unknown>;
+  continueStream?: (requestSignal?: AbortSignal) => AsyncGenerator<unknown, void, unknown>;
 };
 
 /**
