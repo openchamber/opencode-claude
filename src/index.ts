@@ -21,6 +21,7 @@ import {
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
 import { installClaudeCli } from "./cli-install.js";
+import { startClaudeCliAutoUpdate } from "./cli-update.js";
 import {
   startClaudeCliLogin,
   submitClaudeCliLoginCode,
@@ -212,6 +213,13 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     if (cliPresent) {
       void refreshModelCatalog(() => ctx.provider.reload());
     }
+    // Claude Code's own updater never runs under the Agent SDK (see
+    // cli-update.ts). Started even without a CLI: the install action may
+    // add one later, and the check skips until it is there. New models
+    // arrive with the next catalog refresh above.
+    const stopCliAutoUpdate = startClaudeCliAutoUpdate({
+      options: ctx.options as { cliAutoUpdate?: unknown } | undefined,
+    });
 
     await ctx.provider.transform((providers) => {
       providers.add({
@@ -273,6 +281,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     });
 
     return async () => {
+      stopCliAutoUpdate();
       stopWatching();
       await releaseProxy();
     };
