@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0 - 2026-10-11
+
+- **Windows support**: on Windows with an npm-installed Claude Code, the
+  plugin handed the Agent SDK `claude.cmd`, which it can't start, so models
+  and chat failed with EINVAL. The plugin now uses the native `claude.exe`
+  npm installs beside it, and runs older installs that only have `cli.js`
+  through node. Thanks to @daveotero and @StephenHnilica.
+- **Fix: 1M chats compacted at 81%**: the plugin's 900k input limit stacked
+  with the 10% OpenCode keeps free since 2.0.19, so 1M chats compacted
+  around 810k. OpenCode's own reserve now gives the intended 90%. Thanks to
+  @android6.
+- **Sonnet 5.5 is listed before the CLI reports its models**: on a first
+  start or while signed out, a session on Sonnet 5.5 no longer asks you to
+  pick a model again. Thanks to @fgbm.
+- **Tool results in transferred history name their tool**: when Claude gets
+  the chat as text (a new session, turns another model answered), each
+  result says which tool it came from instead of an opaque call id. Thanks
+  to @fgbm.
+
 ## 1.3.9 - 2026-10-11
 
 - **Fix: signing back in asked for a needless restart**: when Claude Code
