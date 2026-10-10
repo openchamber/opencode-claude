@@ -20,12 +20,12 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
+import { runInstaller, type SpawnInstall } from "./cli-install.js";
 import {
-  firstMeaningfulLine,
-  runInstaller,
-  type SpawnInstall,
-} from "./cli-install.js";
-import { cliInvocation, resolveClaudeCli } from "./executable-path.js";
+  cliInvocation,
+  resetClaudeCliResolutionCache,
+  resolveClaudeCli,
+} from "./executable-path.js";
 import { log } from "./log.js";
 
 export type ClaudeCliUpdateOutcome =
@@ -125,6 +125,19 @@ function writeCliUpdateRecord(record: ClaudeCliUpdateRecord, env: Env): void {
   }
 }
 
+/**
+ * `claude update` prints its progress first ("Current version: …",
+ * "Checking for updates…") and the verdict last, so an error is on the last
+ * non-empty line.
+ */
+function lastMeaningfulLine(text: string): string {
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i]!.length > 0) return lines[i]!;
+  }
+  return "";
+}
+
 /** The lines `claude update` prints (Claude Code 2.1.280), by outcome. */
 export function parseClaudeUpdateOutput(
   output: string,
@@ -150,6 +163,8 @@ export async function updateClaudeCli(options?: {
   binaryPath?: string | null;
   spawnInstall?: SpawnInstall;
   timeoutMs?: number;
+  /** Test seam; the plugin drops the memoized CLI path after an update. */
+  resetResolution?: () => void;
 }): Promise<ClaudeCliUpdateOutcome> {
   if (updating) return { kind: "busy" };
   updating = true;
@@ -179,16 +194,25 @@ export async function updateClaudeCli(options?: {
       },
     );
     const outcome = parseClaudeUpdateOutput(result.output ?? "");
-    if (outcome) return outcome;
-    if (result.ok) {
-      return {
-        kind: "failed",
-        message:
-          firstMeaningfulLine(result.output ?? "") ||
-          "claude update printed nothing to judge the outcome by.",
-      };
+    if (outcome?.kind === "updated") {
+      // The install may change layout (npm's cli.js gives way to
+      // bin/claude.exe); the next turn must look for the binary again
+      // instead of reusing the memoized path.
+      (options?.resetResolution ?? resetClaudeCliResolutionCache)();
     }
-    return { kind: "failed", message: result.message };
+    if (outcome) return outcome;
+    if (!result.ok && result.output === undefined) {
+      // Never ran to the end: a spawn error or the timeout, named in message.
+      return { kind: "failed", message: result.message };
+    }
+    const verdict = lastMeaningfulLine(result.output ?? "");
+    if (verdict) return { kind: "failed", message: verdict };
+    return {
+      kind: "failed",
+      message: result.ok
+        ? "claude update printed nothing to judge the outcome by."
+        : result.message,
+    };
   } finally {
     updating = false;
   }

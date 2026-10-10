@@ -2,6 +2,8 @@
  * Regression for the CLI auto-update (src/cli-update.ts):
  * - `claude update` output maps to one outcome each, and exit 0 alone is not
  *   taken for success (the CLI exits 0 when another process holds the lock);
+ *   a failure reports the CLI's last line, not its "Current version" preamble,
+ *   and a successful update drops the memoized CLI path;
  * - the periodic check runs once per interval across plugin instances, through
  *   the shared record file, waits for a missing CLI, and is off under the
  *   documented switches.
@@ -70,6 +72,7 @@ async function main() {
   const run = async (lines: string, code: number, binaryPath = "/opt/claude") => {
     const { child, streams } = fakeCli();
     const calls: string[][] = [];
+    let resets = 0;
     const pending = updateClaudeCli({
       env: { PATH: "/usr/bin" },
       binaryPath,
@@ -77,36 +80,51 @@ async function main() {
         calls.push([command, ...args]);
         return child as any;
       },
+      resetResolution() {
+        resets += 1;
+      },
     });
     await sleep(0);
     streams.stdout.emit("data", lines);
     child.emit("exit", code);
     child.emit("close", code);
-    return { outcome: await pending, calls };
+    return { outcome: await pending, calls, resets };
   };
+  // The CLI's progress lines come before the verdict in every transcript.
+  const preamble = "Current version: 2.1.280\nChecking for updates to latest version...\n";
   {
-    const updated = await run("Successfully updated from 2.1.280 to version 2.1.296\n", 0);
+    const updated = await run(`${preamble}Updating to 2.1.296...\nSuccessfully updated from 2.1.280 to version 2.1.296\n`, 0);
     assert.deepEqual(updated.outcome, { kind: "updated", from: "2.1.280", to: "2.1.296" });
     assert.deepEqual(updated.calls, [["/opt/claude", "update"]]);
+    // The binary (and on Windows possibly its layout) changed: forget the memoized path.
+    assert.equal(updated.resets, 1);
 
-    const busy = await run("Another Claude process is currently running. Please try again in a moment.\n", 0);
+    const busy = await run(`${preamble}Another Claude process is currently running. Please try again in a moment.\n`, 0);
     assert.deepEqual(busy.outcome, { kind: "busy" });
+    assert.equal(busy.resets, 0);
 
-    const failed = await run("Failed to check for updates\n", 1);
+    // The error is the last line, after the progress lines.
+    const failed = await run(`${preamble}Failed to check for updates\n`, 1);
     assert.deepEqual(failed.outcome, { kind: "failed", message: "Failed to check for updates" });
+    assert.equal(failed.resets, 0);
 
     // Exit 0 with unknown text is not a success either.
-    const unknown = await run("something new\n", 0);
+    const unknown = await run(`${preamble}something new\n`, 0);
     assert.deepEqual(unknown.outcome, { kind: "failed", message: "something new" });
+
+    // No output at all: the exit code is all there is to report.
+    const silent = await run("", 3);
+    assert.deepEqual(silent.outcome, { kind: "failed", message: "claude update exited with code 3." });
 
     const missing = await updateClaudeCli({ env: { PATH: "/usr/bin" }, binaryPath: null });
     assert.equal(missing.kind, "failed");
 
     // Windows npm installs may resolve to `cli.js`, which only node can run.
     const cliJs = "C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js";
-    const viaNode = await run("Claude Code is up to date (2.1.296)\n", 0, cliJs);
+    const viaNode = await run(`${preamble}Claude Code is up to date (2.1.296)\n`, 0, cliJs);
     assert.deepEqual(viaNode.outcome, { kind: "up-to-date", version: "2.1.296" });
     assert.deepEqual(viaNode.calls, [["node", cliJs, "update"]]);
+    assert.equal(viaNode.resets, 0);
   }
 
   // Switches.
