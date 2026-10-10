@@ -257,7 +257,7 @@ export function metaFailureText(text: string, metaKind: string | null | undefine
 export function failureHintFor(kind: ClaudeFailureKind): string {
   switch (kind) {
     case "auth":
-      return "Claude Code credentials are invalid or expired. Run `claude auth login`, then restart OpenCode — retrying is pointless until then.";
+      return "Claude Code is signed out. Run `claude auth login` in a terminal, then send the message again.";
     case "rate_limit":
       return "Claude subscription limit is active; wait for the reset instead of retrying.";
     default:
