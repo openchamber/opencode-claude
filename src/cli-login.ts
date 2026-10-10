@@ -21,7 +21,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
-import { resolveClaudeCli } from "./executable-path.js";
+import { cliInvocation, resolveClaudeCli } from "./executable-path.js";
 
 export type ClaudeCliLoginStatus =
   | { state: "idle" }
@@ -196,7 +196,8 @@ function launchLoginChild(
 
   try {
     const spawnLogin = options?.spawnLogin ?? spawn;
-    const spawned = spawnLogin(binaryPath, ["auth", "login", "--claudeai"], {
+    const [command, args] = cliInvocation(binaryPath, ["auth", "login", "--claudeai"]);
+    const spawned = spawnLogin(command, args, {
       cwd: options?.cwd ?? process.cwd(),
       env: env as NodeJS.ProcessEnv,
       stdio: ["pipe", "pipe", "pipe"],

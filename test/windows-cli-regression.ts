@@ -77,6 +77,29 @@ async function main() {
       await resolve({ PATH: empty, HOME: home }),
       join(home, ".local", "bin", "claude.exe"),
     );
+    // cli.js is not executable on its own: probes, login and the SDK run it
+    // through node (the SDK would pick bun inside OpenCode).
+    const { cliInvocation } = await import("../src/executable-path.ts");
+    const cliJs = join(pkg(legacy), "cli.js");
+    assert.deepEqual(cliInvocation(cliJs, ["--version"]), ["node", [cliJs, "--version"]]);
+    const exe = join(pkg(npm), "bin", "claude.exe");
+    assert.deepEqual(cliInvocation(exe, ["--version"]), [exe, ["--version"]]);
+    const { startClaudeQuery } = await import("../src/query.ts");
+    const sdkOptions = async (path: string) => {
+      let seen: any;
+      await startClaudeQuery({
+        prompt: "x",
+        cwd: root,
+        pathToClaudeCodeExecutable: path,
+        queryImpl: () => (input: any) => {
+          seen = input.options;
+          return (async function* () {})();
+        },
+      } as any);
+      return seen;
+    };
+    assert.equal((await sdkOptions(cliJs)).executable, "node");
+    assert.equal((await sdkOptions(exe)).executable, undefined);
     resetClaudeCliResolutionCache();
   } finally {
     rmSync(root, { recursive: true, force: true });

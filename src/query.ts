@@ -7,6 +7,7 @@ import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import { isClaudeEffort, type ClaudeEffort } from "./constants.js";
 import {
   assertClaudeWorkingDirectory,
+  isJsEntrypoint,
   resolveClaudeCodeExecutable,
 } from "./executable-path.js";
 import { log } from "./log.js";
@@ -367,6 +368,7 @@ export async function startClaudeQuery(
 
   if (pathToClaudeCodeExecutable) {
     options.pathToClaudeCodeExecutable = pathToClaudeCodeExecutable;
+    if (isJsEntrypoint(pathToClaudeCodeExecutable)) options.executable = "node";
   }
 
   const model = trimmedString(params.model);
@@ -589,6 +591,9 @@ export async function listClaudeSupportedModels(
       strictMcpConfig: true,
       settings: { disableClaudeAiConnectors: true },
       ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
+      ...(pathToClaudeCodeExecutable && isJsEntrypoint(pathToClaudeCodeExecutable)
+        ? { executable: "node" as const }
+        : {}),
     },
   }) as { supportedModels?: () => Promise<unknown[]>; close?: () => void };
   let timer: ReturnType<typeof setTimeout> | undefined;

@@ -27,6 +27,21 @@ export type CliProbeResult = {
 const MAX_PROBE_OUTPUT = 64 * 1024;
 
 /**
+ * npm's older Claude Code installs on Windows ship only `cli.js`. A JS entry
+ * point is not executable on its own there, and the Agent SDK would pick the
+ * host's runtime for it (bun inside OpenCode, rarely on PATH), so it always
+ * runs through node, which an npm install implies.
+ */
+export function isJsEntrypoint(path: string): boolean {
+  return /\.[cm]?js$/i.test(path);
+}
+
+/** The command and arguments that run the CLI at `binaryPath`. */
+export function cliInvocation(binaryPath: string, args: string[]): [string, string[]] {
+  return isJsEntrypoint(binaryPath) ? ["node", [binaryPath, ...args]] : [binaryPath, args];
+}
+
+/**
  * Run a short-lived CLI probe without blocking the event loop. The child is
  * killed and the probe reported as failed once `timeoutMs` elapses.
  */
@@ -53,7 +68,8 @@ export function runCliProbe(
     timer.unref?.();
 
     try {
-      child = spawn(command, args, {
+      const [file, argv] = cliInvocation(command, args);
+      child = spawn(file, argv, {
         env: options.env as NodeJS.ProcessEnv | undefined,
         windowsHide: true,
         stdio: ["ignore", "pipe", "ignore"],
