@@ -81,6 +81,8 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 **Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. Opus, Fable and some Sonnet models come in 1M-context versions. Context limits and effort levels show up in OpenCode's model details.
 
+**Keeping the CLI current.** Claude Code only updates itself from its interactive screen, so a CLI used from OpenCode alone would stay on the version it was installed with, and new models would never appear. The plugin runs `claude update` for you, in the background, about once an hour; a new version is picked up by the next chat turn, and its models by the next refresh of the model list. The outcome of the last run is in `~/.local/share/opencode-claude/cli-update.json`. To turn it off, pass `cliAutoUpdate: false` in the plugin options (`{ "package": "@openchamber/opencode-claude", "options": { "cliAutoUpdate": false } }`); Claude Code's own `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` in the server's environment are honoured too. Installs owned by winget, Homebrew or a Linux package manager are left to them.
+
 **Effort.** Pick an effort variant (low, medium, high, xhigh, max) where the model supports it. While Claude thinks, a summary of its reasoning streams into the reasoning block.
 
 **Plan mode.** OpenCode's Plan agent works as usual: Claude is told it's in plan mode, and OpenCode blocks file edits.

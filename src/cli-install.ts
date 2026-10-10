@@ -15,10 +15,10 @@ import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import { resetClaudeCliResolutionCache } from "./executable-path.js";
 
 export type ClaudeCliInstallResult =
-  | { ok: true }
-  | { ok: false; message: string };
+  | { ok: true; output?: string }
+  | { ok: false; message: string; output?: string };
 
-type SpawnInstall = (
+export type SpawnInstall = (
   command: string,
   args: string[],
   options: Parameters<typeof spawn>[2],
@@ -27,6 +27,8 @@ type SpawnInstall = (
 /** Budget for the whole install (npm, then script download and run). */
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
 const MAX_BUFFERED_OUTPUT = 16 * 1024;
+/** How long after `exit` to wait for `close` before settling on `exit`. */
+const EXIT_WITHOUT_CLOSE_MS = 500;
 
 const ANSI_PATTERN = /\u001B\[[0-9;?]*[A-Za-z]/g;
 
@@ -45,7 +47,7 @@ function tail(text: string, max = MAX_BUFFERED_OUTPUT): string {
   return text.length > max ? text.slice(text.length - max) : text;
 }
 
-function firstMeaningfulLine(text: string): string {
+export function firstMeaningfulLine(text: string): string {
   return (
     text
       .split(/\r?\n/)
@@ -110,13 +112,15 @@ function installed(): ClaudeCliInstallResult {
   return { ok: true };
 }
 
-type InstallerOptions = {
+export type InstallerOptions = {
   env: NodeJS.ProcessEnv;
   cwd: string;
   /** Total budget, for the timeout message. */
   timeoutMs: number;
   /** Epoch ms by which every step must be done. */
   deadline: number;
+  /** What the timeout message calls the run; "Claude Code install" by default. */
+  label?: string;
 };
 
 /**
@@ -156,7 +160,12 @@ async function runInstallScript(
   }
 }
 
-function runInstaller(
+/**
+ * Run one CLI step with piped stdio and a deadline. The captured output (ANSI
+ * stripped, last 16 KB) comes back with the result: the install path reports
+ * its first line on failure, the update path reads the outcome from it.
+ */
+export function runInstaller(
   spawnInstall: SpawnInstall,
   command: string,
   args: string[],
@@ -164,7 +173,7 @@ function runInstaller(
 ): Promise<ClaudeCliInstallResult> {
   const timedOut: ClaudeCliInstallResult = {
     ok: false,
-    message: `Claude Code install timed out after ${Math.round(
+    message: `${options.label ?? "Claude Code install"} timed out after ${Math.round(
       options.timeoutMs / 1000,
     )}s.`,
   };
@@ -213,17 +222,26 @@ function runInstaller(
     child.once("error", (error) => {
       finish({ ok: false, message: error.message });
     });
-    child.once("exit", (code) => {
+    const settle = (code: number | null) => {
       if (code === 0) {
-        finish({ ok: true });
+        finish({ ok: true, output });
         return;
       }
       finish({
         ok: false,
         message:
           firstMeaningfulLine(output) ||
-          `Claude Code install exited with code ${code ?? "unknown"}.`,
+          `${options.label ?? "Claude Code install"} exited with code ${code ?? "unknown"}.`,
+        output,
       });
+    };
+    // `exit` can fire before the pipes are drained; `close` means the output
+    // is complete. `exit` stays as the fallback for children that never
+    // close (test doubles).
+    child.once("close", (code) => settle(code));
+    child.once("exit", (code) => {
+      const late = setTimeout(() => settle(code), EXIT_WITHOUT_CLOSE_MS);
+      late.unref?.();
     });
   });
 }
