@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.9 - 2026-10-11
+
+- **Fix: signing back in asked for a needless restart**: when Claude Code
+  lost its login, the error in chat said to run `claude auth login` and then
+  restart OpenCode. Each turn starts Claude Code again and reads the login
+  fresh, so the restart is not needed. The message now says to sign in from a
+  terminal and send the message again.
+
 ## 1.3.8 - 2026-10-07
 
 - **New sessions start from the prompt cache**: Claude Code's system prompt
