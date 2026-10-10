@@ -737,7 +737,8 @@ async function main() {
       { role: "tool", tool_call_id: "c1", content: "x".repeat(5000) },
     ]);
     assert.match(withTools, /\[called tool: bash\]/);
-    assert.match(withTools, /Tool result/);
+    // the result is labelled with the tool it answers, not the call id
+    assert.match(withTools, /Tool result \(bash\):/);
     assert.match(withTools, /chars omitted/);
 
     // budget keeps the NEWEST messages, drops oldest first

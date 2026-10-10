@@ -838,6 +838,7 @@ function truncateMiddle(text: string, max: number): string {
 
 function serializeHistoryMessage(
   msg: ConversationHistoryMessage,
+  toolNames: ReadonlyMap<string, string>,
 ): string | null {
   if (!msg || typeof msg !== "object") return null;
   const role = msg.role;
@@ -867,9 +868,12 @@ function serializeHistoryMessage(
   if (role === "tool") {
     const text = extractTextContent(msg.content).trim();
     if (!text) return null;
+    // OpenAI-style tool messages carry only tool_call_id; the name is on the
+    // assistant's call.
     const label =
       (typeof msg.name === "string" && msg.name) ||
-      (typeof msg.tool_call_id === "string" && msg.tool_call_id) ||
+      (typeof msg.tool_call_id === "string" &&
+        (toolNames.get(msg.tool_call_id) || msg.tool_call_id)) ||
       "tool";
     return `Tool result (${label}):\n${truncateMiddle(text, TOOL_RESULT_MAX_CHARS)}`;
   }
@@ -906,9 +910,15 @@ export function buildConversationTranscript(
   maxChars: number = historyMaxChars(),
 ): string {
   if (maxChars <= 0) return "";
+  const toolNames = new Map<string, string>();
+  for (const msg of messages) {
+    for (const call of msg?.tool_calls ?? []) {
+      if (call?.id && call.function?.name) toolNames.set(call.id, call.function.name);
+    }
+  }
   const serialized: string[] = [];
   for (const msg of messages) {
-    const line = serializeHistoryMessage(msg);
+    const line = serializeHistoryMessage(msg, toolNames);
     if (line) serialized.push(line);
   }
   if (serialized.length === 0) return "";
