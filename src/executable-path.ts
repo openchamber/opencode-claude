@@ -10,7 +10,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
 
 type ProbeEnv = NodeJS.ProcessEnv | Record<string, string | undefined>;
@@ -25,6 +25,21 @@ export type CliProbeResult = {
 
 /** Probes print a version or a small JSON document; anything larger is noise. */
 const MAX_PROBE_OUTPUT = 64 * 1024;
+
+/**
+ * npm's older Claude Code installs on Windows ship only `cli.js`. A JS entry
+ * point is not executable on its own there, and the Agent SDK would pick the
+ * host's runtime for it (bun inside OpenCode, rarely on PATH), so it always
+ * runs through node, which an npm install implies.
+ */
+export function isJsEntrypoint(path: string): boolean {
+  return /\.[cm]?js$/i.test(path);
+}
+
+/** The command and arguments that run the CLI at `binaryPath`. */
+export function cliInvocation(binaryPath: string, args: string[]): [string, string[]] {
+  return isJsEntrypoint(binaryPath) ? ["node", [binaryPath, ...args]] : [binaryPath, args];
+}
 
 /**
  * Run a short-lived CLI probe without blocking the event loop. The child is
@@ -53,7 +68,8 @@ export function runCliProbe(
     timer.unref?.();
 
     try {
-      child = spawn(command, args, {
+      const [file, argv] = cliInvocation(command, args);
+      child = spawn(file, argv, {
         env: options.env as NodeJS.ProcessEnv | undefined,
         windowsHide: true,
         stdio: ["ignore", "pipe", "ignore"],
@@ -95,12 +111,56 @@ async function probeClaudePath(candidate: string, env: ProbeEnv): Promise<boolea
 }
 
 /**
+ * Windows: the Agent SDK spawns the executable without a shell, and Node/Bun
+ * refuse to run a `.cmd`/`.bat` that way when an argument holds cmd.exe
+ * special characters (the SDK's `--settings` JSON always does), or at all on
+ * newer runtimes. A batch shim is unwrapped to the native `claude.exe` (or
+ * `cli.js`) npm installs beside it. Checked on disk only: a `.cmd` probe can
+ * be rejected outright, and a cold start of the ~250 MB exe can outlast the
+ * probe timeout.
+ */
+export async function resolveWindowsClaudePath(
+  candidate: string,
+): Promise<string | null> {
+  if (!(await isExecutableFile(candidate))) return null;
+  if (/\.exe$/i.test(candidate)) return candidate;
+  if (!/\.(cmd|bat)$/i.test(candidate)) return null;
+  const pkg = join(dirname(candidate), "node_modules", "@anthropic-ai", "claude-code");
+  for (const target of [join(pkg, "bin", "claude.exe"), join(pkg, "cli.js")]) {
+    if (await isExecutableFile(target)) return target;
+  }
+  return null;
+}
+
+/** On Windows a candidate is usable only as a native target (see above). */
+async function usableClaudePath(
+  candidate: string,
+  env: ProbeEnv,
+): Promise<string | null> {
+  if (process.platform === "win32") return resolveWindowsClaudePath(candidate);
+  return (await probeClaudePath(candidate, env)) ? candidate : null;
+}
+
+/**
  * Install locations the managed OpenChamber server commonly misses because its
  * PATH is not a login shell's PATH: the official installer's `~/.local/bin`
  * and the npm global bin.
  */
 async function knownClaudeLocations(env: ProbeEnv): Promise<string[]> {
   const home = typeof env.HOME === "string" && env.HOME ? env.HOME : homedir();
+  if (process.platform === "win32") {
+    // npm's global bin is the prefix root on Windows, not `<prefix>\bin`, and
+    // `npm` itself is a .cmd that cannot be spawned without a shell.
+    const appData =
+      typeof env.APPDATA === "string" && env.APPDATA
+        ? env.APPDATA
+        : join(home, "AppData", "Roaming");
+    return [
+      join(home, ".local", "bin", "claude.exe"),
+      join(appData, "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+      join(appData, "npm", "claude.cmd"),
+    ];
+  }
   const candidates = [join(home, ".local", "bin", "claude")];
 
   const prefix = await runCliProbe("npm", ["prefix", "-g"], { timeoutMs: 6000 });
@@ -115,16 +175,20 @@ export async function findBinaryOnPath(
 ): Promise<string | null> {
   const pathEnv = typeof env.PATH === "string" ? env.PATH : "";
   const parts = pathEnv.split(process.platform === "win32" ? ";" : ":");
-  const exts =
-    process.platform === "win32" ? [".cmd", ".exe", ".bat", ""] : [""];
+  // Windows: no extensionless variant (npm's sh shim cannot be spawned).
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat"] : [""];
   for (const dir of parts) {
     if (!dir) continue;
     for (const ext of exts) {
       const candidate = `${dir.replace(/[/\\]$/, "")}/${name}${ext}`;
-      if (await probeClaudePath(candidate, env)) return candidate;
+      const usable = await usableClaudePath(candidate, env);
+      if (usable) return usable;
     }
   }
 
+  // A bare name on Windows lets the SDK's spawn find claude.cmd on PATH again;
+  // with no path the SDK falls back to its own bundled executable.
+  if (process.platform === "win32") return null;
   return (await probeClaude(name, env)) ? name : null;
 }
 
@@ -182,10 +246,8 @@ async function probeClaudeCli(env: ProbeEnv): Promise<string | null> {
   let resolved = await findBinaryOnPath("claude", env);
   if (!resolved) {
     for (const candidate of await knownClaudeLocations(env)) {
-      if (await probeClaudePath(candidate, env)) {
-        resolved = candidate;
-        break;
-      }
+      resolved = await usableClaudePath(candidate, env);
+      if (resolved) break;
     }
   }
   return resolved;
