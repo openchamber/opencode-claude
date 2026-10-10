@@ -1004,9 +1004,9 @@ async function main() {
     assert.equal(info.settings.baseURL, "http://127.0.0.1:1/v1");
     const listed: any[] = buildClaudeProviderModels(getClaudeModels());
     const sonnetModel = listed.find((m) => m.id === "claude-sonnet-5");
-    // 1M models declare a 900k input limit so OpenCode compacts around 90%
+    // No input limit on 1M models: OpenCode keeps its own 10% free.
     const oneM = listed.find((m) => m.limit.context === 1_000_000);
-    assert.equal(oneM?.limit.input, 900_000);
+    assert.equal(oneM?.limit.input, undefined);
     assert.equal(sonnetModel.limit.input, undefined);
     assert.deepEqual(
       sonnetModel.variants.map((v: any) => v.id),
