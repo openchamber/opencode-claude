@@ -51,6 +51,8 @@ function model(
 const FALLBACK_MODELS: ClaudeModel[] = [
   model("claude-opus-5-5[1m]", "Opus 5.5", LIMIT_1M),
   model("claude-fable-5-1[1m]", "Fable 5.1", LIMIT_1M),
+  model("claude-sonnet-5-5", "Sonnet 5.5", LIMIT_200K),
+  model("claude-sonnet-5-5[1m]", "Sonnet 5.5 (1M)", LIMIT_1M),
   model("claude-sonnet-5", "Sonnet 5", LIMIT_200K),
   model("claude-sonnet-5[1m]", "Sonnet 5 (1M)", LIMIT_1M),
   model("claude-haiku-4-5", "Haiku 4.5", LIMIT_200K, undefined, []),
