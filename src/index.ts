@@ -84,11 +84,9 @@ export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
     enabled: true,
     limit: {
       context: model.contextWindow,
-      // OpenCode compacts at input - buffer when an input limit is set;
-      // without one a 1M window only compacts near its very edge.
-      ...(model.contextWindow >= 1_000_000
-        ? { input: Math.round(model.contextWindow * 0.9) }
-        : {}),
+      // No input limit: OpenCode 2.0.19+ keeps 10% of the window free on
+      // its own (compaction.buffer overrides it). A 900k input on top of
+      // that compacted 1M chats at 81%, not the intended 90%.
       output: model.maxTokens,
     },
   } as unknown as ModelInfo;
