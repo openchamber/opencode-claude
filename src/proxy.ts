@@ -2715,7 +2715,17 @@ type MapState = {
   shownNotices?: Set<string>;
   /** This response carried answer text or tool calls. */
   producedContent?: boolean;
+  /** A thinking block after the first, held until its signature arrives. */
+  heldThinking?: { index: number; text: string; narration: boolean };
 };
+
+/**
+ * Opus 5.5 sends its pre-tool-call update as a thinking block whose opaque
+ * signature is tagged "narration". If that tag ever changes it stays reasoning.
+ */
+function isNarrationSignature(signature: unknown): boolean {
+  return typeof signature === "string" && Buffer.from(signature, "base64").subarray(0, 64).includes("narration");
+}
 
 /**
  * The CLI hit a retryable API error and retries on its own (up to
@@ -2889,6 +2899,27 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
         ? { kind: "usage-delta", usage, messageId: state?.messageId ?? null }
         : { kind: "ignore" };
     }
+    // Real thinking is always block 0 and streams live; a later thinking block
+    // (the narration, sent in one burst) is held until its signature arrives.
+    const held = state && !e.parent_tool_use_id && state.heldThinking?.index === ev.index ? state.heldThinking : undefined;
+    if (
+      ev.type === "content_block_start" &&
+      state &&
+      !e.parent_tool_use_id &&
+      typeof ev.index === "number" &&
+      ev.index > 0 &&
+      (ev.content_block as { type?: unknown } | undefined)?.type === "thinking"
+    ) {
+      state.heldThinking = { index: ev.index, text: "", narration: false };
+      return { kind: "ignore" };
+    }
+    if (ev.type === "content_block_stop" && held && state) {
+      state.heldThinking = undefined;
+      if (!held.text) return { kind: "ignore" };
+      if (!held.narration) return { kind: "reasoning", text: held.text };
+      state.producedContent = true;
+      return { kind: "text", text: held.text };
+    }
     if (ev.type === "content_block_delta" && ev.delta && typeof ev.delta === "object") {
       const delta = ev.delta as Record<string, unknown>;
       if (delta.type === "text_delta" && typeof delta.text === "string") {
@@ -2899,10 +2930,15 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
         (delta.type === "thinking_delta" || delta.type === "reasoning_delta") &&
         typeof (delta.thinking ?? delta.text) === "string"
       ) {
-        return {
-          kind: "reasoning",
-          text: String(delta.thinking ?? delta.text),
-        };
+        const text = String(delta.thinking ?? delta.text);
+        if (held) {
+          held.text += text;
+          return { kind: "ignore" };
+        }
+        return { kind: "reasoning", text };
+      }
+      if (delta.type === "signature_delta" && held) {
+        held.narration = isNarrationSignature(delta.signature);
       }
     }
     return { kind: "ignore" };
