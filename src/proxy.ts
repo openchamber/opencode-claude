@@ -100,6 +100,14 @@ import {
   type McpToolResultContent,
   type SdkUserPrompt,
 } from "./prompt.js";
+import { cutLargeOutput } from "./large-output.js";
+import {
+  MAX_SLICE_CHARS,
+  OUTPUT_SLICE_TOOL,
+  OUTPUT_TTL_MINUTES,
+  formatSlice,
+  sharedOutputStore,
+} from "./output-store.js";
 import {
   detectMetaRequestKind,
   metaSystemPrompt,
@@ -890,8 +898,9 @@ async function handleChatCompletions(
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
+        const blocks = cutLargeTextBlocks(tool.name, result);
         tool.resolve(
-          toolId === steeringToolId ? withSteering(result, steering) : result,
+          toolId === steeringToolId ? withSteering(blocks, steering) : blocks,
         );
         existing.pendingTools.delete(toolId);
         resolved++;
@@ -1375,9 +1384,19 @@ async function startNewTurn(input: {
   }
   const contextualPrompt = withConversationContext(prompt, transcript, Boolean(resume));
 
+  const openCodeToolNames = openCodeTools
+    .map((t) => t.function?.name)
+    .filter((n): n is string => typeof n === "string" && n.length > 0);
+  // Answered inside this process from the in-memory output store; OpenCode
+  // never sees these calls. Registered for a resumed summary too, so its
+  // tool list matches the chat turn's and the cached prefix still holds.
+  const offerOutputSlice =
+    sharedOutputStore() !== null && !openCodeToolNames.includes(OUTPUT_SLICE_TOOL);
   const mcpServers =
     (!isMetaRequest || summaryResume) && openCodeTools.length > 0
-      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark)
+      ? await buildOpenCodeMcpServer(openCodeTools, pendingTools, notifyPark, {
+          outputSlice: offerOutputSlice,
+        })
       : undefined;
 
   const bridgeOpenCodeTools = !isMetaRequest && openCodeTools.length > 0;
@@ -1397,9 +1416,6 @@ async function startNewTurn(input: {
       { status: 503 },
     );
   }
-  const openCodeToolNames = openCodeTools
-    .map((t) => t.function?.name)
-    .filter((n): n is string => typeof n === "string" && n.length > 0);
   const toolAliases = bridgeOpenCodeTools || (summaryResume && mcpServers)
     ? Object.fromEntries(
         openCodeToolNames.flatMap((name) => {
@@ -1570,7 +1586,9 @@ async function startNewTurn(input: {
     tools: [],
     toolAliases,
     allowedTools: bridgeOpenCodeTools
-      ? openCodeToolNames.map((n) => mcpToolName(n))
+      ? [...openCodeToolNames, ...(offerOutputSlice ? [OUTPUT_SLICE_TOOL] : [])].map((n) =>
+          mcpToolName(n),
+        )
       : undefined,
     // dontAsk runs exactly the allowed tools and refuses the rest. Not
     // bypassPermissions: the CLI refuses to start with it as root.
@@ -1914,6 +1932,7 @@ export async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
   onPark: () => void,
+  options?: { outputSlice?: boolean },
 ): Promise<Record<string, unknown> | undefined> {
   try {
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
@@ -2034,6 +2053,53 @@ export async function buildOpenCodeMcpServer(
         );
       })
       .filter(Boolean);
+
+    if (options?.outputSlice) {
+      const sliceDescription = `Read part of a tool output that was cut before reaching you. Pass the "output id" from the cut note. Returns up to ${MAX_SLICE_CHARS} chars starting at offset. Outputs are kept in memory for about ${OUTPUT_TTL_MINUTES} minutes.`;
+      const sliceShape = {
+        id: z.string().describe("The output id from the cut note, e.g. o1a2b3c4d5e6f"),
+        offset: z.number().int().min(0).optional().describe("First char to return (default 0)"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_SLICE_CHARS)
+          .optional()
+          .describe(`Chars to return (default and max ${MAX_SLICE_CHARS})`),
+      };
+      const { $schema: _schema, ...sliceSchema } = z.toJSONSchema(
+        z.object(sliceShape),
+      ) as Record<string, unknown>;
+      listed.push({
+        name: OUTPUT_SLICE_TOOL,
+        description: sliceDescription,
+        inputSchema: sliceSchema,
+        _meta: { "anthropic/alwaysLoad": true },
+      });
+      mcpTools.push(
+        toolFactory(
+          OUTPUT_SLICE_TOOL,
+          sliceDescription,
+          sliceShape,
+          async (args: { id: string; offset?: number; limit?: number }) => {
+            const store = sharedOutputStore();
+            const result = store
+              ? store.slice(args.id, args.offset, args.limit)
+              : { ok: false as const, reason: "the output store is turned off" };
+            log.info("[opencode-claude] output_slice", {
+              id: args.id,
+              offset: args.offset ?? 0,
+              ok: result.ok,
+            });
+            return {
+              content: [{ type: "text", text: formatSlice(args.id, result) }],
+              ...(result.ok ? {} : { isError: true }),
+            };
+          },
+          { alwaysLoad: true },
+        ),
+      );
+    }
 
     const server = createSdkMcpServer({
       name: currentHost().mcpServer,
@@ -2716,6 +2782,19 @@ function forgetDeadSession(conversationKey: string, errorText: string): void {
     conversationKey,
   });
   clearForeignSessionId(conversationKey);
+}
+
+/** Cut oversized text blocks of a tool result; media blocks pass through. */
+function cutLargeTextBlocks(
+  toolName: string,
+  blocks: McpToolResultContent[],
+): McpToolResultContent[] {
+  const store = sharedOutputStore();
+  return blocks.map((block) =>
+    block.type === "text"
+      ? { type: "text" as const, text: cutLargeOutput(toolName, block.text, store) }
+      : block,
+  );
 }
 
 /**

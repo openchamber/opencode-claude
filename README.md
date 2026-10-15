@@ -134,6 +134,8 @@ Most people won't need these. Set them in the environment of the OpenCode server
 | `OPENCODE_CLAUDE_TURN_STALL_MS` | End a turn when Claude Code goes silent this long (default 10 minutes) |
 | `OPENCODE_CLAUDE_PARKED_TURN_TTL_MS` | Close a turn waiting on tool results after this long (default 1 hour, `0` never) |
 | `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` | Always send turns to Claude, even when a limit is known to be active |
+| `OPENCODE_CLAUDE_TOOL_OUTPUT_CHARS` | Tool results longer than this reach Claude as their head and tail with a note on how much was dropped (default 8000, `0` turns it off). `read` results are never cut |
+| `OPENCODE_CLAUDE_OUTPUT_STORE_MB` | Memory kept for cut outputs, so Claude can read the rest through the local `output_slice` tool (default 16, `0` turns it off) |
 | `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` | Keep the working directory, memory path and git status in Claude Code's system prompt. By default they go in the first message instead, so every session shares the prompt and a new one reads it from the cache |
 
 ## Development
