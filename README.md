@@ -81,6 +81,8 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 **Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. Opus, Fable and some Sonnet models come in 1M-context versions. Context limits and effort levels show up in OpenCode's model details.
 
+**Keeping the CLI current.** Claude Code only updates itself from its interactive screen, so a CLI used from OpenCode alone would stay on the version it was installed with, and new models would never appear. The plugin runs `claude update` for you, in the background, about once an hour; a new version is picked up by the next chat turn, and its models the next time the plugin reads the model list: when OpenCode loads the plugin (for example after a restart), at most once every ten minutes. Several OpenCode servers on one machine share the schedule: the one that starts the update marks it `running` in `~/.local/share/opencode-claude/cli-update.json`, and the others skip. Every run ends with `claude --version`, and an update the CLI reports but did not put in place is recorded as a failure. A chat turn that starts while the CLI cannot be launched (the update is replacing it, or another program holds the file) fails with a server error, which OpenCode retries on its own a few seconds later, up to ten times; the plugin looks for the CLI again before each retry. The file holds the outcome of the last run, and `cli-update.log` next to it keeps one line per update and per failure. To turn it off, pass `cliAutoUpdate: false` in the plugin options (`{ "package": "@openchamber/opencode-claude", "options": { "cliAutoUpdate": false } }`); Claude Code's own `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` in the server's environment are honoured too. Installs owned by winget, Homebrew or a Linux package manager are left to them.
+
 **Effort.** Pick an effort variant (low, medium, high, xhigh, max) where the model supports it. While Claude thinks, a summary of its reasoning streams into the reasoning block.
 
 **Plan mode.** OpenCode's Plan agent works as usual: Claude is told it's in plan mode, and OpenCode blocks file edits.
@@ -134,6 +136,7 @@ Most people won't need these. Set them in the environment of the OpenCode server
 | `OPENCODE_CLAUDE_TURN_STALL_MS` | End a turn when Claude Code goes silent this long (default 10 minutes) |
 | `OPENCODE_CLAUDE_PARKED_TURN_TTL_MS` | Close a turn waiting on tool results after this long (default 1 hour, `0` never) |
 | `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` | Always send turns to Claude, even when a limit is known to be active |
+| `OPENCODE_CLAUDE_CLI_UPDATE_INTERVAL_MS` | How often the plugin runs `claude update` (default 1 hour) |
 | `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` | Keep the working directory, memory path and git status in Claude Code's system prompt. By default they go in the first message instead, so every session shares the prompt and a new one reads it from the cache |
 
 ## Development

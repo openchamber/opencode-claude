@@ -21,6 +21,7 @@ import {
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
 import { installClaudeCli } from "./cli-install.js";
+import { startClaudeCliAutoUpdate } from "./cli-update.js";
 import {
   startClaudeCliLogin,
   submitClaudeCliLoginCode,
@@ -259,6 +260,14 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     });
 
     const stopWatching = watchSessionInterrupts(ctx);
+    // Claude Code's own updater never runs under the Agent SDK (see
+    // cli-update.ts). Started even without a CLI: the install action may
+    // add one later, and the check skips until it is there. New models
+    // arrive with the catalog read at the next plugin load. Started here,
+    // after the awaited host calls, so a failure above leaves no timer.
+    const stopCliAutoUpdate = startClaudeCliAutoUpdate({
+      options: ctx.options as { cliAutoUpdate?: unknown } | undefined,
+    });
     // Claude Code already moved the session to its fallback model; move the
     // OpenCode session too so the picker and the next turns match it.
     setModelFallbackHandler((sessionID, modelId, variant) => {
@@ -276,6 +285,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     });
 
     return async () => {
+      stopCliAutoUpdate();
       stopWatching();
       await releaseProxy();
     };

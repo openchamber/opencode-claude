@@ -44,7 +44,9 @@ esac
     return {
       stop,
       ctx: {
-        options: {},
+        // The background CLI update is not what this checks, and on Windows
+        // the PATH above does not apply: it could update the real CLI.
+        options: { cliAutoUpdate: false },
         location: { directory: tmp },
         provider: {
           transform: async (fn: (p: { add: (x: unknown) => void }) => void) => {

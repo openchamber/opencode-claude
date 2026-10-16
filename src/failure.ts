@@ -13,6 +13,15 @@
  * - refusal          → 400 refusal (Claude declined; a retry is refused too)
  * - overloaded       → 503 overloaded_error (retryable; OpenCode backs off)
  * - unknown          → 500
+ *
+ * Retries are OpenCode's, not ours: it treats any 5xx from a provider as
+ * ProviderInternal and repeats the request up to 10 times, 2, 4, 8, then
+ * 10 s apart (packages/ai/src/provider-error.ts, classifyProviderFailure;
+ * packages/core/src/session/runner/retry.ts). A CLI that did not start
+ * (isClaudeLaunchFailure) relies on that: the turn is a plain 500, the
+ * memoized CLI path is dropped, and the retry finds the CLI again. Checked
+ * live on Windows with the launcher held open for 15 s: three 500s, then
+ * the fourth attempt answered.
  */
 import { isClaudeRateLimitText } from "./rate-limit.js";
 
@@ -64,6 +73,25 @@ export function classifyClaudeFailure(text: string): ClaudeFailureKind {
   if (CONTEXT_OVERFLOW_PATTERN.test(text)) return "context_overflow";
   if (IMAGE_FAILURE_PATTERN.test(text)) return "image";
   return "unknown";
+}
+
+/**
+ * The CLI could not be started. The Agent SDK reports a missing file in the
+ * turn's stream ("Claude Code native binary not found at …", "Claude Code
+ * executable not found at …", "… exists but failed to launch", "Failed to
+ * spawn Claude Code process: …"); Bun throws other spawn errors right away,
+ * naming the system call ("EBUSY: resource busy or locked, uv_spawn" on
+ * Windows, "ETXTBSY: text file busy, posix_spawn" elsewhere), and query.ts
+ * wraps Node's ENOTDIR.
+ * Seen when `claude update` swaps the launcher under a starting turn, or an
+ * install changed the layout. The memoized CLI path is dropped so the next
+ * attempt looks again; the turn itself stays a 500, which OpenCode retries.
+ */
+const LAUNCH_FAILURE_PATTERN =
+  /Claude Code (?:native binary|executable) not found at|Claude Code (?:native binary|executable) at .* exists but failed to launch|Failed to spawn Claude Code process|\b(?:uv|posix)_spawn\b|Claude Code executable path is not spawnable/;
+
+export function isClaudeLaunchFailure(text: string): boolean {
+  return LAUNCH_FAILURE_PATTERN.test(text);
 }
 
 export function failureStatusFor(kind: ClaudeFailureKind): number {

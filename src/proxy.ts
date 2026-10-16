@@ -24,12 +24,14 @@ import {
   type ParkedToolCall,
 } from "./bridge-pool.js";
 import { buildClaudeCodeChildEnv } from "./auth-env.js";
+import { resetClaudeCliResolutionCache } from "./executable-path.js";
 import {
   classifyClaudeFailure,
   failureCodeFor,
   failureHintFor,
   failureStatusFor,
   failureTypeFor,
+  isClaudeLaunchFailure,
   metaFailureText,
   overloadedResultText,
   resultErrorText,
@@ -497,6 +499,9 @@ async function handleRequest(req: Request): Promise<Response> {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log.error("[opencode-claude] chat completions error", message);
+      // A launcher locked at spawn throws here (see isClaudeLaunchFailure);
+      // OpenCode retries the 500, and the retry looks for the CLI again.
+      if (isClaudeLaunchFailure(message)) resetClaudeCliResolutionCache();
       return Response.json(
         { error: { message, type: "server_error" } },
         { status: 500 },
@@ -2337,6 +2342,9 @@ function failureResponse(
   const errorText = metaFailureText(rawErrorText, metaKind);
   recordRateLimitErrorText(errorText);
   forgetDeadSession(conversationKey, errorText);
+  // The CLI did not start: OpenCode retries the 500 below in a few seconds,
+  // and that attempt must look for the CLI again, not reuse the old path.
+  if (isClaudeLaunchFailure(errorText)) resetClaudeCliResolutionCache();
   const kind = classifyClaudeFailure(errorText);
   log.warn("[opencode-claude] turn failed fast", {
     kind,

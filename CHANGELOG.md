@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **The Claude Code CLI keeps itself current**: Claude Code's own updater
+  runs only from its interactive screen, so a CLI driven through the Agent
+  SDK stayed on its install-day version and new models (Sonnet 5.5, Haiku 5.5)
+  never showed up. The plugin now runs `claude update` in the background about
+  once an hour (once across all OpenCode servers on the machine), checks the
+  result with `claude --version`, and records the outcome in
+  `~/.local/share/opencode-claude/cli-update.json`. Off with
+  `cliAutoUpdate: false` in the plugin options or Claude Code's
+  `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` or
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`.
+- **A CLI that does not start is looked for again**: when a turn cannot
+  launch the CLI (an update is replacing it, an install changed its path,
+  another program holds the file), the plugin forgets the path it had found
+  and answers with a server error; OpenCode retries it a few seconds later
+  and the retry finds the CLI anew.
+
 ## 1.4.1 - 2026-10-13
 
 - **Opus 5.5's update before a tool call shows as text**: the short "found
