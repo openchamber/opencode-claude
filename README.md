@@ -79,7 +79,9 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 ## Using it
 
-**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. Opus, Fable and some Sonnet models come in 1M-context versions. Context limits and effort levels show up in OpenCode's model details.
+**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. The context window of each model is the one your CLI runs it with: current models run at 1M, a model that reaches 1M only through Claude Code's `[1m]` variant (Opus 4.6) is listed twice, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` lists everything at 200K. Context limits and effort levels show up in OpenCode's model details.
+
+The plugin asks the CLI for these windows once and keeps the answers in `~/.local/share/opencode-claude/context-windows.json`. Asking costs a tiny request per model (Claude Code checks a model it switches to with a one-token call), so it asks again only when something changes: the CLI is updated, you sign in to another account or change plans, a setting that changes windows (`CLAUDE_CODE_DISABLE_1M_CONTEXT`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `DISABLE_COMPACT`) changes in the environment or in Claude Code's `settings.json`, or a new model appears. Otherwise it asks again after a day.
 
 **Effort.** Pick an effort variant (low, medium, high, xhigh, max) where the model supports it. While Claude thinks, a summary of its reasoning streams into the reasoning block.
 
@@ -100,7 +102,7 @@ Your plan's limits go mostly to context: each step of an agent loop re-reads the
 - Start a new session for a new task instead of stretching one session over a day's work.
 - Coming back to a long session after a break costs more, because the cache has expired and the whole context is written again.
 - Plugins that rewrite OpenCode's history on every turn (context pruning and the like) break the cache and make every turn much more expensive with Claude.
-- 1M models compact around 90% of the window. If you don't need the room, the regular versions stay smaller.
+- 1M models compact around 90% of the window. If you don't need the room, `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` keeps every model at 200K.
 
 ## Troubleshooting
 
@@ -109,7 +111,9 @@ Your plan's limits go mostly to context: each step of an agent loop re-reads the
 | No Claude Code provider in OpenCode | Check that `plugins` in `opencode.json` includes `@openchamber/opencode-claude`, then restart OpenCode |
 | Authentication error | Run `claude auth status`. If you're signed out or on an API key, run `claude auth login --claudeai` |
 | `claude` works with my company API key in the terminal but not in OpenCode | The plugin only runs on a Claude plan. With an API key or a company gateway you don't need this plugin at all: use OpenCode's built-in Anthropic provider |
-| "Model unavailable" on an old session | The model ids changed in 1.1. Pick the model again in that session |
+| "Model unavailable" on an old session | The model ids changed in 1.1, and models that run at 1M on their own (Opus 5.5, Fable 5.1, Sonnet 5.5…) later lost their `[1m]` suffix. Pick the model again in that session |
+| A model listed under its raw id, like `claude-opus-5-5[1m]` | Your `opencode.json` has settings for an id the plugin no longer lists, and OpenCode adds that model on its own. Rename the entry under `providers.claude-code.models` to the plain id (`claude-opus-5-5`) or remove it |
+| A context window that looks wrong | Delete `~/.local/share/opencode-claude/context-windows.json`. The windows are asked from the CLI again on the next start |
 | A rate-limit error with a reset time | Your plan's limit was reached. It clears at the reset time, or on your next message if you reset your limits early |
 | Something else | Turn on the debug log (below) and share it in an issue or on Discord |
 

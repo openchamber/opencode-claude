@@ -1,14 +1,12 @@
 /**
  * Claude Code model catalog (from OpenChamber harness registry).
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import {
   EFFORT_LEVELS,
   isClaudeEffort,
   type ClaudeEffort,
 } from "./constants.js";
+import { readCachedModels, writeCachedModels } from "./model-cache.js";
 
 export type ClaudeModel = {
   id: string;
@@ -49,12 +47,10 @@ function model(
  * (`opus[1m]`, `sonnet`) asks the user to pick a model once.
  */
 const FALLBACK_MODELS: ClaudeModel[] = [
-  model("claude-opus-5-5[1m]", "Opus 5.5", LIMIT_1M),
-  model("claude-fable-5-1[1m]", "Fable 5.1", LIMIT_1M),
-  model("claude-sonnet-5-5", "Sonnet 5.5", LIMIT_200K),
-  model("claude-sonnet-5-5[1m]", "Sonnet 5.5 (1M)", LIMIT_1M),
-  model("claude-sonnet-5", "Sonnet 5", LIMIT_200K),
-  model("claude-sonnet-5[1m]", "Sonnet 5 (1M)", LIMIT_1M),
+  model("claude-opus-5-5", "Opus 5.5", LIMIT_1M),
+  model("claude-fable-5-1", "Fable 5.1", LIMIT_1M),
+  model("claude-sonnet-5-5", "Sonnet 5.5", LIMIT_1M),
+  model("claude-sonnet-5", "Sonnet 5", LIMIT_1M),
   model("claude-haiku-5-5", "Haiku 5.5", LIMIT_1M),
   model("claude-haiku-4-5", "Haiku 4.5", LIMIT_200K, undefined, []),
   model("claude-opus-4-8", "Opus 4.8", LIMIT_1M),
@@ -68,21 +64,46 @@ export type SdkModelRow = {
   supportedEffortLevels?: string[];
 };
 
+/** Output limit that goes with a context window. */
+function limitFor(context: number): { context: number; output: number } {
+  const output = context > LIMIT_200K.context ? LIMIT_1M.output : LIMIT_200K.output;
+  return { context, output };
+}
+
+/** Concrete model id of a `supportedModels()` row, without `[1m]`. */
+function rowBaseId(row: SdkModelRow): string | undefined {
+  const value = typeof row?.value === "string" ? row.value.trim() : "";
+  // The CLI's "default" row only repeats another model.
+  if (!value || value === "default") return undefined;
+  return (row.resolvedModel || value).replace(/\[1m\]$/i, "");
+}
+
+/** Concrete ids of the listed models, without `[1m]`, each once. */
+export function listedModelIds(rows: SdkModelRow[]): string[] {
+  const ids: string[] = [];
+  for (const row of rows) {
+    const base = rowBaseId(row);
+    if (base && !ids.includes(base)) ids.push(base);
+  }
+  return ids;
+}
+
 /**
- * 1M context rules per model family (same table t3code ships). Claude Code
- * selects 1M through a `[1m]` suffix on the model id.
- * - default: offered only as the 1M variant
- * - optional: offered as both the plain model and a 1M variant
- * - fixed: the plain id already runs at 1M
+ * `[1m]` variants worth asking the CLI about: only where the plain id runs
+ * below 1M (Opus 4.6). A model that already runs at 1M gains nothing from
+ * the suffix, and every question costs a model request.
  */
-const ONE_M_FAMILIES: Array<{ match: RegExp; mode: "default" | "optional" | "fixed" }> = [
-  { match: /^claude-fable-5/, mode: "default" },
-  { match: /^claude-opus-5/, mode: "default" },
-  { match: /^claude-opus-4-6/, mode: "default" },
-  { match: /^claude-opus-4-[78]/, mode: "fixed" },
-  { match: /^claude-sonnet-(5|4-6)/, mode: "optional" },
-  { match: /^claude-haiku-5/, mode: "fixed" },
-];
+export function extendedProbeIds(
+  rows: SdkModelRow[],
+  windows: ReadonlyMap<string, number | null>,
+): string[] {
+  return listedModelIds(rows)
+    .filter((id) => {
+      const plain = windows.get(id);
+      return typeof plain === "number" && plain < LIMIT_1M.context && !windows.has(`${id}[1m]`);
+    })
+    .map((id) => `${id}[1m]`);
+}
 
 /**
  * Display name from the concrete model id ("claude-opus-5-5[1m]" →
@@ -100,34 +121,45 @@ export function modelNameFromId(id: string | undefined): string | undefined {
 
 /**
  * Map the CLI's own model list (supportedModels) into the catalog. The
- * CLI's "default" row only repeats another model, so it is skipped.
+ * context window of each id is the one the CLI reported now (`windows`); an
+ * id it could not answer this time keeps what it reported before
+ * (`lastAnswers`, from the window cache), and an id it never answered gets
+ * 200K, which can only compact a chat early, never overflow it. Claude Code
+ * selects 1M through a `[1m]` suffix on the model id (the suffix never
+ * reaches the API); a model gets a second "(1M)" entry only when its `[1m]`
+ * variant runs a larger window than the plain id (Opus 4.6), and a refused
+ * variant is not listed.
  */
-export function modelsFromSdk(rows: SdkModelRow[]): ClaudeModel[] {
+export function modelsFromSdk(
+  rows: SdkModelRow[],
+  windows?: ReadonlyMap<string, number | null>,
+  lastAnswers?: ReadonlyMap<string, number | null>,
+): ClaudeModel[] {
+  const answer = (id: string) => {
+    const now = windows?.get(id);
+    return now === undefined ? lastAnswers?.get(id) : now;
+  };
   const out: ClaudeModel[] = [];
   for (const row of rows) {
-    const value = typeof row?.value === "string" ? row.value.trim() : "";
-    if (!value || value === "default") continue;
+    // The concrete id, like t3code: a session stays on the model it picked
+    // instead of moving when the CLI's `opus` alias points somewhere new.
+    const base = rowBaseId(row);
+    if (!base) continue;
+    const value = row.value.trim();
     const efforts = (row.supportedEffortLevels ?? []).filter(isClaudeEffort);
     const name =
       modelNameFromId(row.resolvedModel) ??
       modelNameFromId(value) ??
       (row.displayName?.trim() || value);
-    // The concrete id, like t3code: a session stays on the model it picked
-    // instead of moving when the CLI's `opus` alias points somewhere new.
-    const family = (row.resolvedModel || value).replace(/\[1m\]$/i, "");
-    const base = family;
-    const rule = /\[1m\]$/i.test(value)
-      ? { mode: "default" as const }
-      : ONE_M_FAMILIES.find((f) => f.match.test(family));
-    if (rule?.mode === "default") {
-      out.push(model(`${base}[1m]`, name, LIMIT_1M, undefined, efforts));
-    } else if (rule?.mode === "fixed") {
-      out.push(model(base, name, LIMIT_1M, undefined, efforts));
-    } else if (rule?.mode === "optional") {
-      out.push(model(base, name, LIMIT_200K, undefined, efforts));
-      out.push(model(`${base}[1m]`, `${name} (1M)`, LIMIT_1M, undefined, efforts));
-    } else {
-      out.push(model(base, name, LIMIT_200K, undefined, efforts));
+    const answered = answer(base);
+    const plain = typeof answered === "number" ? answered : LIMIT_200K.context;
+    out.push(model(base, name, limitFor(plain), undefined, efforts));
+    // null: the CLI refused the variant for this account. Not answered this
+    // time: its last answer keeps the variant, so a session on it keeps its
+    // model until the next refresh asks again.
+    const extended = answer(`${base}[1m]`);
+    if (typeof extended === "number" && extended > plain) {
+      out.push(model(`${base}[1m]`, `${name} (1M)`, limitFor(extended), undefined, efforts));
     }
   }
   // An alias row and its concrete row resolve to the same model.
@@ -152,30 +184,6 @@ export function setDiscoveredModels(models: ClaudeModel[]): boolean {
   discovered = models;
   if (changed) writeCachedModels(models);
   return changed;
-}
-
-function modelCachePath(): string {
-  const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-  return join(base, "opencode-claude", "models.json");
-}
-
-function readCachedModels(): ClaudeModel[] | null {
-  try {
-    const parsed = JSON.parse(readFileSync(modelCachePath(), "utf8"));
-    return Array.isArray(parsed) && parsed.length ? (parsed as ClaudeModel[]) : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeCachedModels(models: ClaudeModel[]): void {
-  try {
-    const file = modelCachePath();
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify(models, null, 2));
-  } catch {
-    // The cache only speeds up the next start.
-  }
 }
 
 export function resolveClaudeModelId(modelId: string): string {
