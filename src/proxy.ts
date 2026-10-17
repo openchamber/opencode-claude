@@ -1910,6 +1910,61 @@ export function normalizeToolParameters(
   return { type: "object", properties: {} };
 }
 
+/** JSON Schema types a property accepts; empty when it constrains none. */
+function schemaTypes(schema: unknown): string[] {
+  if (!schema || typeof schema !== "object") return [];
+  const { type, anyOf, oneOf } = schema as {
+    type?: unknown;
+    anyOf?: unknown;
+    oneOf?: unknown;
+  };
+  if (typeof type === "string") return [type];
+  if (Array.isArray(type)) return type.filter((t): t is string => typeof t === "string");
+  const variants = [anyOf, oneOf].find(Array.isArray) as unknown[] | undefined;
+  if (!variants) return [];
+  const types = variants.map(schemaTypes);
+  return types.some((t) => t.length === 0) ? [] : types.flat();
+}
+
+/**
+ * Claude sometimes sends a scalar or JSON argument as its string encoding
+ * ("true", "300000", a JSON array). Claude Code's own tools accept that, so
+ * decode a string for a parameter that cannot take one; anything that does
+ * not decode to an accepted type is left for validation to reject.
+ */
+export function coerceStringArgument(value: unknown, schema: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const types = schemaTypes(schema);
+  if (types.length === 0 || types.includes("string")) return value;
+  const text = value.trim();
+  if (types.includes("boolean") && (text === "true" || text === "false")) {
+    return text === "true";
+  }
+  if ((types.includes("number") || types.includes("integer")) && text !== "") {
+    const number = Number(text);
+    if (
+      Number.isFinite(number) &&
+      (types.includes("number") || Number.isInteger(number))
+    ) {
+      return number;
+    }
+  }
+  if (types.includes("null") && text === "null") return null;
+  if (types.includes("array") || types.includes("object")) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (
+        Array.isArray(parsed)
+          ? types.includes("array")
+          : parsed !== null && typeof parsed === "object" && types.includes("object")
+      ) {
+        return parsed;
+      }
+    } catch {}
+  }
+  return value;
+}
+
 export async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -1964,6 +2019,42 @@ export async function buildOpenCodeMcpServer(
       return shape;
     };
 
+    // Decode string-encoded top-level arguments before validation.
+    const withStringCoercion = (
+      shape: unknown,
+      schema: Record<string, unknown>,
+    ): unknown => {
+      const props =
+        schema.properties && typeof schema.properties === "object"
+          ? (schema.properties as Record<string, unknown>)
+          : {};
+      const object = shape instanceof z.ZodObject
+        ? (shape as { shape: Record<string, any>; extend: (f: Record<string, any>) => unknown })
+        : undefined;
+      const fields: Record<string, any> = {
+        ...(object ? object.shape : (shape as Record<string, unknown>)),
+      };
+      let changed = false;
+      for (const [key, field] of Object.entries(fields)) {
+        const types = schemaTypes(props[key]);
+        if (types.length === 0 || types.includes("string")) continue;
+        const coerced = z.preprocess(
+          (value) => coerceStringArgument(value, props[key]),
+          field,
+        );
+        // The pipe returns undefined for an omitted optional argument without
+        // running `field`, which would drop a schema default.
+        const omitted = field.safeParse(undefined);
+        fields[key] =
+          omitted.success && omitted.data !== undefined
+            ? coerced.default(() => field.parse(undefined))
+            : coerced;
+        changed = true;
+      }
+      if (!changed) return shape;
+      return object ? object.extend(fields) : fields;
+    };
+
     const listed: Array<{
       name: string;
       description: string;
@@ -2001,6 +2092,7 @@ export async function buildOpenCodeMcpServer(
         } catch {
           shape = jsonSchemaToZodShape(params);
         }
+        shape = withStringCoercion(shape, params);
         return toolFactory(
           name,
           description,
