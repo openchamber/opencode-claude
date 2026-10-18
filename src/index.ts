@@ -36,9 +36,8 @@ import {
   modelsFromSdk,
   setDiscoveredModels,
   type ClaudeModel,
-  type SdkModelRow,
 } from "./models.js";
-import { listClaudeSupportedModels } from "./query.js";
+import { listClaudeSupportedModels } from "./model-discovery.js";
 import { closeSessionBridges } from "./bridge-pool.js";
 import {
   getClaudeProxyBaseUrl,
@@ -115,16 +114,29 @@ export function buildProviderInfo(baseURL: string): ProviderInfo {
 // OpenCode starts a plugin instance per location and recycles idle ones, so
 // setup runs many times a day; the account's model list rarely changes.
 const MODEL_REFRESH_INTERVAL_MS = 10 * 60_000;
-let lastModelRefresh = 0;
+
+/**
+ * Kept on globalThis, like the bridge runtime (bridge-pool.ts): OpenCode
+ * imports a changed local plugin afresh on reload, and a module-level time
+ * would start over in the new copy, which then asks the CLI for every
+ * window again while the old copy's pass may still be running.
+ */
+const MODEL_REFRESH_KEY = Symbol.for("@openchamber/opencode-claude/model-refresh/v1");
+
+export const modelRefreshRuntime: { lastModelRefresh: number } = ((globalThis as Record<symbol, unknown>)[
+  MODEL_REFRESH_KEY
+] ??= { lastModelRefresh: 0 }) as { lastModelRefresh: number };
 
 async function refreshModelCatalog(reload: () => Promise<void>) {
   const now = Date.now();
-  if (now - lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
-  lastModelRefresh = now;
+  if (now - modelRefreshRuntime.lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
+  modelRefreshRuntime.lastModelRefresh = now;
   try {
-    const rows = await listClaudeSupportedModels();
-    if (!rows?.length) return;
-    if (setDiscoveredModels(modelsFromSdk(rows as SdkModelRow[]))) {
+    const found = await listClaudeSupportedModels();
+    if (!found?.rows.length) return;
+    // A window the CLI could not answer this time keeps its last answer.
+    const models = modelsFromSdk(found.rows, found.windows, found.lastAnswers);
+    if (setDiscoveredModels(models)) {
       await reload();
     }
   } catch (err) {

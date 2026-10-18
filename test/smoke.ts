@@ -522,7 +522,9 @@ async function main() {
   const models = getClaudeModels();
   assert.ok(models.length >= 4);
   assert.ok(models.some((m) => m.id === "claude-sonnet-5"));
-  assert.ok(models.some((m) => m.id === "claude-opus-5-5[1m]"));
+  assert.ok(models.some((m) => m.id === "claude-opus-5-5"));
+  // Models with a native 1M window are listed once, without `[1m]`
+  assert.ok(!models.some((m) => m.id === "claude-opus-5-5[1m]" || m.id === "claude-sonnet-5-5[1m]"));
   // 1.0 aliases are no longer listed; the proxy itself still passes them on
   assert.ok(!models.some((m) => m.id === "opus" || m.id === "sonnet"));
   assert.equal(resolveClaudeModelId("sonnet"), "sonnet");
@@ -532,7 +534,8 @@ async function main() {
   const variants = buildEffortVariants(sonnet);
   assert.deepEqual(variants, [...EFFORT_LEVELS]);
   for (const level of EFFORT_LEVELS) assert.equal(isClaudeEffort(level), true);
-  assert.equal(sonnet.contextWindow, 200_000);
+  assert.equal(sonnet.contextWindow, 1_000_000);
+  assert.equal(sonnet.maxTokens, 128_000);
   // Haiku takes no effort, so it gets no effort variants
   assert.deepEqual(
     buildEffortVariants(getClaudeModels().find((m) => m.id === "claude-haiku-4-5")!),
@@ -552,26 +555,40 @@ async function main() {
     assert.equal(row!.name, "Opus 5");
   }
 
-  // The CLI's own model list becomes the catalog, with t3code's 1M rules
+  // The CLI's own model list becomes the catalog, with the windows the CLI
+  // reports for each id (context-window-regression.ts covers the windows)
+  const cliRows = [
+    { value: "default", displayName: "Default (recommended)", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
+    { value: "opus", displayName: "Opus 5.5", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
+    { value: "sonnet", displayName: "Sonnet 5", resolvedModel: "claude-sonnet-5", supportedEffortLevels: ["low", "high"] },
+    { value: "claude-opus-4-8", displayName: "Opus 4.8", resolvedModel: "claude-opus-4-8" },
+    { value: "claude-opus-4-6", displayName: "Opus 4.6", resolvedModel: "claude-opus-4-6" },
+    { value: "claude-sonnet-4-6", displayName: "Sonnet 4.6", resolvedModel: "claude-sonnet-4-6" },
+    { value: "haiku", displayName: "Haiku 4.5", resolvedModel: "claude-haiku-4-5-20251001" },
+  ];
+  // What CLI 2.1.300 answered on a Max plan, plain ids and the [1m] variants
+  // worth asking
+  const cliWindows: Record<string, number | null> = {
+    "claude-opus-5-5": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
+    "claude-opus-4-8": 1_000_000,
+    "claude-opus-4-6": 200_000, "claude-opus-4-6[1m]": 1_000_000,
+    "claude-sonnet-4-6": 200_000, "claude-sonnet-4-6[1m]": null,
+    "claude-haiku-4-5-20251001": 200_000, "claude-haiku-4-5-20251001[1m]": null,
+  };
   {
-    const fromCli = modelsFromSdk([
-      { value: "default", displayName: "Default (recommended)", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
-      { value: "opus", displayName: "Opus 5.5", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["low", "high"] },
-      { value: "sonnet", displayName: "Sonnet 5", resolvedModel: "claude-sonnet-5", supportedEffortLevels: ["low", "high"] },
-      { value: "claude-opus-4-8", displayName: "Opus 4.8", resolvedModel: "claude-opus-4-8" },
-      { value: "haiku", displayName: "Haiku 4.5", resolvedModel: "claude-haiku-4-5-20251001" },
-    ]);
+    const fromCli = modelsFromSdk(cliRows, new Map(Object.entries(cliWindows)));
     const byId = Object.fromEntries(fromCli.map((m) => [m.id, m]));
     assert.deepEqual(
       fromCli.map((m) => m.id),
-      ["claude-opus-5-5[1m]", "claude-sonnet-5", "claude-sonnet-5[1m]", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
+      [
+        "claude-opus-5-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-6", "claude-opus-4-6[1m]",
+        "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
+      ],
     );
-    assert.equal(byId["claude-opus-5-5[1m]"]!.contextWindow, 1_000_000);
-    assert.equal(byId["claude-opus-5-5[1m]"]!.name, "Opus 5.5");
-    assert.deepEqual(buildEffortVariants(byId["claude-opus-5-5[1m]"]!), ["low", "high"]);
-    assert.equal(byId["claude-sonnet-5"]!.contextWindow, 200_000);
-    assert.equal(byId["claude-sonnet-5[1m]"]!.name, "Sonnet 5 (1M)");
-    assert.equal(byId["claude-opus-4-8"]!.contextWindow, 1_000_000);
+    assert.equal(byId["claude-opus-5-5"]!.name, "Opus 5.5");
+    assert.deepEqual(buildEffortVariants(byId["claude-opus-5-5"]!), ["low", "high"]);
+    assert.equal(byId["claude-opus-4-6[1m]"]!.name, "Opus 4.6 (1M)");
     assert.deepEqual(buildEffortVariants(byId["claude-haiku-4-5-20251001"]!), []);
     assert.equal(setDiscoveredModels(fromCli), true);
     const ids = getClaudeModels().map((m) => m.id);
@@ -1063,7 +1080,8 @@ async function main() {
       { value: "claude-fable-5-1", resolvedModel: "claude-fable-5-1", supportedEffortLevels: ["low", "high"] },
       { value: "claude-opus-5", resolvedModel: "claude-opus-5", supportedEffortLevels: ["low", "high"] },
     ]));
-    assert.equal(catalogIdForFallback("claude-opus-5", "claude-fable-5-1[1m]"), "claude-opus-5[1m]");
+    assert.equal(catalogIdForFallback("claude-opus-5", "claude-fable-5-1[1m]"), "claude-opus-5");
+    assert.equal(catalogIdForFallback("claude-opus-5", "claude-fable-5-1"), "claude-opus-5");
     assert.match(
       modelFallbackNote({ original_model: "claude-fable-5-1", fallback_model: "claude-opus-5", api_refusal_category: "bio" }),
       /Fable 5\.1 declined this request \(bio\); Opus 5 answered/,
@@ -1093,7 +1111,7 @@ async function main() {
     const body = await res.text();
     assert.match(body, /declined this request/);
     assert.match(body, /answer from opus/);
-    assert.deepEqual(switched, [["ses_fallback", "claude-opus-5[1m]", undefined]]);
+    assert.deepEqual(switched, [["ses_fallback", "claude-opus-5", undefined]]);
     // Chat turns keep the user's Claude Code memory; only utility turns drop it.
     assert.equal(chatEnv?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined);
     setModelFallbackHandler(null);

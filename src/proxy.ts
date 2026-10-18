@@ -632,8 +632,12 @@ type SummaryResumePoint = {
  * characters per token of the chat model's window. OpenCode already sized
  * the request to that window, so this only guards against a runaway one.
  */
-function summaryHistoryMaxChars(model: string): number {
-  return (/\[1m\]$/i.test(model) ? 1_000_000 : 200_000) * 3;
+export function summaryHistoryMaxChars(model: string): number {
+  // The catalog knows the window: a model with a native 1M window has no
+  // `[1m]` in its id. The suffix only decides for an id it does not list.
+  const listed = getClaudeModels().find((m) => m.id === model || m.resolvedId === model);
+  const tokens = listed?.contextWindow ?? (/\[1m\]$/i.test(model) ? 1_000_000 : 200_000);
+  return tokens * 3;
 }
 
 const SUMMARY_NUDGE_MARKER = "did not fill in the required summary template";
@@ -742,11 +746,19 @@ export function setModelFallbackHandler(handler: ModelFallbackHandler | null): v
   modelFallbackHandler = handler;
 }
 
-/** Catalog id for the CLI's fallback model, keeping the 1M variant if picked. */
+/**
+ * Catalog id for the CLI's fallback model. A `[1m]` variant the CLI names
+ * explicitly stays as named. A plain name (the CLI usually reports the model
+ * without the suffix) gets the 1M variant when the original ran at 1M: by its
+ * window in the catalog, since a native 1M model has no `[1m]` in its id.
+ */
 export function catalogIdForFallback(fallback: string, original: string): string {
-  const ids = new Set(getClaudeModels().map((m) => m.id));
+  const models = getClaudeModels();
+  const ids = new Set(models.map((m) => m.id));
+  if (/\[1m\]$/i.test(fallback) && ids.has(fallback)) return fallback;
   const base = fallback.replace(/\[1m\]$/i, "");
-  const wants1M = /\[1m\]$/i.test(original);
+  const originalWindow = models.find((m) => m.id === original)?.contextWindow ?? 0;
+  const wants1M = /\[1m\]$/i.test(original) || originalWindow >= 1_000_000;
   for (const candidate of wants1M ? [`${base}[1m]`, base] : [base, `${base}[1m]`]) {
     if (ids.has(candidate)) return candidate;
   }
