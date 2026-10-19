@@ -9,6 +9,7 @@
  * tool_calls; the follow-up request with tool results resumes the turn.
  */
 import { createHash, randomUUID } from "node:crypto";
+import type { ZodObject, ZodType } from "zod";
 import { currentHost, mcpToolName, openCodeToolName } from "./host.js";
 import {
   mcpInstructions,
@@ -2026,11 +2027,31 @@ export async function buildOpenCodeMcpServer(
         // did not name instead of silently dropping them before OpenCode.
         let shape: unknown;
         try {
-          shape = (z as unknown as {
-            fromJSONSchema: (s: unknown) => { loose: () => unknown };
+          const parsed = (z as unknown as {
+            fromJSONSchema: (s: unknown) => ZodObject;
           })
             .fromJSONSchema(params)
             .loose();
+          // Claude sometimes sends a nested object or array as a JSON string
+          // (seen after compaction); parse it back instead of failing -32602.
+          const props = (params.properties ?? {}) as Record<string, { type?: unknown }>;
+          const fixed: Record<string, ZodType> = {};
+          for (const [key, field] of Object.entries(parsed.shape)) {
+            const type = props[key]?.type;
+            if (type !== "object" && type !== "array") continue;
+            const parse = z.preprocess((v) => {
+              if (typeof v !== "string") return v;
+              try {
+                return JSON.parse(v);
+              } catch {
+                return v;
+              }
+            }, field as ZodType);
+            fixed[key] = (field as ZodType).safeParse(undefined).success
+              ? parse.optional()
+              : parse;
+          }
+          shape = parsed.extend(fixed);
         } catch {
           shape = jsonSchemaToZodShape(params);
         }
