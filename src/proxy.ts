@@ -1960,6 +1960,30 @@ export async function buildOpenCodeMcpServer(
       return undefined;
     }
 
+    // Claude sometimes sends a non-text argument as text: {} as "{}", 22 as
+    // "22", true as "true" (seen after compaction). Parse it back instead of
+    // failing -32602. Fields that accept text are left alone.
+    const parsesFromText = (type: unknown) => {
+      const types = Array.isArray(type) ? type : [type];
+      return (
+        !types.includes("string") &&
+        types.some((t) =>
+          ["object", "array", "number", "integer", "boolean"].includes(t as string),
+        )
+      );
+    };
+    const parseJsonText = (field: ZodType): ZodType => {
+      const parse = z.preprocess((v) => {
+        if (typeof v !== "string") return v;
+        try {
+          return JSON.parse(v);
+        } catch {
+          return v;
+        }
+      }, field);
+      return field.safeParse(undefined).success ? parse.optional() : parse;
+    };
+
     const jsonSchemaToZodShape = (
       schema: Record<string, unknown> | undefined,
     ): Record<string, unknown> => {
@@ -1993,7 +2017,7 @@ export async function buildOpenCodeMcpServer(
         if (!required.has(key)) {
           field = (field as { optional: () => unknown }).optional();
         }
-        shape[key] = field;
+        shape[key] = parsesFromText(type) ? parseJsonText(field as ZodType) : field;
       }
       return shape;
     };
@@ -2032,24 +2056,10 @@ export async function buildOpenCodeMcpServer(
           })
             .fromJSONSchema(params)
             .loose();
-          // Claude sometimes sends a nested object or array as a JSON string
-          // (seen after compaction); parse it back instead of failing -32602.
           const props = (params.properties ?? {}) as Record<string, { type?: unknown }>;
           const fixed: Record<string, ZodType> = {};
           for (const [key, field] of Object.entries(parsed.shape)) {
-            const type = props[key]?.type;
-            if (type !== "object" && type !== "array") continue;
-            const parse = z.preprocess((v) => {
-              if (typeof v !== "string") return v;
-              try {
-                return JSON.parse(v);
-              } catch {
-                return v;
-              }
-            }, field as ZodType);
-            fixed[key] = (field as ZodType).safeParse(undefined).success
-              ? parse.optional()
-              : parse;
+            if (parsesFromText(props[key]?.type)) fixed[key] = parseJsonText(field as ZodType);
           }
           shape = parsed.extend(fixed);
         } catch {
