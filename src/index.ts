@@ -53,7 +53,8 @@ export function applyClaudeRequestContextHeaders(
   directory: string,
   sessionID?: string,
 ): void {
-  headers[DIRECTORY_HEADER] = directory;
+  // Header values must be Latin-1: fetch rejects a raw path like C:\项目.
+  headers[DIRECTORY_HEADER] = encodeURIComponent(directory);
   if (sessionID) headers["x-opencode-claude-session"] = sessionID;
 }
 

@@ -1081,7 +1081,10 @@ async function startNewTurn(input: {
   // came back naming an unrelated project from a memory line. A summary that
   // resumes the chat's session keeps it, like the chat turn it continues.
   if (isMetaRequest && !summaryResume) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
-  const requestDirectory = req.headers.get(DIRECTORY_HEADER)?.trim();
+  const directoryHeader = req.headers.get(DIRECTORY_HEADER)?.trim();
+  const requestDirectory = directoryHeader
+    ? decodeURIComponent(directoryHeader)
+    : undefined;
   const cwd =
     process.env.OPENCODE_CLAUDE_CWD || requestDirectory || process.cwd();
   const bridgeId = randomUUID();
