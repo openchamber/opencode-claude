@@ -105,8 +105,8 @@ export async function probeClaudeAuthStatusCli(options: {
 }
 
 const SUBSCRIPTION_CHECK_TTL_MS = 60_000;
-let subscriptionCheck: { at: number; result: Promise<string | null> } | null =
-  null;
+/** Keyed by config directory: each one holds its own login. */
+const subscriptionChecks = new Map<string, { at: number; result: Promise<string | null> }>();
 
 /**
  * The plugin serves Claude plans only: API-key access already has a native
@@ -116,32 +116,39 @@ let subscriptionCheck: { at: number; result: Promise<string | null> } | null =
  * on its own with an auth error. Cached briefly to keep turns fast.
  */
 type AuthStatus = { loggedIn: boolean; detail: string } | null;
-type AuthStatusProbe = () => AuthStatus | Promise<AuthStatus>;
+type AuthStatusProbe = (configDir?: string) => AuthStatus | Promise<AuthStatus>;
 
-const defaultAuthStatusProbe: AuthStatusProbe = async () => {
+const defaultAuthStatusProbe: AuthStatusProbe = async (configDir) => {
   const binaryPath = await resolveClaudeCli(process.env);
-  return binaryPath ? probeClaudeAuthStatusCli({ binaryPath }) : null;
+  if (!binaryPath) return null;
+  return probeClaudeAuthStatusCli({
+    binaryPath,
+    env: configDir ? { ...process.env, CLAUDE_CONFIG_DIR: configDir } : undefined,
+  });
 };
 let authStatusProbe = defaultAuthStatusProbe;
 
 /** Test seam: replace the CLI probe (null restores the real one). */
 export function setAuthStatusProbe(probe: AuthStatusProbe | null): void {
   authStatusProbe = probe ?? defaultAuthStatusProbe;
-  subscriptionCheck = null;
+  subscriptionChecks.clear();
 }
 
 export function checkSubscriptionAuth(
+  configDir?: string,
   now = Date.now(),
 ): Promise<string | null> {
   const probe = authStatusProbe;
-  if (subscriptionCheck && now - subscriptionCheck.at < SUBSCRIPTION_CHECK_TTL_MS) {
-    return subscriptionCheck.result;
+  const key = configDir ?? "";
+  const cached = subscriptionChecks.get(key);
+  if (cached && now - cached.at < SUBSCRIPTION_CHECK_TTL_MS) {
+    return cached.result;
   }
   const result = Promise.resolve().then(async () => {
     // A failing probe fails open like an unknown result.
     let status: AuthStatus = null;
     try {
-      status = await probe();
+      status = await probe(configDir);
     } catch {
       status = null;
     }
@@ -153,7 +160,7 @@ export function checkSubscriptionAuth(
     }
     return null;
   });
-  subscriptionCheck = { at: now, result };
+  subscriptionChecks.set(key, { at: now, result });
   return result;
 }
 

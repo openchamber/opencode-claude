@@ -45,6 +45,7 @@ import {
 } from "./model-selection.js";
 import { getClaudeModels, isFastModelId, modelNameFromId, resolveClaudeModelId } from "./models.js";
 import {
+  CONFIG_DIR_HEADER,
   DIRECTORY_HEADER,
   KIND_HEADER,
   SESSION_HEADER,
@@ -656,6 +657,7 @@ function summaryResumePoint(
   chatKey: string,
   messages: OpenAIMessage[],
   stoppedTurn: boolean,
+  configDir?: string,
 ): SummaryResumePoint | null {
   const sessionId = getForeignSessionId(chatKey);
   if (!sessionId) return null;
@@ -682,7 +684,7 @@ function summaryResumePoint(
   } else {
     return null;
   }
-  const file = findClaudeSessionFile(source);
+  const file = findClaudeSessionFile(source, configDir);
   if (!file) return null;
   if (leafUuid && sessionChainAfterLeaf(file, leafUuid) !== "clean") return null;
   return {
@@ -807,6 +809,12 @@ export function resolveMetaKind(
   return kind === null && !session ? "generate" : null;
 }
 
+/** The Claude Code config directory the plugin mapped to this request's project. */
+function requestConfigDir(req: Request): string | undefined {
+  const header = req.headers.get(CONFIG_DIR_HEADER)?.trim();
+  return header ? decodeURIComponent(header) : undefined;
+}
+
 async function handleChatCompletions(
   req: Request,
   body: ChatCompletionRequest,
@@ -840,7 +848,7 @@ async function handleChatCompletions(
         conversationKey: chatKey,
       });
     }
-    summaryResume = summaryResumePoint(chatKey, messages, stopped > 0);
+    summaryResume = summaryResumePoint(chatKey, messages, stopped > 0, requestConfigDir(req));
     log.info(
       summaryResume
         ? "[opencode-claude] summarizing from the chat's Claude session"
@@ -1080,6 +1088,8 @@ async function startNewTurn(input: {
   });
 
   const env = buildClaudeCodeChildEnv();
+  const configDir = requestConfigDir(req);
+  if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
 
   const requestTools = Array.isArray(body.tools) ? body.tools : [];
   // A resumed summary repeats the tools of the chat turn it continues.
@@ -1193,7 +1203,7 @@ async function startNewTurn(input: {
     );
   }
 
-  const authRefusal = await checkSubscriptionAuth();
+  const authRefusal = await checkSubscriptionAuth(configDir);
   if (authRefusal) {
     return Response.json(
       {
@@ -1216,7 +1226,7 @@ async function startNewTurn(input: {
   // account is refused before any generation); OpenCode's automatic retries
   // of the same request stay blocked until the reset.
   const gateKey = `${conversationKey}:${messages.length}`;
-  const gate = rateLimitGate();
+  const gate = rateLimitGate(Date.now(), configDir);
   const alreadyTried = gateChecked.has(gateKey);
   rememberGateCheck(gateKey);
   if (gate.blocked && alreadyTried) {
@@ -1249,7 +1259,7 @@ async function startNewTurn(input: {
   }
 
   let resume = summaryResume?.sessionId ?? getForeignSessionId(conversationKey);
-  const sessionFile = resume ? findClaudeSessionFile(resume) : null;
+  const sessionFile = resume ? findClaudeSessionFile(resume, configDir) : null;
   if (resume && !sessionFile) {
     // The claude CLI resumes by looking the session up on disk. A missing
     // transcript (cleanup, different machine, pruned projects dir) would
@@ -1287,7 +1297,7 @@ async function startNewTurn(input: {
     // fork); its file must still hold the leaf.
     const source = match.kind === "rewind" ? (match.sessionId ?? resume) : undefined;
     const sourceFile =
-      source === undefined ? null : source === resume ? sessionFile : findClaudeSessionFile(source);
+      source === undefined ? null : source === resume ? sessionFile : findClaudeSessionFile(source, configDir);
     if (
       match.kind === "rewind" &&
       match.leafUuid &&
@@ -1358,7 +1368,7 @@ async function startNewTurn(input: {
       // Fork uuids are fresh. The current boundary moves to the fork's last
       // entry, the copy of the leaf it was cut at; older boundaries keep
       // pointing into the sessions they were recorded in.
-      const forkFile = findClaudeSessionFile(forked);
+      const forkFile = findClaudeSessionFile(forked, configDir);
       setForeignSessionId(conversationKey, forked, {
         modelId: model,
         cwd,
@@ -1503,7 +1513,7 @@ async function startNewTurn(input: {
   const codeMode = openCodeToolNames.includes("execute") ? codeModeCatalog(messages) : "";
   const skills = openCodeToolNames.includes("skill") ? skillsCatalog(messages) : "";
   const agentPrompt = customAgentPrompt(messages);
-  const instructionFiles = isMetaRequest ? "" : openCodeInstructionFiles(messages, cwd);
+  const instructionFiles = isMetaRequest ? "" : openCodeInstructionFiles(messages, cwd, configDir);
   const sessionContext = isMetaRequest ? "" : sessionContextBlocks(messages);
   const mcpNotes = openCodeToolNames.includes("execute") ? mcpInstructions(messages) : "";
   // Stored in the chat's profile below, so a summary that resumes the chat
@@ -1642,6 +1652,7 @@ async function startNewTurn(input: {
     forwardedSteering: new Set(),
     createdAt: Date.now(),
     input: turnInput,
+    configDir,
   };
   // Session binding and resume point follow every event the turn yields,
   // including the ones stop() reads after an interrupt: for a turn stopped
@@ -1856,7 +1867,7 @@ async function startNewTurn(input: {
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
-      return failureResponse(probe.errorText, conversationKey, metaKind);
+      return failureResponse(probe.errorText, conversationKey, metaKind, configDir);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
@@ -2250,7 +2261,7 @@ async function collectTurnResponse(
   let content = "";
   let reasoning = "";
   const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
-  const mapState: MapState = { messageId: null };
+  const mapState: MapState = { messageId: null, configDir: bridge.configDir };
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
   let errorText: string | null = null;
@@ -2300,7 +2311,7 @@ async function collectTurnResponse(
     // Null: only CLI diagnostics after an error result already noted.
     const message = thrownErrorText(err) ?? (errorText ? null : "Claude turn failed");
     if (message) {
-      recordRateLimitErrorText(message);
+      recordRateLimitErrorText(message, bridge.configDir);
       forgetDeadSession(bridge.conversationKey, message);
       noteError(message);
     }
@@ -2323,6 +2334,7 @@ async function collectTurnResponse(
       mapState.refusalText ?? errorText,
       bridge.conversationKey,
       bridge.metaKind,
+      bridge.configDir,
     );
   }
 
@@ -2500,9 +2512,10 @@ function failureResponse(
   rawErrorText: string,
   conversationKey: string,
   metaKind?: string | null,
+  configDir?: string,
 ): Response {
   const errorText = metaFailureText(rawErrorText, metaKind);
-  recordRateLimitErrorText(errorText);
+  recordRateLimitErrorText(errorText, configDir);
   forgetDeadSession(conversationKey, errorText);
   const kind = classifyClaudeFailure(errorText);
   log.warn("[opencode-claude] turn failed fast", {
@@ -2512,7 +2525,7 @@ function failureResponse(
   });
 
   if (kind === "rate_limit") {
-    const snap = getRateLimitSnapshot();
+    const snap = getRateLimitSnapshot(Date.now(), configDir);
     const until = snap.limitedUntil ?? snap.resetsAt;
     const retryAfterSeconds =
       until !== undefined
@@ -2625,7 +2638,7 @@ function streamOpenAIResponse(
 
       let finishReason: string | null = "stop";
       const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
-      const mapState: MapState = { messageId: null };
+      const mapState: MapState = { messageId: null, configDir: bridge.configDir };
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
       const sendError = (text: string) => {
@@ -2765,7 +2778,7 @@ function streamOpenAIResponse(
         const message =
           thrownErrorText(err) ?? (lastErrorNorm ? null : "Claude turn failed");
         if (message) {
-          recordRateLimitErrorText(message);
+          recordRateLimitErrorText(message, bridge.configDir);
           forgetDeadSession(bridge.conversationKey, message);
           log.warn("[opencode-claude] stream iterator failed", {
             conversationKey: bridge.conversationKey,
@@ -2906,6 +2919,8 @@ type MapState = {
   producedContent?: boolean;
   /** A thinking block after the first, held until its signature arrives. */
   heldThinking?: { index: number; text: string; narration: boolean };
+  /** The turn's Claude account, whose limits the events record. */
+  configDir?: string;
 };
 
 /**
@@ -3027,8 +3042,8 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
       e.rate_limit_info && typeof e.rate_limit_info === "object"
         ? (e.rate_limit_info as Record<string, unknown>)
         : undefined;
-    const state = recordRateLimitInfo(rawInfo);
-    const note = maybeRateLimitNote(state, rawInfo);
+    const limits = recordRateLimitInfo(rawInfo, state?.configDir);
+    const note = maybeRateLimitNote(limits, rawInfo);
     return note ? { kind: "reasoning", text: note } : { kind: "ignore" };
   }
 
@@ -3151,7 +3166,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     // this event can activate the shared countdown/gate in time.
     const errorText = assistantErrorText(e);
     if (errorText) {
-      const limited = recordRateLimitErrorText(errorText);
+      const limited = recordRateLimitErrorText(errorText, state?.configDir);
       let note = errorText;
       const until = limited?.limitedUntil ?? limited?.resetsAt;
       if (until !== undefined) {
@@ -3186,7 +3201,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
     if (e.is_error) {
       const text = resultErrorText(e);
       // Hard subscription limit? Record it so the gate + counter activate.
-      const limited = recordRateLimitErrorText(text);
+      const limited = recordRateLimitErrorText(text, state?.configDir);
       let note = text;
       if (limited?.limited) {
         const until = limited.limitedUntil ?? limited.resetsAt;

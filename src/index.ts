@@ -12,7 +12,9 @@
 // Type-only: the v2 host loads a plain `{ id, setup }` object, so the plugin
 // needs none of OpenCode's runtime packages.
 import type { Model, Plugin, Provider } from "@opencode/plugin";
+import { configDirForDirectory } from "./config-dir.js";
 import {
+  CONFIG_DIR_HEADER,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
   KIND_HEADER,
@@ -52,10 +54,12 @@ export function applyClaudeRequestContextHeaders(
   headers: Record<string, string>,
   directory: string,
   sessionID?: string,
+  configDir?: string,
 ): void {
   // Header values must be Latin-1: fetch rejects a raw path like C:\项目.
   headers[DIRECTORY_HEADER] = encodeURIComponent(directory);
   if (sessionID) headers["x-opencode-claude-session"] = sessionID;
+  if (configDir) headers[CONFIG_DIR_HEADER] = encodeURIComponent(configDir);
 }
 
 type ProviderInfo = Provider.Info;
@@ -197,6 +201,11 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       process.env.OPENCODE_CLAUDE_DEBUG ??= "1";
     }
     const directory = ctx.location.directory;
+    // A project mapped to another Claude account in the `configDirs` option.
+    const configDir = configDirForDirectory(
+      (ctx.options as { configDirs?: unknown } | undefined)?.configDirs,
+      directory,
+    );
     // Bind first (ephemeral port by default) so the provider points at the
     // live listener for this process.
     try {
@@ -238,6 +247,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
           request.headers,
           directory,
           request.sessionID,
+          configDir,
         );
       },
       { providerID: PROVIDER_ID },
