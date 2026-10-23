@@ -33,6 +33,8 @@ export type ParkedBridge = {
   input?: TurnInput;
   /** Continues consuming the SDK stream after tools resolve. */
   continueStream?: () => AsyncGenerator<unknown, void, unknown>;
+  /** Claude Code config directory of a project mapped to another account. */
+  configDir?: string;
 };
 
 /**

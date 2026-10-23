@@ -7,6 +7,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse } from "node:path";
+import { claudeConfigDir } from "./config-dir.js";
 import { metaSystemPrompt } from "./request-kind.js";
 
 type MessageLike = { role?: string; content?: unknown };
@@ -56,9 +57,8 @@ function claudeCodeReadsAgentsMd(path: string, dirs: Set<string>): boolean {
 }
 
 /** CLAUDE.md files Claude Code loads itself for this working directory. */
-function claudeMdFiles(cwd: string): string[] {
-  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-  const files = [join(configDir, "CLAUDE.md")];
+function claudeMdFiles(cwd: string, configDir?: string): string[] {
+  const files = [join(claudeConfigDir(configDir), "CLAUDE.md")];
   let dir = cwd;
   const { root } = parse(cwd);
   for (;;) {
@@ -126,9 +126,13 @@ function withImports(files: string[]): string[] {
  * reads as CLAUDE.md (the same file through a symlink or an `@path` import,
  * or the same text) are skipped so the rules don't arrive twice.
  */
-export function openCodeInstructionFiles(messages: MessageLike[], cwd: string): string {
+export function openCodeInstructionFiles(
+  messages: MessageLike[],
+  cwd: string,
+  configDir?: string,
+): string {
   const system = metaSystemPrompt(messages);
-  const loaded = withImports(claudeMdFiles(cwd));
+  const loaded = withImports(claudeMdFiles(cwd, configDir));
   const loadedPaths = new Set(loaded.map(realPath));
   const loadedTexts = new Set(
     loaded.map((file) => readText(file)?.trim()).filter((text): text is string => !!text),
