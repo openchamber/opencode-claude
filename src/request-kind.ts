@@ -93,7 +93,8 @@ export function codeModeCatalog(messages: MessageLike[]): string {
   const heading = /^# Code Mode[\t ]*\r?$/m.exec(system);
   if (!heading) return "";
   const rest = system.slice(heading.index);
-  const toolsHeading = /^## Available tools[\t ]*\r?$/m.exec(rest);
+  // "## Code Mode tools (call only inside `execute`)" from OpenCode 2.2.1.
+  const toolsHeading = /^## (?:Available tools|Code Mode tools\b[^\r\n]*)[\t ]*\r?$/m.exec(rest);
   if (!toolsHeading) return "";
 
   // OpenCode renders namespace/tool listings as one block, separated from

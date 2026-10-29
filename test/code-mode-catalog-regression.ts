@@ -69,6 +69,27 @@ const partial = [
 ].join("\n");
 assert.equal(extract(`${partial}\n\n${environment}`), partial);
 
+// OpenCode 2.2.1 renamed the listing heading to "## Code Mode tools (call
+// only inside `execute`)"; the old one matched nothing, so no catalog went out.
+const catalog221 = [
+  "# Code Mode",
+  "",
+  "The tools listed below, and `search`, cannot be called directly: they only work as JavaScript inside the `execute` tool. Every other tool you have is a normal tool call: call it directly, never inside `execute`.",
+  "",
+  "The catalog is partial. Before calling a tool that is not listed below, find it with the global `search(...)` function. Do not guess tool names.",
+  "",
+  "- search(query: string)",
+  "",
+  "## Code Mode tools (call only inside `execute`)",
+  "",
+  "- demo (2 tools) // Example tools",
+  "  - tools.demo.read({",
+  "  path: string,",
+  "}): Promise<string> // Read a file",
+  "  - tools.demo.status(): Promise<string> // Status",
+].join("\n");
+assert.equal(extract(`${catalog221}\n\n${trailingSections.join("\n\n")}`), catalog221);
+
 // Markdown headings, CRLF, and whitespace-only separators.
 for (const heading of ["# Other instructions", "## Other instructions"]) {
   assert.equal(extract(`${catalog}\n${heading}\nExample`), catalog);
