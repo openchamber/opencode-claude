@@ -27,6 +27,13 @@ export type ParkedBridge = {
   seenCalls: Set<string>;
   /** Keys of mid-turn user messages already attached to a tool result. */
   forwardedSteering: Set<string>;
+  /** Epoch of the chat's context when the turn started (names.ts): a compaction changes it. */
+  epoch?: string;
+  /**
+   * The name of the turn's record in the transcript (names.ts): a summary
+   * written while the turn runs resumes before the message it names.
+   */
+  promptUuid?: string;
   createdAt: number;
   /** Open input of a chat turn: mid-turn user messages go in here. */
   input?: TurnInput;

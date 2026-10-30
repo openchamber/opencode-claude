@@ -24,7 +24,22 @@ export type SdkUserPrompt = {
   type: "user";
   message: { role: "user"; content: string | AnthropicContentBlock[] };
   parent_tool_use_id: null;
+  /** The transcript record's uuid, named by the plugin (names.ts). */
+  uuid?: string;
+  /**
+   * A record without a turn: the CLI writes it to the transcript and the
+   * next record of the stream carries the turn (probes 5, 6, 23).
+   */
+  shouldQuery?: false;
 };
+
+/** The prompt as a record with this uuid; an empty text prompt still needs some content. */
+export function withUuid(prompt: string | SdkUserPrompt, uuid: string): SdkUserPrompt {
+  if (typeof prompt === "string") {
+    return { type: "user", message: { role: "user", content: prompt || " " }, parent_tool_use_id: null, uuid };
+  }
+  return { ...prompt, uuid };
+}
 
 function parseDataUrl(url: string): {
   mediaType: string;
@@ -400,6 +415,22 @@ export function extractTextContent(content: unknown): string {
 }
 
 const SYSTEM_REMINDER_BLOCK = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+/**
+ * A system update OpenCode lowers into user text for an OpenAI-form
+ * provider (ai/src/protocols/shared.ts wrapSystemUpdate): appended to the
+ * previous user message's text, or a user message of its own.
+ */
+const SYSTEM_UPDATE_BLOCK = /<system-update>[\s\S]*?<\/system-update>/g;
+
+/**
+ * The user's own text of a message: without <system-reminder> blocks and
+ * the <system-update> blocks OpenCode appends, with collapsed whitespace.
+ * Empty for a message made of reminders or updates alone, which is not
+ * counted as a user message of the history (see userHistoryFingerprints).
+ */
+export function userTextIdentity(text: string): string {
+  return text.replace(SYSTEM_REMINDER_BLOCK, " ").replace(SYSTEM_UPDATE_BLOCK, " ").replace(/\s+/g, " ").trim();
+}
 
 /**
  * One short hash per user message of a conversation, in order: the
@@ -433,6 +464,19 @@ export function historyAfterUserCount<T extends { role?: string; content?: unkno
   return next ? messages.slice(next.index) : [];
 }
 
+/**
+ * The part of a history after its `count`-th fingerprinted user message:
+ * everything that came after that message, answers included. Empty when the
+ * history holds fewer (the message is in the latest user turn).
+ */
+export function historyAfterUserMessage<T extends { role?: string; content?: unknown }>(
+  messages: T[],
+  count: number,
+): T[] {
+  const entry = fingerprintedUserMessages(messages)[count - 1];
+  return entry ? messages.slice(entry.index + 1) : [];
+}
+
 function fingerprintedUserMessages(
   messages: Array<{ role?: string; content?: unknown }>,
 ): Array<{ index: number; print: string }> {
@@ -440,10 +484,7 @@ function fingerprintedUserMessages(
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
-    const text = extractTextContent(msg.content)
-      .replace(SYSTEM_REMINDER_BLOCK, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const text = userTextIdentity(extractTextContent(msg.content));
     const identity = text || (contentHasAttachments(msg.content) ? "\u0000attachments" : "");
     if (!identity) continue;
     entries.push({ index: i, print: createHash("sha1").update(identity).digest("hex").slice(0, 16) });
@@ -710,49 +751,6 @@ export function collectSteeringMessages(
     }
   }
   return out;
-}
-
-function isSystemUpdate(text: string): boolean {
-  return text.startsWith("<system-update>") && text.endsWith("</system-update>");
-}
-
-/** Append steering to a tool result so Claude reads it on resume. */
-export function withSteering(
-  result: McpToolResultContent[],
-  steering: McpToolResultContent[],
-): McpToolResultContent[] {
-  if (steering.length === 0) return result;
-  const texts = steering
-    .filter((b): b is { type: "text"; text: string } => b.type === "text")
-    .map((b) => b.text.trim())
-    .filter(Boolean);
-  // OpenCode sends a changed session context entry as `<system-update>` user
-  // text. It comes from the host, not the user, so it is not labelled as theirs.
-  const updates = texts.filter(isSystemUpdate);
-  const text = texts.filter((t) => !isSystemUpdate(t)).join("\n\n");
-  const media = steering.filter((b) => b.type !== "text");
-  const userSent = text.length > 0 || media.length > 0;
-  return [
-    ...result,
-    ...(updates.length > 0
-      ? [{ type: "text" as const, text: updates.join("\n\n") }]
-      : []),
-    ...(userSent
-      ? [
-          {
-            type: "text" as const,
-            text: [
-              "<system-reminder>",
-              "While this tool was running, the user sent the following message(s). Read them now and adjust your current work accordingly; they take priority over earlier instructions where they conflict:",
-              "",
-              text || "(attachments only, see below)",
-              "</system-reminder>",
-            ].join("\n"),
-          },
-        ]
-      : []),
-    ...media,
-  ];
 }
 
 type ToolStepMessage = {
@@ -1172,8 +1170,12 @@ export function buildRuntimeInstructions(): string {
  */
 export type TurnInput = {
   stream: AsyncGenerator<SdkUserPrompt, void, unknown>;
-  /** Resolves once the SDK has taken the message for the CLI. */
-  push(content: string | AnthropicContentBlock[]): Promise<void>;
+  /**
+   * Resolves once the SDK has taken the message for the CLI. `uuid` names
+   * the message's record in the transcript (names.ts): the CLI keeps it as
+   * the `source_uuid` of the attachment it absorbs the message into.
+   */
+  push(content: string | AnthropicContentBlock[], uuid?: string): Promise<void>;
   end(): void;
   ended(): boolean;
 };
@@ -1212,7 +1214,7 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
   }
   return {
     stream: stream(),
-    push(content) {
+    push(content, uuid) {
       if (done) return Promise.resolve();
       // A CLI that stops reading must not hold the tool results back.
       return new Promise<void>((resolve) => {
@@ -1228,6 +1230,7 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
             message: { role: "user", content },
             parent_tool_use_id: null,
             priority: "next",
+            ...(uuid ? { uuid } : {}),
           } as SdkUserPrompt,
           taken,
         });
@@ -1240,4 +1243,22 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
     },
     ended: () => done,
   };
+}
+
+/**
+ * The prompt of a turn that starts a new transcript, after the record the
+ * transcript starts with: blank, without a turn, named `uuid`
+ * (names.ts TRANSCRIPT_START_NAME). It gives the chat's first message a
+ * record to resume at: a retry of a first message that failed resumes there
+ * in the same transcript, where it would otherwise need a new one (the CLI
+ * starts no transcript without a record, and refuses a name in use). The
+ * CLI sends the model nothing of a blank text (probe 47: an empty string
+ * would reach it as "(no content)", an empty array writes no record).
+ */
+export async function* withTranscriptStart(
+  prompt: string | AsyncIterable<SdkUserPrompt>,
+  uuid: string,
+): AsyncGenerator<SdkUserPrompt, void, unknown> {
+  yield { type: "user", message: { role: "user", content: " " }, parent_tool_use_id: null, uuid, shouldQuery: false };
+  yield* typeof prompt === "string" ? promptAsStream(prompt) : prompt;
 }

@@ -21,7 +21,7 @@ import {
   OPENAI_COMPATIBLE_PACKAGE,
   PROVIDER_ID,
 } from "./constants.js";
-import { detectClaudeCode } from "./detect.js";
+import { MIN_CLI_VERSION, cliVersionTooOld, detectClaudeCode } from "./detect.js";
 import { ORIGINAL_ID_KEY } from "./names.js";
 import { installClaudeCli } from "./cli-install.js";
 import { startClaudeCliAutoUpdate } from "./cli-update.js";
@@ -53,6 +53,7 @@ import {
 import {
   getClaudeProxyBaseUrl,
   acquireProxy,
+  noteCliVersion,
   releaseProxy,
   setModelFallbackHandler,
   startProxy,
@@ -539,6 +540,16 @@ async function probeCliPresence(): Promise<boolean> {
       const present = detection ? detection.status !== "missing-cli" : true;
       // A missing CLI is not remembered, so a fresh install shows at once.
       if (detection && present) cliPresentAt = Date.now();
+      // Chat turns are refused on a CLI older than the plugin needs (detect.ts).
+      if (detection?.version) {
+        noteCliVersion(detection.version);
+        if (cliVersionTooOld(detection.version)) {
+          log.error("[opencode-claude] Claude Code is too old for this plugin", {
+            version: detection.version,
+            required: MIN_CLI_VERSION,
+          });
+        }
+      }
       return present;
     } catch {
       return true;

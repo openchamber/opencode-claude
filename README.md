@@ -45,11 +45,11 @@ OpenCode sends the plugin an ordinary chat request. The plugin turns it into an 
 
 Tools stay OpenCode's. Claude Code's built-in tools (its own Bash, Edit and so on) are switched off. OpenCode's tools are handed to Claude instead, so every file edit and shell command goes through OpenCode and its permissions. When Claude asks for several read-only tools at once, like reads, greps or subagents, they run in parallel.
 
-Each OpenCode chat maps to one Claude Code session and resumes it on every message. That keeps Anthropic's prompt cache warm, which is what makes long sessions affordable on a plan.
+Each OpenCode chat maps to one Claude Code session and resumes it on every message. That keeps Anthropic's prompt cache warm, which is what makes long sessions affordable on a plan. The session and every message in it are named from OpenCode's own ids, so the plugin keeps no record of its own: on each message it reads the session's transcript, finds the last message OpenCode's history still has and resumes right after it. A revert or an edit branches the transcript the way Claude Code's `/rewind` does; a message another model answered reaches Claude as text. Needs Claude Code 2.1.300 or later.
 
 ## Install
 
-You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code) signed in to a Claude plan. OpenCode 1.x users stay on `@openchamber/opencode-claude@0.14`.
+You need [OpenCode](https://opencode.ai) 2.0.19 or later and the [Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code) signed in to a Claude plan. OpenCode 1.x users stay on `@openchamber/opencode-claude@0.14`.
 
 1. Add the plugin:
 
@@ -170,6 +170,8 @@ bun install
 bun run build
 bun run test
 ```
+
+`bun test/cli-contract-live.ts` checks the Claude Code behaviour the plugin relies on (session names, record ids, copies, records without a turn, mid-turn messages, error texts) against the installed `claude`, one check per property. It needs no sign-in and spends no plan limits: the model is a local stub. Run it after a Claude Code update; it is not part of `bun run test`.
 
 To try a local build, point `plugins` at the checkout folder: `{ "plugins": ["/path/to/opencode-claude"] }`.
 

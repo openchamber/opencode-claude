@@ -1,86 +1,97 @@
 /**
- * A chat's Claude session over its turns, as main 1.6.0 keeps it: the
- * plugin's store binds the chat to its Claude session and the leaf of its last
- * turn. A chat another model answered first gets its history transferred as
- * text and is bound to the new session; the next turn resumes it; a branch
- * another process wrote after the leaf is resumed through a fork cut at the
- * leaf (the SDK's forkSession); a transcript gone from disk drops the binding
- * and transfers the history again. The series binds by names
- * (chain/turn-by-names): history-resume-regression.ts.
+ * A chat's Claude session over its turns, bound by names: the chat's
+ * transcript and its records are named after the chat and its messages
+ * (names.ts), no store binds them. A chat another model answered first gets
+ * its history transferred as text into a new transcript; the next turn
+ * resumes it at Claude's last answer (`resumeSessionAt`); a branch another
+ * process wrote after that point leaves the chat on its own Claude session; a
+ * transcript gone from disk starts a new one with the history transferred
+ * again. The form of the transferred history: history-transfer-*.ts. main's
+ * store: history-resume-main-regression.ts.
  *
- * On the simulators (BEHAVIOR.md "Writing a test"): a chat that another model
- * answered first (the plugin never served that turn), then Claude's turns; a
- * Claude Code process the plugin did not stop (a zombie, as in
- * branched-session-regression); the binding read from the plugin's store after
- * the turns.
+ * On the simulators (BEHAVIOR.md "Writing a test", "Where a resume
+ * continues"): a chat that another model answered first (the plugin never
+ * served that turn), then Claude's turns; a Claude Code process the plugin
+ * did not stop (a zombie, as in branched-session-regression); what a turn
+ * resumes read from the query's parameters and the journal.
  *
- * Run: bun test/history-resume-main-regression.ts (trees: where.md)
+ * Run: bun test/history-resume-regression.ts (trees: where.md)
  */
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 
 import { testCases } from "./simulators/cases.ts";
 import { contentText } from "./simulators/claude-code.ts";
-import { createWorld, pluginModule } from "./simulators/world.ts";
+import { createWorld } from "./simulators/world.ts";
 
-const world = await createWorld("history-resume-main");
+const world = await createWorld("history-resume");
 const { opencode, claude } = world;
 await opencode.startPlugin();
 const cases = testCases();
-const store = await pluginModule("session-store");
 
 /** The text the query's prompt carried (records with a turn). */
 const promptOf = (query: (typeof claude.queries)[number]) =>
   query.input.filter((m) => !m.noTurn).map((m) => contentText(m.content)).join("\n");
+/**
+ * The transfers of the chat's history as text: the history rides the turn's record (the journal's "turn records"
+ * with history), or, for a turn not sent as records, goes ahead of the prompt.
+ */
 const injected = (chat: string) =>
-  world.journal().filter((line) => line.includes("injecting transferred conversation history") && line.includes(chat)).length;
-const forkLines = (chat: string) =>
-  world.journal().filter((line) => line.includes("resuming a fork of the Claude session") && line.includes(chat));
+  world
+    .journal()
+    .filter((line) => line.includes(chat) && ((line.includes("turn records") && !line.includes('"historyChars":0')) || line.includes("injecting transferred conversation history"))).length;
+const started = (chat: string) =>
+  world.journal().filter((line) => line.includes("starting a new Claude transcript; transferring history") && line.includes(`"conversationKey":"${chat}"`));
+/** The end of the last turn in `name` (its last chain record, BEHAVIOR.md "Where a resume continues"): where the chat's next turn resumes. */
+const lastAnswer = (name: string) => claude.leafOf(name)!.uuid;
 
 // One chat through the cases: each case is the chat's next turn.
 const chat = opencode.newChat();
 let fresh: (typeof claude.queries)[number] | undefined;
-let fork: string | undefined;
+let afterBranch: (typeof claude.queries)[number] | undefined;
 
-await cases.run("no stored binding: the history is transferred and the chat bound to the new session", async () => {
+await cases.run("no transcript of the chat yet: the history is transferred into a new transcript", async () => {
   await opencode.say(chat, "remember the codename AXIOM-9042");
   opencode.otherModelAnswer(chat, "Codename AXIOM-9042 noted.");
   await opencode.say(chat, "what is the codename?");
   const first = await opencode.turn(chat);
   assert.ok(first.ok, `the first Claude turn: ${first.requests.map((r) => r.status).join(",")}`);
   fresh = claude.queries.at(-1)!;
-  assert.equal(fresh.params.resume, undefined);
+  assert.equal(fresh.params.resume, undefined, "no resume attempted");
   const promptText = promptOf(fresh);
-  assert.match(promptText, /<conversation_history>/);
-  assert.match(promptText, /AXIOM-9042/);
-  assert.match(promptText, /Latest user message:\nwhat is the codename\?/);
+  assert.match(promptText, /AXIOM-9042/, "the history went with the turn");
+  assert.match(promptText, /what is the codename\?$/, "the latest message after the history");
   assert.doesNotMatch(promptText, /You are OpenCode\./, "the system prompt is not history");
   assert.equal(injected(chat), 1, "the journal names the transfer");
-  // The turn stored the new Claude session for the follow-up resume.
-  assert.equal(store.getForeignSessionId(chat), fresh.name);
+  assert.equal(started(chat).length, 1, "the journal names the new transcript");
+  // The turn wrote the chat's transcript: the follow-up resumes it.
+  assert.ok(claude.records(fresh.name).length > 0, "the new transcript is on disk");
 });
 
-await cases.run("a stored binding whose transcript exists: resume, no transfer, the leaf is Claude's last answer", async () => {
+await cases.run("the chat's transcript exists: resume at Claude's last answer, no transfer", async () => {
+  // The turn's main-chain entries are the resume point: the turn resumes at Claude's last answer
+  // (`resumeSessionAt`, by name, on every resume).
   assert.ok(fresh, "the first turn ran");
+  const firstAnswer = lastAnswer(fresh.name);
   await opencode.say(chat, "spell it backwards");
   assert.ok((await opencode.turn(chat)).ok);
   const resumed = claude.queries.at(-1)!;
   assert.equal(resumed.params.resume, fresh.name);
-  assert.doesNotMatch(promptOf(resumed), /<conversation_history>/);
-  assert.equal("resumeSessionAt" in resumed.params, false);
+  assert.doesNotMatch(promptOf(resumed), /AXIOM-9042/, "no history with the resumed turn");
+  assert.equal(resumed.params.resumeSessionAt, firstAnswer, "the resume point is Claude's last answer");
   assert.equal(injected(chat), 1, "no second transfer");
-  // The turn's main-chain entries become the resume point; a chain that continues from it resumes as is.
-  assert.equal(store.getSessionLeafUuid(chat), claude.records(fresh.name).findLast((r) => r.type === "assistant")!.uuid, "the chat's leaf is Claude's last answer");
-  assert.deepEqual(forkLines(chat), [], "a chain that continues from the leaf resumes as is");
-  // Subagent entries (`parent_tool_use_id` set) must not move the leaf: waiting for the simulator
+  assert.equal(started(chat).length, 1, "no second transcript");
+  // Subagent entries (`parent_tool_use_id` set) must not move the point: waiting for the simulator
   // to write subagent events.
 });
 
-await cases.run("a branch another process wrote after the leaf: the resume goes through a fork cut at the leaf", async () => {
-  // main's fork is the SDK's forkSession on Claude Code's files. The other process is one the plugin did not stop
-  // (a zombie): its turn failed, the user stopped the chat while OpenCode waited to retry and let another model
-  // answer, the next Claude turn continued the same file, and then the zombie wrote its answer off the failed
-  // turn's prompt.
+await cases.run("a branch another process wrote after the point: the chat goes on in its own Claude session", async () => {
+  // The turn still resumes the chat's own file and Claude reads the chat's turns, not the orphaned one's answer.
+  // The other process is one the plugin did not stop (a zombie): its turn failed, the user stopped the chat while
+  // OpenCode waited to retry and let another model answer, the next Claude turn continued the same file, and then
+  // the zombie wrote its answer off the failed turn's prompt. Claude Code resumes only along the file's leaf chain
+  // (BEHAVIOR.md "Where a resume continues"): the point found by name sits on a side branch then, and the point
+  // moves to where the chat's branch leaves it, the turns after going as missed.
   assert.ok(fresh, "the first turn ran");
   await opencode.say(chat, "and once more");
   claude.state.failures = ["zombie"];
@@ -101,42 +112,43 @@ await cases.run("a branch another process wrote after the leaf: the resume goes 
   await opencode.say(chat, "where did we stop?");
   assert.ok((await opencode.turn(chat)).ok);
   assert.equal(claude.queries.at(-1)!.params.resume, fresh.name, "the next Claude turn continued the same file");
-  const ours = store.getSessionLeafUuid(chat) as string;
+  const ours = lastAnswer(fresh.name);
   claude.state.zombies.shift()!();
-  assert.equal(store.sessionChainAfterLeaf(claude.fileOf(fresh.name), ours), "branched");
+  assert.notEqual(lastAnswer(fresh.name), ours, "the zombie's answer is the file's last record now");
+  const transfersBefore = injected(chat);
   await opencode.say(chat, "where were we?");
   const branched = await opencode.turn(chat);
   assert.ok(branched.ok, `the turn after the branch: ${branched.requests.map((r) => r.status).join(",")}`);
-  assert.ok(world.journal().some((line) => line.includes("Claude session branched after this chat's last turn") && line.includes(chat)));
-  assert.equal(forkLines(chat).length, 1);
-  fork = (JSON.parse(forkLines(chat)[0]!.slice(forkLines(chat)[0]!.indexOf("{"))) as { from: string; fork: string }).fork;
-  const viaFork = claude.queries.at(-1)!;
-  assert.equal(viaFork.params.resume, fork);
-  assert.notEqual(fork, fresh.name);
-  assert.ok(viaFork.view.includes("and once more") && !viaFork.view.includes("ZOMBIE-ANSWER"), `Claude sees our branch, not the zombie's: ${viaFork.view}`);
-  assert.equal(store.getForeignSessionId(chat), fork);
-  assert.equal(store.getSessionLeafUuid(chat), claude.records(fork).findLast((r) => r.type === "assistant")!.uuid);
-  // A leaf the file no longer holds falls back to a plain resume, and a fork that fails transfers the history
-  // instead of retrying: waiting for the simulator to have a transcript that lost the chat's
-  // leaf, and the SDK's forkSession failing.
+  afterBranch = claude.queries.at(-1)!;
+  assert.ok(afterBranch.view.includes("and once more") && !afterBranch.view.includes("ZOMBIE-ANSWER"), `Claude sees our branch, not the zombie's: ${afterBranch.view}`);
+  // The chat's Claude session goes on (no transfer as text).
+  assert.equal(world.journal().filter((line) => line.includes("No message found") && line.includes(chat)).length, 0, "Claude Code did not refuse the resume point");
+  assert.equal(injected(chat), transfersBefore, "the history was not transferred as text");
+  assert.ok(afterBranch.params.resume, "the turn resumed a Claude session");
+  // A point the file no longer holds: names-regression, turn-point-regression.
 });
 
-await cases.run("a stored binding with its transcript missing: the binding dropped, the history transferred again", async () => {
+await cases.run("the chat's transcript missing: a new transcript, the history transferred again", async () => {
   // The transcript is gone: Claude Code's cleanup (cleanupPeriodDays) or the user cleared the profile's projects
   // folder.
-  assert.ok(fork, "the fork case ran");
-  rmSync(claude.fileOf(fork), { force: true });
+  assert.ok(afterBranch, "the branch case ran");
+  const injectedBefore = injected(chat);
+  const startedBefore = started(chat).length;
+  rmSync(claude.fileOf(afterBranch.name), { force: true });
   await opencode.say(chat, "still there?");
   const lost = await opencode.turn(chat);
   assert.ok(lost.ok, `the turn after the transcript was lost: ${lost.requests.map((r) => r.status).join(",")}`);
   const transferred = claude.queries.at(-1)!;
   assert.equal(transferred.params.resume, undefined);
-  assert.match(promptOf(transferred), /<conversation_history>/);
-  assert.match(promptOf(transferred), /AXIOM-9042/);
-  assert.ok(world.journal().some((line) => line.includes("stored Claude session file missing; transferring history") && line.includes(chat)));
-  assert.equal(injected(chat), 2);
-  assert.equal(store.getForeignSessionId(chat), transferred.name, "the chat is bound to the new session");
-  assert.notEqual(transferred.name, fork);
+  assert.match(promptOf(transferred), /AXIOM-9042/, "the history went with the turn");
+  assert.equal(started(chat).length, startedBefore + 1, "the journal names the new transcript");
+  assert.equal(injected(chat), injectedBefore + 1);
+  assert.ok(claude.records(transferred.name).length > 0, "the chat's new transcript is on disk");
+  // The follow-up resumes the new transcript.
+  await opencode.say(chat, "and now?");
+  assert.ok((await opencode.turn(chat)).ok);
+  assert.equal(claude.queries.at(-1)!.params.resume, transferred.name, "the chat continues the new transcript");
+  assert.equal(injected(chat), injectedBefore + 1, "no transfer after the new transcript");
   assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
 });
 

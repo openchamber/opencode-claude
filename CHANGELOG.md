@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **Sessions resume by name, not by guessing**: the plugin kept a record of
+  every chat (`sessions.json`) and matched OpenCode's history against it by
+  text fingerprints, which went wrong on a reverted turn asked again, a chat
+  that came back from another model, a retried turn, or a lost record. Now
+  OpenCode's own message ids name the Claude transcript of a chat and every
+  record in it: the plugin reads the transcript, finds the last record the
+  current history names and resumes right after its turn, so a revert
+  branches the transcript like Claude Code's own `/rewind`, a retry gets a
+  new record, and turns another model answered reach Claude as text. No
+  record file is kept; an existing `sessions.json` is left alone and ignored,
+  so the first turn of an existing chat after the update transfers its
+  history once. Requires Claude Code 2.1.300 or later and OpenCode 2.0.19 or
+  later.
+- **Breaking: requests the plugin cannot name are refused**: a request
+  without OpenCode's session id (the plugin no longer keys a chat by its
+  messages), a chat request that did not pass the `context` hook, and a
+  message that failed sixteen times in a row are refused with
+  `x-should-retry: false`; a chat turn on a Claude Code older than 2.1.300
+  gets a 503 that says what to update. Titles, summaries and `generate`
+  without a session run as before.
+- **A turn says how it ran**: a turn that runs differently from the usual
+  adds a line to its reasoning, above the answer: `[claude-code warning]`
+  when it goes without the prompt cache (the request did not match
+  OpenCode's message list and ran once outside the chat's Claude session;
+  the session could not be continued), `[claude-code]` for an expected
+  step (messages Claude had not seen went as text, the first turn after a
+  compaction, a rebuilt tool step).
 - **Only OpenCode compacts the chat**: Claude Code's own auto-compaction was
   meant to be off for summaries and on for chat turns, but the plugin set it
   through an option the Agent SDK does not have, so the CLI compacted on its

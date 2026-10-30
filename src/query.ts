@@ -135,6 +135,19 @@ export function killProcessTree(
   }
 }
 
+/**
+ * The `result` event that ends a turn. A record appended without a turn
+ * (`shouldQuery: false`) gets a `result` of its own with `num_turns: 0`; it
+ * is not the end of the stream, and carries no usage of a model call.
+ */
+export function isTurnResult(event: unknown): boolean {
+  if (!event || typeof event !== "object") return false;
+  const e = event as { type?: unknown; is_error?: unknown; num_turns?: unknown };
+  if (e.type !== "result") return false;
+  if (e.is_error === true) return true;
+  return e.num_turns !== 0;
+}
+
 export type ClaudeQueryHandle = {
   stream: AsyncIterable<unknown>;
   interrupt: () => Promise<void>;
@@ -183,9 +196,7 @@ export function withGracefulStop(handle: ClaudeQueryHandle): StoppableClaudeQuer
   let ended = false;
   let sawResult = false;
   const observe = (event: unknown) => {
-    if (event && typeof event === "object" && (event as { type?: unknown }).type === "result") {
-      sawResult = true;
-    }
+    if (isTurnResult(event)) sawResult = true;
     for (const listener of listeners) {
       try {
         listener(event);
@@ -275,6 +286,8 @@ export type StartClaudeQueryParams = {
   cwd: string;
   model?: string;
   resume?: string;
+  /** Without `resume`: the id (file name) of the new session, chosen by the plugin. */
+  sessionId?: string;
   /** With `resume`: resume only up to and including this entry. */
   resumeSessionAt?: string;
   /** With `resume`: continue in a new session id instead of appending. */
@@ -381,6 +394,8 @@ export async function startClaudeQuery(
     if (resumeAt) options.resumeSessionAt = resumeAt;
     if (params.forkSession === true) options.forkSession = true;
   }
+  const sessionId = trimmedString(params.sessionId);
+  if (sessionId && !resume) options.sessionId = sessionId;
 
   const permissionMode = trimmedString(params.permissionMode);
   if (ALLOWED_PERMISSION_MODES.has(permissionMode)) {

@@ -164,6 +164,42 @@ export function checkSubscriptionAuth(
   return result;
 }
 
+/**
+ * The oldest Claude Code the plugin works with. The transcript names
+ * (names.ts) need a CLI that honours `sessionId` and the uuid of a user
+ * message, keeps uuids across `resume` + `forkSession`, and writes a record
+ * without a turn (`shouldQuery: false`); all checked on 2.1.302 and later,
+ * none investigated below 2.1.300.
+ */
+export const MIN_CLI_VERSION = "2.1.300";
+
+/** Whether a `claude --version` answer is older than MIN_CLI_VERSION; unknown versions pass. */
+export function cliVersionTooOld(version: string | null | undefined, minimum = MIN_CLI_VERSION): boolean {
+  const parse = (text: string) => text.match(/(\d+)\.(\d+)\.(\d+)/)?.slice(1, 4).map(Number);
+  const actual = version ? parse(version) : undefined;
+  const required = parse(minimum);
+  if (!actual || !required) return false;
+  for (let i = 0; i < 3; i++) {
+    if (actual[i]! !== required[i]!) return actual[i]! < required[i]!;
+  }
+  return false;
+}
+
+/** What a turn is told when the CLI is too old. */
+export function cliTooOldMessage(version: string): string {
+  const number = version.match(/\d+\.\d+\.\d+/)?.[0] ?? version;
+  return `Claude Code ${number} is too old for this plugin: it needs ${MIN_CLI_VERSION} or later (session resume by named records). Update it with \`claude update\` or \`npm install -g @anthropic-ai/claude-code\`.`;
+}
+
+/** The installed CLI's version alone (`claude --version`), null when there is no CLI or it does not answer. */
+export async function probeCliVersion(env: NodeJS.ProcessEnv = process.env): Promise<string | null> {
+  const binaryPath = await resolveClaudeCli(env);
+  if (!binaryPath) return null;
+  const run = await runCliProbe(binaryPath, ["--version"], { env: buildClaudeCodeChildEnv(env), timeoutMs: 4000 });
+  const output = run.stdout.trim();
+  return output.match(/(\d+\.\d+\.\d+)/)?.[1] ?? (output || null);
+}
+
 export async function detectClaudeCode(options?: {
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
   homeDir?: string;

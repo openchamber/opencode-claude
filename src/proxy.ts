@@ -57,28 +57,31 @@ import {
   type ClaudeEffort,
 } from "./constants.js";
 import {
-  forkClaudeSession,
+  isTurnResult,
   startClaudeQuery,
   withGracefulStop,
   type StoppableClaudeQueryHandle,
 } from "./query.js";
+import { hasPendingContextEvents, peekCompactionEvent, takeContextEvent, type ContextEvent } from "./context-list.js";
+import { OPENCODE_IMAGE_REMOVED } from "./removed-images.js";
+import { FIRST_EPOCH, MAX_ATTEMPTS, TRANSCRIPT_START_NAME, epochOfList, userRecordName, type ListMessage } from "./names.js";
 import {
-  clearForeignSessionId,
-  conversationKeyFromMessages,
-  findClaudeSessionFile,
-  getForeignSessionId,
-  getSessionLeafUuid,
-  getSessionTurns,
-  matchTurnHistory,
-  recordTurnStart,
-  rewindSessionTurns,
-  lastChainEntryUuid,
-  sessionChainAfterLeaf,
-  sessionFileHasEntry,
-  setForeignSessionId,
-} from "./session-store.js";
+  countedUserThrough,
+  expectedChain,
+  isCountedUserMessage,
+  planResume,
+  planSummaryResume,
+  readTranscript,
+  steeringMessageIds,
+} from "./turn-point.js";
+import {
+  currentTranscript,
+  markTranscriptUnusable,
+  nextTranscript,
+  rememberChatTranscript,
+} from "./transcripts.js";
 import { log } from "./log.js";
-import { checkSubscriptionAuth } from "./detect.js";
+import { checkSubscriptionAuth, cliTooOldMessage, cliVersionTooOld, probeCliVersion } from "./detect.js";
 import {
   getRateLimitSnapshot,
   isClaudeRateLimitText,
@@ -101,15 +104,18 @@ import {
   openaiToolResultToMcpContent,
   priorMessagesOf,
   historyAfterUserCount,
+  historyAfterUserMessage,
   promptAsStream,
   createTurnInput,
   transcriptFiles,
   transcriptText,
   userHistoryFingerprints,
+  userTextIdentity,
   withConversationContext,
   withLeadingText,
+  withTranscriptStart,
+  withUuid,
   buildRuntimeInstructions,
-  withSteering,
   type McpToolResultContent,
   type SdkUserPrompt,
 } from "./prompt.js";
@@ -266,14 +272,71 @@ export function setClaudeQueryStarter(
   queryStarter = starter ?? startClaudeQuery;
 }
 
-/** Injectable for tests — production path always uses forkClaudeSession. */
-let sessionForker: typeof forkClaudeSession = forkClaudeSession;
+/** The Claude Code version found at setup (`claude --version`); null until known. */
+let cliVersionNote: string | null = null;
 
-export function setClaudeSessionForker(
-  forker: typeof forkClaudeSession | null,
-): void {
-  sessionForker = forker ?? forkClaudeSession;
+export function noteCliVersion(version: string | null): void {
+  cliVersionNote = version;
+  cliVersionCheckedAt = 0;
 }
+
+/** When the version was last asked of the CLI by a refused turn (cliStillTooOld). */
+let cliVersionCheckedAt = 0;
+/** How long a refused turn trusts the noted version before asking the CLI again. */
+const CLI_VERSION_RECHECK_MS = 60_000;
+
+/** Asks the installed CLI for its version; replaced in tests. */
+let cliVersionProbe: () => Promise<string | null> = probeCliVersion;
+
+export function setCliVersionProbe(probe: (() => Promise<string | null>) | null): void {
+  cliVersionProbe = probe ?? probeCliVersion;
+}
+
+/**
+ * Whether chat turns are still refused for an old CLI. The version is noted
+ * at setup; the user who runs `claude update` as told must not stay refused
+ * until the next reload, so a refused turn asks the CLI again, at most once
+ * a minute.
+ */
+async function cliStillTooOld(): Promise<boolean> {
+  if (!cliVersionNote || !cliVersionTooOld(cliVersionNote)) return false;
+  if (Date.now() - cliVersionCheckedAt < CLI_VERSION_RECHECK_MS) return true;
+  cliVersionCheckedAt = Date.now();
+  try {
+    const version = await cliVersionProbe();
+    if (version) cliVersionNote = version;
+  } catch {
+    // The CLI could not be asked: the noted version stands.
+  }
+  return cliVersionTooOld(cliVersionNote);
+}
+
+/**
+ * A request the proxy cannot serve as asked; OpenCode shows the message and
+ * does not retry (`x-should-retry: false`, read by its provider-error.ts).
+ */
+function refuseRequest(message: string, code = "claude_session_unnamed"): Response {
+  return Response.json(
+    { error: { message, type: "invalid_request_error", code } },
+    { status: 400, headers: { "x-should-retry": "false" } },
+  );
+}
+
+/**
+ * OpenCode dropped the request before its turn started: the user stopped it
+ * while it waited for the chat's queue or while its turn was planned. The
+ * stop came while there was no turn to stop, so none may start now: a Claude
+ * process would answer a message the user stopped. The response reaches no
+ * one; it only ends the handler. Null while the request is alive.
+ * `planned`: the turn was planned already (its plan line is in the journal).
+ */
+function droppedBeforeStart(req: Request, conversationKey: string, planned: boolean): Response | null {
+  if (!req.signal.aborted) return null;
+  log.info("[opencode-claude] the request was dropped before its turn started; Claude is not started", { conversationKey, planned });
+  return new Response(null, { status: 499 });
+}
+
+const ATTEMPTS_EXHAUSTED = `Claude Code failed on this message ${MAX_ATTEMPTS} times in a row, so the plugin stopped retrying it. Send the message again.`;
 
 export function getClaudeProxyBaseUrl(): string {
   const port = proxyPort ?? (REQUESTED_PROXY_PORT > 0 ? REQUESTED_PROXY_PORT : null);
@@ -647,22 +710,88 @@ type SummaryResumePoint = {
 const SUMMARY_NUDGE_MARKER = "did not fill in the required summary template";
 
 /**
- * OpenCode summarizes the older part of a chat: the request is that part,
- * then its summary prompt (plus a reminder after a reply that missed the
+ * Chats whose last summary could not resume the transcript (forgetDeadSession):
+ * the next summary request reads the request as text. Kept on globalThis like
+ * the other runtimes: OpenCode may reload the plugin between the refused
+ * summary and its retry, and a fresh module copy must still see the mark.
+ */
+const SUMMARY_AS_TEXT_KEY = Symbol.for("@openchamber/opencode-claude/summary-as-text/v1");
+const summaryAsText: Set<string> = ((globalThis as Record<symbol, unknown>)[SUMMARY_AS_TEXT_KEY] ??= new Set<string>()) as Set<string>;
+
+/**
+ * The texts of a summarized part in order, the same for the request body
+ * (OpenAI form) and the hook's list (list form): the user's and the
+ * assistant's text (userTextIdentity: reminders and updates left out,
+ * whitespace collapsed) and the text of every tool result. A part OpenCode
+ * flattened or cut reads differently.
+ */
+function partTexts(messages: ReadonlyArray<{ role?: string; content?: unknown }>): string {
+  return messages.flatMap(messageTexts).join("\n");
+}
+
+/** The texts one message adds to its part (partTexts). */
+function messageTexts(m: { role?: string; content?: unknown }): string[] {
+  if (m?.role === "tool" && Array.isArray(m.content)) {
+    const texts: string[] = [];
+    for (const part of m.content as Array<{ type?: string; result?: { value?: unknown } }>) {
+      if (part?.type === "tool-result" && typeof part.result?.value === "string") texts.push(userTextIdentity(part.result.value));
+    }
+    return texts;
+  }
+  const text = userTextIdentity(extractTextContent(m?.content));
+  return text ? [text] : [];
+}
+
+/**
+ * The part of the compaction hook's list a summary request holds, the
+ * request's own part given as `request`: the whole list, or the list up to
+ * the tail OpenCode keeps verbatim. OpenCode 2.2.0 gives the hook the whole
+ * chat and sends it whole while it fits the summary's room; else it sends
+ * the part before the first kept message, a user message (compaction.ts
+ * withoutTail). OpenCode 2.0.32 gave the hook that part alone. Undefined
+ * when the request reads as neither: OpenCode flattened or cut the part.
+ */
+function summarizedPart<T extends { role?: string; content?: unknown }>(
+  list: readonly T[],
+  request: ReadonlyArray<{ role?: string; content?: unknown }>,
+): T[] | undefined {
+  const wanted = partTexts(request);
+  if (partTexts(list) === wanted) return [...list];
+  // The first user message where the list has read as many texts as the
+  // request holds: no more than the request is ever taken from the transcript.
+  const count = request.flatMap(messageTexts).length;
+  let seen = 0;
+  for (let end = 1; end < list.length && seen <= count; end++) {
+    seen += messageTexts(list[end - 1]!).length;
+    if (seen !== count || list[end]!.role !== "user") continue;
+    const part = list.slice(0, end);
+    return partTexts(part) === wanted ? part : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * OpenCode summarizes a chat (2.2.0: all of it while it fits, else the part
+ * before the tail it keeps; 2.0.32: that part always): the request is that
+ * part, then its summary prompt (plus a reminder after a reply that missed the
  * template). The chat's Claude session already holds that part with every
  * tool result in full, so the summary resumes it at the turn boundary where
  * the part ends. Null when the session can't be cut there (no binding,
  * history that doesn't line up, a branched transcript): the summary then
  * reads the history as text.
  */
-function summaryResumePoint(
+async function summaryResumePoint(
   chatKey: string,
   messages: OpenAIMessage[],
   configDir?: string,
-  liveTurn = false,
-): SummaryResumePoint | null {
-  const sessionId = getForeignSessionId(chatKey);
-  if (!sessionId) return null;
+  liveTurnPrompt?: string | null,
+): Promise<SummaryResumePoint | null> {
+  // The CLI refused the point of the previous summary request (the record is
+  // off the leaf chain): this one reads the request as text.
+  if (summaryAsText.delete(chatKey)) return null;
+  // The compaction hook's list: the part OpenCode summarizes, with ids.
+  const event = peekCompactionEvent(chatKey);
+  if (!event) return null;
   const users = messages.flatMap((m, i) => (m?.role === "user" ? [i] : []));
   let promptIndex = users.at(-1);
   if (promptIndex === undefined) return null;
@@ -672,45 +801,227 @@ function summaryResumePoint(
   ) {
     promptIndex = users.at(-2)!;
   }
-  const turns = getSessionTurns(chatKey);
-  const prints = userHistoryFingerprints(messages.slice(0, promptIndex));
-  const match = matchTurnHistory(turns, prints);
-  let source: string;
-  let leafUuid: string | undefined;
-  let liveMessages: OpenAIMessage[] | undefined;
-  if (liveTurn) {
-    // A turn still running (background compaction) may end its session on
-    // an unanswered tool call, which no resume can cut at. Resume at the end
-    // of the turn before it; the live turn's messages go along as text.
-    const previous = turns.at(-2);
-    if (
-      match.kind !== "latest" ||
-      !previous?.leafUuid ||
-      prints[previous.count - 1] !== previous.hash
-    ) {
-      return null;
+  // OpenCode may send less than the hook saw: the part before the tail it
+  // keeps (summarizedPart), a part that does not fit as one text message
+  // with tool outputs cut, and after an overflow whole exchanges dropped,
+  // oldest first, without running the hook again (compaction.ts
+  // flattenAndDropOldest). The transcript holds the whole list; a request
+  // whose texts are not the list's or its part before the tail is read as
+  // text, or the summary would read from the transcript what OpenCode just cut.
+  // The body opens with OpenCode's system prompt as system messages; the
+  // hook's list holds the chat alone.
+  let first = 0;
+  while (first < promptIndex && messages[first]?.role === "system") first++;
+  const summarized = summarizedPart(event.messages, messages.slice(first, promptIndex));
+  if (!summarized) return null;
+  const transcript = currentTranscript(chatKey, epochOfList(event.messages), configDir);
+  if (!transcript.file) return null;
+  // A turn still running (background compaction) may end its transcript on
+  // an unanswered tool call, which no resume can cut at. The summary resumes
+  // at the end of the turn before it: the part up to the message that
+  // started the live turn. The live turn's messages go along as text.
+  let part = summarized;
+  let liveMessages: OpenAIMessage[] = [];
+  if (liveTurnPrompt !== undefined) {
+    const start = liveTurnPrompt
+      ? expectedChain(event.messages).find((entry) => entry.kind === "message" && entry.names.includes(liveTurnPrompt))
+      : undefined;
+    // The live turn rebuilt a step or ran outside the transcript: no turn
+    // boundary to cut at.
+    if (!start || start.index === 0) return null;
+    // A live turn in the kept tail is not in the request: nothing of it to cut off.
+    if (start.index < part.length) {
+      part = event.messages.slice(0, start.index);
+      liveMessages = historyAfterUserCount(messages.slice(first, promptIndex), countedUserThrough(part, part.length - 1));
     }
-    source = previous.sessionId ?? sessionId;
-    leafUuid = previous.leafUuid;
-    liveMessages = historyAfterUserCount(messages.slice(0, promptIndex), previous.count);
-  } else if (match.kind === "rewind" && match.leafUuid) {
-    source = match.sessionId ?? sessionId;
-    leafUuid = match.leafUuid;
-  } else if (match.kind === "latest" && turns.at(-1)!.count === prints.length) {
-    source = sessionId;
-    leafUuid = getSessionLeafUuid(chatKey);
-  } else {
-    return null;
   }
-  const file = findClaudeSessionFile(source, configDir);
-  if (!file) return null;
-  if (leafUuid && sessionChainAfterLeaf(file, leafUuid) !== "clean") return null;
+  const plan = planSummaryResume(await readTranscript(transcript.file), part);
+  if (!plan) return null;
   return {
-    sessionId: source,
-    leafUuid,
+    sessionId: transcript.name,
+    leafUuid: plan.point,
     promptIndex,
     profile: chatTurnProfiles.get(chatKey),
-    ...(liveMessages?.length ? { liveTurn: liveMessages } : {}),
+    ...(liveMessages.length > 0 ? { liveTurn: liveMessages } : {}),
+  };
+}
+
+/** What a chat turn resumes, or starts, and how its record is named. */
+type ChatTurnPlan = {
+  resume?: string;
+  resumeSessionAt?: string;
+  newSessionId?: string;
+  missedMessages: OpenAIMessage[];
+  /** How many user messages of the history the transcript holds up to the resume point. */
+  coveredUsers?: number;
+  /** The tool results of the request are in the transcript already: no rebuilt step. */
+  stepDelivered?: boolean;
+  promptUuid: string;
+  epoch: string;
+  /** Why the turn starts a new transcript (the plan's journal line says the same); see turnNotes. */
+  startedBecause?: string;
+  /** The point moved onto the transcript's leaf chain (turn-point.ts offLeafChain); see turnNotes. */
+  offLeafChain?: boolean;
+};
+
+/**
+ * Lines a turn adds to its reasoning stream, above the answer, when it runs
+ * differently from the usual, as the CLI's own notices do (cliNotice): out
+ * of the answer's text, so no later turn or other model reads them as part
+ * of it. `[claude-code warning]`: something did not work, and the turn
+ * costs more than usual (no prompt cache); `[claude-code]`: an expected
+ * step, explained.
+ */
+const TURN_NOTES = {
+  sessionLost:
+    "[claude-code warning] The chat's Claude session could not be continued (another process wrote to it, or it could not be loaded), so this turn started a new one with the history as text, without the prompt cache.",
+  noRecordBefore:
+    "[claude-code warning] The chat's Claude session holds nothing before this message, so this turn started a new one with the history as text, without the prompt cache.",
+  unmatchedList:
+    "[claude-code warning] OpenCode's message list did not match this request, so this turn ran outside the chat's Claude session: the history went as text, without the prompt cache. If this shows on every turn, update the plugin.",
+  compacted: "[claude-code] The chat was compacted: this turn starts a new Claude session from the summary.",
+  noSessionYet:
+    "[claude-code] This part of the chat had no Claude session yet (another model answered it, or the chat is a fork), so its history went to Claude as text, once.",
+  missed: (count: number) =>
+    `[claude-code] ${count === 1 ? "A message is" : `${count} messages are`} missing from Claude's session file (most likely another model answered ${count === 1 ? "it" : "them"}), so ${count === 1 ? "it" : "they"} went to Claude as text, once.`,
+  offLeafChain: (count: number) =>
+    `[claude-code] Another Claude Code process wrote to the chat's session file after this chat's turns, so this turn continued from before them and ${count === 1 ? "a message" : `${count} messages`} went to Claude as text, once.`,
+  rebuiltStep:
+    "[claude-code] The turn that waited for these tool results was gone (the plugin restarted, or the wait ran out), so the results went to Claude as text.",
+};
+
+/**
+ * The notes of a planned chat turn. A new transcript explains itself only
+ * when it carries history: the first turn of a new chat transfers nothing.
+ * The first turn after a compaction always does: its checkpoint (sent with
+ * the question, not as history) is the chat so far.
+ */
+function turnNotes(plan: ChatTurnPlan, hasHistory: boolean): string[] {
+  if (plan.resume && plan.missedMessages.length > 0) {
+    const count = plan.missedMessages.length;
+    return [plan.offLeafChain ? TURN_NOTES.offLeafChain(count) : TURN_NOTES.missed(count)];
+  }
+  if (!plan.startedBecause) return [];
+  if (plan.startedBecause === "no transcript of this chat in this epoch" && plan.epoch !== FIRST_EPOCH) return [TURN_NOTES.compacted];
+  if (!hasHistory) return [];
+  switch (plan.startedBecause) {
+    case "no transcript of this chat in this epoch":
+      return [TURN_NOTES.noSessionYet];
+    case "the transcript holds no record before this message":
+      return [TURN_NOTES.noRecordBefore];
+    default:
+      return [TURN_NOTES.sessionLost];
+  }
+}
+
+/** The turn's notes ahead of its events, as events the stream maps to reasoning lines (mapSdkEvent). */
+async function* withTurnNotes(notes: readonly string[], events: AsyncIterable<unknown>): AsyncGenerator<unknown, void, unknown> {
+  for (const text of notes) yield { type: "__note__", text: `\n${text}\n` };
+  yield* events;
+}
+
+/**
+ * Plan a chat turn from the context hook's list (turn-point.ts): the chat's
+ * transcript in the list's epoch, the resume point in it, the messages the
+ * transcript never saw, and the name of this turn's record. No transcript
+ * yet, or none the list names: a new transcript with the history as text.
+ */
+async function planChatTurn(input: {
+  sessionID: string;
+  conversationKey: string;
+  event: ContextEvent | undefined;
+  priorMessages: OpenAIMessage[];
+  /** The whole request body: its history when the tool step is not rebuilt. */
+  messages: OpenAIMessage[];
+  /** The tool results of the request arrived with no parked turn: a step to rebuild. */
+  rebuiltStep: boolean;
+  /** The Claude account of the chat's project (`configDirs`): where its transcripts are. */
+  configDir?: string;
+}): Promise<ChatTurnPlan | Response> {
+  const { sessionID, conversationKey, event, priorMessages, configDir } = input;
+  if (!event) return refuseRequest(NO_CONTEXT_EVENT);
+  const list = event.messages;
+  const epoch = epochOfList(list);
+  const chain = expectedChain(list);
+  const launching = chain.at(-1);
+  if (!launching) {
+    return refuseRequest("The request names no user message for Claude to answer.");
+  }
+  const transcript = currentTranscript(sessionID, epoch, configDir);
+  const startNew = (why: string, from = transcript) => {
+    const fresh = from.file ? nextTranscript(from) : from;
+    rememberChatTranscript(conversationKey, fresh);
+    log.info("[opencode-claude] starting a new Claude transcript; transferring history", {
+      conversationKey,
+      why,
+      transcript: fresh.name,
+      version: fresh.version,
+    });
+    return { newSessionId: fresh.name, missedMessages: [], promptUuid: launching.names[0]!, epoch, startedBecause: why };
+  };
+  if (!transcript.file) {
+    // A version past the first is there because the CLI refused the one before (markTranscriptUnusable).
+    return startNew(transcript.version > 1 ? "the chat's transcript can no longer be continued" : "no transcript of this chat in this epoch");
+  }
+  const records = await readTranscript(transcript.file);
+  const plan = planResume(records, list, chain);
+  if (plan.kind === "exhausted") {
+    log.warn("[opencode-claude] every attempt of the message is taken; refusing it", { conversationKey, attempts: MAX_ATTEMPTS });
+    return refuseRequest(ATTEMPTS_EXHAUSTED, "claude_attempts_exhausted");
+  }
+  if (plan.kind === "none") {
+    // Nothing before the message to resume at: a transcript without the
+    // record every new one starts with (withTranscriptStart). The next
+    // version starts with it, and later retries resume there.
+    return startNew("the transcript holds no record before this message");
+  }
+  rememberChatTranscript(conversationKey, transcript);
+  if (plan.offLeafChain) {
+    log.info("[opencode-claude] the resume point is off the transcript's leaf chain; resuming where its branch leaves it", {
+      conversationKey,
+      transcript: transcript.name,
+      offPoint: plan.offLeafChain.point,
+      ancestor: plan.offLeafChain.ancestor,
+    });
+  }
+  // Tool results with no parked turn are rebuilt into a step, unless the
+  // transcript shows the CLI took them (the turn went on after them, and a
+  // revert since cut what followed): then the turn is a plain one. A point
+  // moved onto the leaf chain lies before the step's call, where no step can
+  // be rebuilt: a plain turn too, the step going as text with the rest.
+  const rebuildStep = input.rebuiltStep && !plan.stepDelivered && !plan.offLeafChain;
+  // The list and the request body hold the same user messages in the same
+  // order: what follows the covered one in the body is what the transcript
+  // never saw. Also for a rebuilt tool step: it is Claude's own only when no
+  // turn the transcript never saw comes before it (the history before the
+  // step); after a model switch it can be the other model's step, and the
+  // turns before it are the handover (startNewTurn relays the step as that
+  // model's). When the transcript has no answer to the covered message (its
+  // turn failed), an answer after it is another model's: missed too.
+  const coveredUsers = countedUserThrough(list, plan.coveredIndex);
+  const history = input.rebuiltStep ? priorMessagesOf(input.messages) : priorMessages;
+  const missedMessages = rebuildStep
+    ? historyAfterUserCount(priorMessages, coveredUsers)
+    : !plan.answered && list[plan.coveredIndex]?.role === "user"
+      ? historyAfterUserMessage(history, coveredUsers)
+      : historyAfterUserCount(history, coveredUsers);
+  log.info("[opencode-claude] resuming the chat's Claude transcript", {
+    conversationKey,
+    transcript: transcript.name,
+    version: transcript.version,
+    point: plan.point,
+    attempt: plan.attempt,
+    missed: missedMessages.length,
+  });
+  return {
+    resume: transcript.name,
+    resumeSessionAt: plan.point,
+    missedMessages,
+    coveredUsers,
+    stepDelivered: input.rebuiltStep && !rebuildStep,
+    promptUuid: launching.names[plan.attempt - 1]!,
+    epoch,
+    ...(plan.offLeafChain ? { offLeafChain: true } : {}),
   };
 }
 
@@ -834,6 +1145,57 @@ export function resolveMetaKind(
   return kind === null && !session ? "generate" : null;
 }
 
+/**
+ * Whether the context hook's list and the request body describe the same
+ * request: the user's own texts, in order (prompt.ts userTextIdentity), are
+ * the same on both sides. OpenCode builds the body from the list after the
+ * hooks, so they agree for one request; a list left by a request that never
+ * arrived (a turn stopped between the hook and the request) does not fit the
+ * next one: fewer messages, or other messages after a revert. Only text is
+ * compared: a user message of attachments alone has no text on either side
+ * (a message the user sent while a tool ran, or a tool's media OpenCode
+ * lowers into a user message of its own, which the list does not have); a
+ * system update, its own `system` entry in the list, is `<system-update>`
+ * text appended to a user message in the body, and userTextIdentity leaves
+ * it out. An image OpenCode took out of the body after the hooks is its
+ * note there (OPENCODE_IMAGE_REMOVED) and still an image in the list: the
+ * note is left out too.
+ */
+function listFitsRequest(list: ListMessage[], body: OpenAIMessage[]): boolean {
+  return requestFit(body)(list);
+}
+
+/**
+ * The user's own texts of these messages, in order (empty texts left out;
+ * a tool's media OpenCode promoted into a user message is not a message
+ * of the user's, in either of its forms: isSyntheticToolMediaMessage).
+ * OpenCode's note for a removed image is not the user's text. Without white
+ * space: a message of text parts alone is one string in the body, its parts
+ * joined with nothing between them (openai-chat lowerUserMessage), while
+ * the list keeps the parts.
+ */
+function userTexts(messages: ReadonlyArray<{ role?: string; content?: unknown }>): string {
+  const texts: string[] = [];
+  for (const [i, m] of messages.entries()) {
+    if (m?.role !== "user" || isSyntheticToolMediaMessage(m, messages[i - 1])) continue;
+    const text = userTextIdentity(extractTextContent(m.content).replaceAll(OPENCODE_IMAGE_REMOVED, " ")).replace(/\s+/g, "");
+    if (text) texts.push(text);
+  }
+  return texts.join("\n");
+}
+
+/**
+ * listFitsRequest with the body's side read once: the same body is held
+ * against every list a chat left behind (up to a few).
+ */
+function requestFit(body: OpenAIMessage[]): (list: ListMessage[]) => boolean {
+  const bodyTexts = userTexts(body);
+  return (list) => userTexts(list) === bodyTexts;
+}
+
+const NO_CONTEXT_EVENT =
+  "The request did not pass through the Claude Code provider's context hook, so its messages have no ids (the plugin was probably reloaded between the hook and the request). Send the message again.";
+
 /** The Claude Code config directory the plugin mapped to this request's project. */
 function requestConfigDir(req: Request): string | undefined {
   const header = req.headers.get(CONFIG_DIR_HEADER)?.trim();
@@ -853,22 +1215,64 @@ async function handleChatCompletions(
   // A title or generate call without a session belongs to no chat: keyed
   // by its prompt, concurrent calls sharing a preamble stopped each other.
   const standalone = !sessionHeader && (metaKind === "title" || metaKind === "generate");
-  const conversationKey =
-    requestKeyNamespace(metaKind) +
-    (sessionHeader || (standalone ? `req_${randomUUID()}` : conversationKeyFromMessages(messages)));
+  // A chat turn or a summary is named by its OpenCode session: without the
+  // id there are no names for its records (names.ts). Only OpenCode sends
+  // these requests, and it always sends the id; nothing else is served.
+  if (!sessionHeader && !standalone) {
+    return refuseRequest(
+      "The request carries no OpenCode session id; the Claude Code provider serves OpenCode sessions only.",
+    );
+  }
+  const conversationKey = requestKeyNamespace(metaKind) + (sessionHeader || `req_${randomUUID()}`);
+  // The list of this request's messages, from the context hook that ran just
+  // before it (context-list.ts). Taken once, before any refusal below: a
+  // retry runs the hook again, and a refused request must not leave its list
+  // for the next one. A list that does not fit the request belongs to a
+  // request that never arrived and is dropped.
+  const listsWaiting = sessionHeader !== null && metaKind === null && hasPendingContextEvents(sessionHeader);
+  const contextEvent =
+    sessionHeader && metaKind === null
+      ? takeContextEvent(sessionHeader, ((fits) => (event) => fits(event.messages))(requestFit(messages)))
+      : undefined;
+  // The hook ran, but no list it left fits the request's texts: OpenCode, or
+  // another plugin after the hook, changed the request in a way this plugin
+  // does not know. The turn still runs, once, outside the chat's transcript
+  // (startNewTurn `unmatchedList`), with a note that says so; a request no
+  // hook announced at all is refused below.
+  const unmatchedList = metaKind === null && !contextEvent && listsWaiting;
+  if (unmatchedList) {
+    log.warn("[opencode-claude] the request does not match OpenCode's message list; the turn runs outside the chat's transcript", {
+      conversationKey,
+    });
+  }
+  // A chat turn needs a CLI that honours the plugin's record names; only chat
+  // turns write them, so a title, a summary or a generate call runs on any
+  // version.
+  if (metaKind === null && (await cliStillTooOld())) {
+    return Response.json(
+      { error: { message: cliTooOldMessage(cliVersionNote!), type: "server_error", code: "claude_cli_too_old" } },
+      { status: 503, headers: { "x-should-retry": "false" } },
+    );
+  }
+  // A chat turn is planned on its list (planChatTurn), and so is the delivery
+  // of tool results and mid-turn messages to a parked turn below: without
+  // the list a mid-turn message would reach Claude with no name. Refused
+  // here, before either; a request whose lists did not fit runs outside the
+  // transcript instead (a mid-turn message then reaches its turn unnamed).
+  if (metaKind === null && !contextEvent && !unmatchedList) return refuseRequest(NO_CONTEXT_EVENT);
   // OpenCode is summarizing this chat. The chat itself is left alone: with
   // background compaction the summary is written ahead of time while the
-  // chat goes on with its full history, and stopping its turn or dropping
-  // its binding here started one fresh Claude session now and another when
-  // the summary was swapped in. The compacted history replaces the session
-  // once it arrives: it matches none of the session's turns, so the turn
-  // that carries it moves to a fresh session, and a turn parked on the old
-  // history is stopped first (the checks below).
+  // chat goes on with its full history, and stopping its turn here started
+  // one fresh Claude transcript now and another when the summary was swapped
+  // in. The compacted history starts a new epoch (names.ts), so the turn
+  // that carries it starts a new transcript, and a turn parked in the old
+  // epoch is stopped first (the check below).
   let summaryResume: SummaryResumePoint | null = null;
   if (metaKind === "summary") {
-    const chatKey = sessionHeader || conversationKeyFromMessages(messages);
-    const liveTurn = Boolean(findBridgeByConversation(chatKey));
-    summaryResume = summaryResumePoint(chatKey, messages, requestConfigDir(req), liveTurn);
+    const chatKey = sessionHeader!;
+    const live = findBridgeByConversation(chatKey);
+    const liveTurn = Boolean(live);
+    summaryResume = await summaryResumePoint(chatKey, messages, requestConfigDir(req), live ? (live.promptUuid ?? null) : undefined);
     log.info(
       summaryResume
         ? "[opencode-claude] summarizing from the chat's Claude session"
@@ -917,76 +1321,75 @@ async function handleChatCompletions(
   }
   // A chat can be compacted without its summary passing through here: the
   // user's compaction model belongs to another provider. Nothing stopped the
-  // parked turn then, so check the history as a new turn does below. A turn
-  // parked on a history OpenCode no longer has would re-emit its old calls
-  // with the old context size, and OpenCode would compact again, in a loop.
-  if (existing && metaKind === null && existing.pendingTools.size > 0) {
-    const match = matchTurnHistory(
-      getSessionTurns(existing.conversationKey),
-      userHistoryFingerprints(messages),
-    );
-    if (match.kind === "diverged" || match.kind === "rewind") {
-      log.warn("[opencode-claude] OpenCode history no longer matches the parked turn; stopping it", {
-        conversationKey: existing.conversationKey,
-        match: match.kind,
-      });
-      await stopConversationBridges(existing.conversationKey, "Chat history replaced");
-      // Its pending calls must not take results from the new history. The
-      // new turn below resumes, forks or transfers as for any changed history.
-      existing = undefined;
-    }
+  // parked turn then. A compaction starts a new epoch (names.ts): a turn
+  // parked in the old one would re-emit its old calls with the old context
+  // size, and OpenCode would compact again, in a loop.
+  if (
+    existing &&
+    metaKind === null &&
+    existing.pendingTools.size > 0 &&
+    contextEvent &&
+    existing.epoch !== undefined &&
+    epochOfList(contextEvent.messages) !== existing.epoch
+  ) {
+    log.warn("[opencode-claude] the chat was compacted while its turn was parked; stopping the turn", {
+      conversationKey: existing.conversationKey,
+    });
+    await stopConversationBridges(existing.conversationKey, "Chat history replaced");
+    // Its pending calls must not take results from the new history. The
+    // new turn below starts from the compacted context.
+    existing = undefined;
   }
   if (existing && existing.pendingTools.size > 0) {
     let resolved = 0;
-    // User messages sent while the tool ran ride the last tool result
-    // resolved now. Results of one park can arrive over several resume
-    // requests that all still carry the same queued messages after a tool
-    // result, so the bridge remembers what it forwarded: each reaches Claude
-    // exactly once.
+    // User messages sent while the tool ran. Results of one park can arrive
+    // over several resume requests that all still carry the same queued
+    // messages after a tool result, so the bridge remembers what it
+    // forwarded: each reaches Claude exactly once.
     const freshSteering = collectSteeringMessages(messages)
       .map((m) => ({
         key: createHash("sha1").update(m.key).digest("hex"),
-        blocks: m.blocks,
         prompt: m.prompt,
       }))
       .filter((m) => !existing!.forwardedSteering.has(m.key));
-    const steering = freshSteering.flatMap((m) => m.blocks);
     const resolvable = [...existing.pendingTools.keys()].filter((id) =>
       toolResults.has(id),
     );
-    const steeringToolId =
-      steering.length > 0 ? resolvable.at(-1) : undefined;
-    // An open turn input takes them as the user's own messages, ahead of the
-    // results. Inside a tool result Claude reads them as tool output, which
-    // it may rightly distrust as an injected instruction.
-    const steerAsInput = steeringToolId !== undefined && existing.input && !existing.input.ended();
-    if (steerAsInput) {
-      for (const m of freshSteering) await existing.input!.push(m.prompt);
+    // The messages go with the results this request resolves, through the
+    // turn's open input: the CLI takes each as the user's own message ahead
+    // of the results and absorbs it into the turn under the name of its
+    // record (an `attachment` with the name as `source_uuid`, probe 7), so
+    // the next turn finds it by name (turn-point.ts). An input that is
+    // already closed belongs to a process that stopped reading (it is
+    // exiting): nothing reaches it, and the messages reach Claude on the
+    // next turn, as missed.
+    const forward = freshSteering.length > 0 && resolvable.length > 0;
+    if (forward && existing.input && !existing.input.ended()) {
+      // Each message's record is named after its OpenCode id (the last ids
+      // of the list are the messages not forwarded yet).
+      const ids = contextEvent ? steeringMessageIds(contextEvent.messages).slice(-freshSteering.length) : [];
+      for (const [index, m] of freshSteering.entries()) {
+        const id = ids.length === freshSteering.length ? ids[index] : undefined;
+        await existing.input.push(m.prompt, id ? userRecordName(id, 1) : undefined);
+        existing.forwardedSteering.add(m.key);
+      }
+      log.info("[opencode-claude] forwarding mid-turn user messages", {
+        conversationKey: existing.conversationKey,
+        messages: freshSteering.length,
+      });
+    } else if (forward) {
+      log.warn("[opencode-claude] the parked turn no longer reads its input; mid-turn user messages wait for the next turn", {
+        conversationKey: existing.conversationKey,
+        messages: freshSteering.length,
+      });
     }
     for (const [toolId, tool] of existing.pendingTools) {
       const result = toolResults.get(toolId);
       if (result !== undefined) {
-        tool.resolve(
-          toolId === steeringToolId && !steerAsInput ? withSteering(result, steering) : result,
-        );
+        tool.resolve(result);
         existing.pendingTools.delete(toolId);
         resolved++;
       }
-    }
-    if (steeringToolId) {
-      for (const m of freshSteering) existing.forwardedSteering.add(m.key);
-      // The history now ends at the steering message: a later revert to
-      // before it rewinds to where the turn was when it arrived.
-      if (!existing.metaKind) {
-        const prints = userHistoryFingerprints(messages);
-        if (prints.length > 0) {
-          recordTurnStart(existing.conversationKey, { count: prints.length, hash: prints.at(-1)! });
-        }
-      }
-      log.info("[opencode-claude] forwarding mid-turn user messages", {
-        conversationKey: existing.conversationKey,
-        blocks: steering.length,
-      });
     }
     if (existing.pendingTools.size === 0 && existing.continueStream) {
       log.info("[opencode-claude] resuming parked bridge", {
@@ -1049,6 +1452,8 @@ async function handleChatCompletions(
       stream,
       toolResults,
       summaryResume,
+      contextEvent,
+      unmatchedList,
       releaseSpawnLock,
     });
   } finally {
@@ -1068,6 +1473,14 @@ async function startNewTurn(input: {
   stream: boolean;
   toolResults: Map<string, McpToolResultContent[]>;
   summaryResume?: SummaryResumePoint | null;
+  /** The context hook's event for this request (chat turns). */
+  contextEvent?: ContextEvent;
+  /**
+   * A chat turn whose hook lists did not fit the request (handleChatCompletions):
+   * it runs once outside the chat's transcript, the history as text, nothing
+   * written to disk, and says so in a note.
+   */
+  unmatchedList?: boolean;
   releaseSpawnLock: () => void;
 }): Promise<Response> {
   const {
@@ -1083,6 +1496,10 @@ async function startNewTurn(input: {
     toolResults,
   } = input;
   const summaryResume = input.summaryResume ?? null;
+  // Waiting for the chat's queue, the request may have been dropped: it
+  // must not stop the turn that held the queue either.
+  const droppedWaiting = droppedBeforeStart(req, conversationKey, false);
+  if (droppedWaiting) return droppedWaiting;
   // A new turn while an earlier one of this chat still runs (OpenCode
   // restarted, retried, or moved on): stop the old one first and wait for
   // its process to close. Two claude processes writing the same session
@@ -1175,21 +1592,29 @@ async function startNewTurn(input: {
   // Tool results with no parked turn waiting for them (reaped, cancelled or
   // superseded park, proxy restart): rebuild the turn around them instead of
   // re-sending the original request, which would make Claude start over.
-  const answeredStep = isMetaRequest ? null : answeredToolStepIndex(messages);
+  let answeredStep = isMetaRequest ? null : answeredToolStepIndex(messages);
   if (answeredStep !== null) {
     log.warn(
       "[opencode-claude] tool results arrived with no parked turn; rebuilding the turn with them",
       { conversationKey, toolResults: toolResults.size },
     );
   }
-  const prompt =
+  // A summary that resumes the transcript reads the summarized part from it,
+  // all of it, a last question whose turn failed included: its prompt is the
+  // summary prompt, not joined with the user messages before it, plus the
+  // reminder OpenCode adds when a reply missed the template (the point of
+  // its retry).
+  const summaryPrompt = summaryResume
+    ? latestUserPrompt(messages.slice(summaryResume.promptIndex).filter((m) => m?.role === "user"))
+    : "";
+  let prompt =
     answeredStep !== null
       ? answeredToolStepPrompt(messages, answeredStep)
       : summaryResume
-        ? latestUserPrompt(messages.slice(0, summaryResume.promptIndex + 1))
+        ? summaryPrompt
         : latestUserPrompt(messages);
   // History the prompt does not carry itself.
-  const priorMessages =
+  let priorMessages =
     answeredStep !== null ? messages.slice(0, answeredStep) : priorMessagesOf(messages);
   if (typeof prompt !== "string") {
     const parts = Array.isArray(prompt.message.content)
@@ -1275,146 +1700,70 @@ async function startNewTurn(input: {
     );
   }
 
-  let resume = summaryResume?.sessionId ?? getForeignSessionId(conversationKey);
-  const sessionFile = resume ? findClaudeSessionFile(resume, configDir) : null;
-  if (resume && !sessionFile) {
-    // The claude CLI resumes by looking the session up on disk. A missing
-    // transcript (cleanup, different machine, pruned projects dir) would
-    // silently start a context-free session — drop the stale binding and
-    // transfer the conversation history into the prompt instead.
-    log.warn("[opencode-claude] stored Claude session file missing; transferring history", {
-      conversationKey,
-      foreignSessionId: resume,
-    });
-    clearForeignSessionId(conversationKey);
-    resume = undefined;
-  }
-
-  // The user reverted or edited in OpenCode: the history before this prompt
-  // is shorter than, or differs from, what the Claude session holds. Resume
-  // from the boundary where the two still agree, or, when none does, start
-  // over from the history OpenCode has.
-  // Where the resume has to be cut through a fork (see below): the session
-  // to copy and the entry to cut at.
-  let forkAt: { sessionId: string; leafUuid: string } | undefined;
-  // Turns after this chat's last Claude turn that the session never saw:
-  // the user switched to another model for them, or they failed before
-  // Claude ran. A resume alone would skip them.
+  // Where the chat's transcript continues (turn-point.ts): the transcript
+  // to resume and the record to resume at, or the name of a new transcript.
+  let resume: string | undefined = summaryResume?.sessionId;
+  let resumeSessionAt: string | undefined = summaryResume?.leafUuid;
+  let newSessionId: string | undefined;
+  // Turns after the resume point that the transcript never saw: the user
+  // switched to another model for them, or they failed before Claude ran. A
+  // resume alone would skip them, so they go into the prompt as text. A
+  // summary resumed before the chat's live turn reads that turn so.
   let missedMessages: typeof priorMessages = summaryResume?.liveTurn ?? [];
-  if (resume && sessionFile && !isMetaRequest) {
-    const match = matchTurnHistory(
-      getSessionTurns(conversationKey),
-      userHistoryFingerprints(priorMessages),
-    );
-    // Also for a rebuilt tool step: it is Claude's own only when no turn the
-    // session never saw comes before it. After a model switch it can be the
-    // other model's step, and the turns before it are the handover.
-    if (match.kind === "latest") {
-      missedMessages = historyAfterUserCount(priorMessages, match.count);
+  // The uuid of this turn's record in the transcript (names.ts).
+  let promptUuid: string | undefined;
+  let epoch: string | undefined;
+  // Lines above the answer that say how the turn ran (TURN_NOTES).
+  const notes: string[] = [];
+  const outsideTranscript = !isMetaRequest && input.unmatchedList === true;
+  if (outsideTranscript) notes.push(TURN_NOTES.unmatchedList);
+  if (!isMetaRequest && !outsideTranscript) {
+    const planned = await planChatTurn({
+      sessionID: sessionHeader!,
+      conversationKey,
+      event: input.contextEvent,
+      priorMessages,
+      messages,
+      rebuiltStep: answeredStep !== null,
+      configDir,
+    });
+    if (planned instanceof Response) return planned;
+    // The step's results are in the transcript, or its call is off the leaf
+    // chain the turn resumes on: a plain turn on the user messages after them.
+    if (planned.stepDelivered) {
+      log.info(
+        planned.offLeafChain
+          ? "[opencode-claude] the tool step's call is off the transcript's leaf chain; sending the step as text"
+          : "[opencode-claude] the transcript holds the tool step's results; not rebuilding it",
+        { conversationKey },
+      );
+      answeredStep = null;
+      prompt = latestUserPrompt(messages);
+      priorMessages = priorMessagesOf(messages);
     }
-    // A boundary may sit in an earlier session of this chat (before a
-    // fork); its file must still hold the leaf.
-    const source = match.kind === "rewind" ? (match.sessionId ?? resume) : undefined;
-    const sourceFile =
-      source === undefined ? null : source === resume ? sessionFile : findClaudeSessionFile(source, configDir);
+    resume = planned.resume;
+    resumeSessionAt = planned.resumeSessionAt;
+    newSessionId = planned.newSessionId;
+    missedMessages = planned.missedMessages;
+    promptUuid = planned.promptUuid;
+    epoch = planned.epoch;
+    // OpenCode's system prompt rides in the body's first messages: it is not history.
+    notes.push(...turnNotes(planned, priorMessages.some((m) => m?.role !== "system")));
+    // The latest user turn joins the user messages after the last answer
+    // (queued together, or one whose turn failed). The transcript may hold
+    // the first of them already, up to the resume point: the prompt is the
+    // rest, or Claude would read them twice.
     if (
-      match.kind === "rewind" &&
-      match.leafUuid &&
-      source &&
-      sourceFile &&
-      sessionFileHasEntry(sourceFile, match.leafUuid)
+      answeredStep === null &&
+      planned.coveredUsers !== undefined &&
+      planned.coveredUsers > userHistoryFingerprints(priorMessages).length
     ) {
-      log.info("[opencode-claude] OpenCode history went back; resuming from an earlier turn", {
-        conversationKey,
-        turn: match.index,
-        session: source,
-      });
-      rewindSessionTurns(conversationKey, match.index);
-      // The undone turns descend from that leaf, so a plain resume would
-      // bring them back. Unless nothing came after it: a retry of a turn
-      // that failed before Claude wrote anything resumes as is.
-      const untouched =
-        source === resume &&
-        lastChainEntryUuid(sourceFile) === match.leafUuid &&
-        sessionChainAfterLeaf(sourceFile, match.leafUuid) === "clean";
-      if (!untouched) forkAt = { sessionId: source, leafUuid: match.leafUuid };
-    } else if (match.kind === "rewind" && !match.leafUuid) {
-      // A boundary recorded before this chat's leaf was known: nothing to
-      // cut at, so resume the whole session as before.
-      log.info("[opencode-claude] OpenCode history went back to a turn with no resume point; resuming the session", {
-        conversationKey,
-        turn: match.index,
-      });
-    } else if (match.kind === "rewind" || match.kind === "diverged") {
-      log.warn("[opencode-claude] OpenCode history no longer matches the Claude session; transferring history", {
-        conversationKey,
-        match: match.kind,
-      });
-      clearForeignSessionId(conversationKey);
-      resume = undefined;
-    }
-  }
-  // Resume from the last entry this plugin saw. Another claude process
-  // writing the same session (a turn orphaned by an OpenCode restart) can
-  // leave a side branch after it, and a plain resume may follow that branch.
-  // The CLI's resumeSessionAt doesn't help there: it only searches the chain
-  // it picked and fails with "No message found". A fork cut at the leaf
-  // holds exactly our chain, so the resume goes through one when needed.
-  if (resume && sessionFile && !isMetaRequest && !forkAt) {
-    const leafUuid = getSessionLeafUuid(conversationKey);
-    if (leafUuid) {
-      const state = sessionChainAfterLeaf(sessionFile, leafUuid);
-      if (state === "branched") {
-        log.info("[opencode-claude] Claude session branched after this chat's last turn; resuming through a fork", {
-          conversationKey,
-        });
-        forkAt = { sessionId: resume, leafUuid };
-      } else if (state === "missing") {
-        log.info("[opencode-claude] last seen entry is not in the Claude session; resuming the session as is", {
-          conversationKey,
-        });
-      }
-    }
-  }
-  if (resume && forkAt) {
-    try {
-      const forked = await sessionForker(forkAt.sessionId, forkAt.leafUuid);
-      log.info("[opencode-claude] resuming a fork of the Claude session", {
-        conversationKey,
-        from: forkAt.sessionId,
-        fork: forked,
-      });
-      // Fork uuids are fresh. The current boundary moves to the fork's last
-      // entry, the copy of the leaf it was cut at; older boundaries keep
-      // pointing into the sessions they were recorded in.
-      const forkFile = findClaudeSessionFile(forked, configDir);
-      setForeignSessionId(conversationKey, forked, {
-        modelId: model,
-        cwd,
-        leafUuid: forkFile ? lastChainEntryUuid(forkFile) : undefined,
-      });
-      resume = forked;
-    } catch (error) {
-      log.warn("[opencode-claude] could not fork the Claude session; transferring history", {
-        conversationKey,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      clearForeignSessionId(conversationKey);
-      resume = undefined;
+      prompt = latestUserPrompt(historyAfterUserCount(messages, planned.coveredUsers));
     }
   }
 
-  if (!isMetaRequest) {
-    const prints = userHistoryFingerprints(messages);
-    const before = userHistoryFingerprints(priorMessages);
-    if (prints.length > 0) {
-      recordTurnStart(
-        conversationKey,
-        { count: prints.length, hash: prints.at(-1)! },
-        before.length > 0 ? { count: before.length, hash: before.at(-1)! } : undefined,
-      );
-    }
-  }
+  // The step is still rebuilt (the plan found its results missing from the transcript).
+  if (answeredStep !== null && !isMetaRequest) notes.push(TURN_NOTES.rebuiltStep);
 
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
@@ -1506,7 +1855,10 @@ async function startNewTurn(input: {
           "</instructions>",
         ].join("\n")
       : "";
-  const mainPrompt = withLeadingText(contextualPrompt, metaInstructions);
+  const leadPrompt = withLeadingText(contextualPrompt, metaInstructions);
+  // A chat turn's record carries the name computed from its OpenCode message
+  // (names.ts), so the next turn finds it in the transcript by name.
+  const mainPrompt = promptUuid ? withUuid(leadPrompt, promptUuid) : leadPrompt;
   const fastMode = !isMetaRequest && isFastModelId(selection.modelId);
   // A chat turn that can park on tools keeps its input open, so a message
   // the user sends while a tool runs reaches Claude as their own message.
@@ -1601,6 +1953,10 @@ async function startNewTurn(input: {
   // model, which knows the conversation best. Generation is an explicit model
   // choice by the caller; keep it.
   const queryModel = metaKind === "title" ? META_REQUEST_MODEL : model;
+  // The turn was planned (transcripts read, a fork's parent asked): a stop
+  // that came meanwhile found no turn to stop.
+  const droppedPlanning = droppedBeforeStart(req, conversationKey, true);
+  if (droppedPlanning) return droppedPlanning;
   handle = withGracefulStop(await queryStarter(
     summaryResume
       ? {
@@ -1636,18 +1992,22 @@ async function startNewTurn(input: {
           },
         }
       : {
-    prompt: queryPrompt,
+    // A new transcript starts with a record of its own, before the turn's.
+    prompt: !isMetaRequest && newSessionId ? withTranscriptStart(queryPrompt, TRANSCRIPT_START_NAME) : queryPrompt,
     cwd,
     model: queryModel,
     resume: isMetaRequest ? undefined : resume,
+    resumeSessionAt: isMetaRequest ? undefined : resumeSessionAt,
+    sessionId: isMetaRequest ? undefined : newSessionId,
     effort: isMetaRequest ? undefined : selection.effort,
     fastMode,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
     maxTurns: isMetaRequest ? 1 : undefined,
     // Titles and summaries are never resumed; saving them would fill the
-    // user's Claude Code history with "create a title" sessions.
-    persistSession: isMetaRequest ? false : undefined,
+    // user's Claude Code history with "create a title" sessions. A turn
+    // outside the chat's transcript leaves no file either: it has no name.
+    persistSession: isMetaRequest || outsideTranscript ? false : undefined,
     // Only the OpenCode tool bridge: the user's Claude Code MCP servers and
     // claude.ai connectors would add their tool definitions to every turn
     // and compete with OpenCode's own tools.
@@ -1680,26 +2040,12 @@ async function startNewTurn(input: {
     pendingTools,
     seenCalls: new Set(),
     forwardedSteering: new Set(),
+    epoch,
+    promptUuid,
     createdAt: Date.now(),
     input: turnInput,
     configDir,
   };
-  // Session binding and resume point follow every event the turn yields,
-  // including the ones stop() reads after an interrupt: for a turn stopped
-  // while parked on a tool, those are the CLI's rejected tool_result and
-  // its "[Request interrupted by user for tool use]" entry, so the next turn
-  // resumes after the interruption instead of at the unanswered tool_use.
-  if (!isMetaRequest) {
-    handle.onEvent((event) => {
-      const sessionId = extractSessionId(event);
-      if (!sessionId) return;
-      setForeignSessionId(conversationKey, sessionId, {
-        modelId: model,
-        cwd,
-        leafUuid: mainChainUuid(event),
-      });
-    });
-  }
   putBridge(bridge);
   input.releaseSpawnLock();
 
@@ -1746,11 +2092,17 @@ async function startNewTurn(input: {
         // may run side by side (readOnlyHint ones); here they are only
         // forwarded, and OpenCode runs one response's calls concurrently.
         const holding = parked && pendingTools.size > 0;
+        // The SDK takes a call from the CLI at once but queues the stream's
+        // events, so a call can register before its message was read here.
+        // Not read yet is not closed: wait until the stream shows a block for
+        // every registered call.
+        const readUpToCalls = messageToolNames.length >= pendingTools.size;
         // Closed message: hand off once the CLI has started the whole group
         // it runs together, or when the settle window below runs out.
         if (
           holding &&
           !messageOpen &&
+          readUpToCalls &&
           (settled || pendingTools.size >= expectedParallelGroup(messageToolNames))
         ) {
           settled = false;
@@ -1843,8 +2195,9 @@ async function startNewTurn(input: {
         if (raced.value.done) break;
         const event = raced.value.value;
         if (fastMode) logFastModeState(event, conversationKey);
-        // The turn is over: close its input so the CLI exits.
-        if ((event as { type?: string } | undefined)?.type === "result") turnInput?.end();
+        // The turn is over: close its input so the CLI exits. (A record
+        // appended without a turn gets a result of its own; not this one.)
+        if (isTurnResult(event)) turnInput?.end();
         trackMessageState(event);
         retryWaitMs = apiRetryDelayMs(event);
         logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
@@ -1894,14 +2247,19 @@ async function startNewTurn(input: {
   // fake-200 stream whose only "assistant text" is the error. Hosts retry
   // fake-200 turns in a loop and each retry re-sends the whole conversation
   // to Anthropic: that doom loop burned ~4% of a weekly quota on 2026-08-11.
+  // The notes go ahead of the turn's first response only (a park's next
+  // response continues the same answer). A turn that fails before it
+  // produces anything shows none: the probe holds them with the other
+  // system lines and drops them with the failure.
+  const firstEvents = notes.length > 0 ? withTurnNotes(notes, consumeStream()) : consumeStream();
   if (stream) {
-    const probe = await probeTurnEvents(consumeStream());
+    const probe = await probeTurnEvents(firstEvents);
     if (probe.status === "failed") {
       return failureResponse(probe.errorText, conversationKey, metaKind, configDir, probe.kind);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
-  return collectTurnResponse(consumeStream(), body.model || model, bridge);
+  return collectTurnResponse(firstEvents, body.model || model, bridge);
 }
 
 
@@ -1928,15 +2286,6 @@ function logFastModeState(event: unknown, conversationKey: string): void {
     state: e.fast_mode_state,
     reason: e.fast_mode_disabled_reason,
   });
-}
-
-function mainChainUuid(event: unknown): string | undefined {
-  if (!event || typeof event !== "object") return undefined;
-  const e = event as Record<string, unknown>;
-  if (e.type !== "assistant" && e.type !== "user") return undefined;
-  if (e.parent_tool_use_id) return undefined;
-  if (e.isReplay === true) return undefined;
-  return typeof e.uuid === "string" && e.uuid ? e.uuid : undefined;
 }
 
 function extractSessionId(event: unknown): string | null {
@@ -2084,13 +2433,10 @@ export function coerceStringArgument(value: unknown, schema: unknown): unknown {
 /**
  * The id of the tool call an MCP request answers, as the CLI puts it in the
  * request's `_meta` (`claudecode/toolUseId`): Claude Code 2.1.300 and later
- * pass it on every call (probe 43, the 2.1.300 probe). A call without it (an
- * older CLI, which this plugin still runs) has none.
+ * pass it on every call (probe 43, the 2.1.300 probe).
  */
-export function toolUseIdOf(extra: unknown): string | undefined {
-  const meta = (extra as { _meta?: Record<string, unknown> } | null | undefined)?._meta;
-  const id = meta?.["claudecode/toolUseId"];
-  return typeof id === "string" && id ? id : undefined;
+export function toolUseIdOf(extra: unknown): string {
+  return (extra as { _meta: { "claudecode/toolUseId": string } })._meta["claudecode/toolUseId"];
 }
 
 export async function buildOpenCodeMcpServer(
@@ -2228,12 +2574,11 @@ export async function buildOpenCodeMcpServer(
           async (args: Record<string, unknown>, extra?: unknown) => {
             // The id Claude gave the call, which the CLI passes along (probe
             // 43): OpenCode then shows the step under the same id the
-            // transcript's call and result records carry. A call without one
-            // (an older CLI), or with an id already held for a parked call
-            // (the CLI never repeats one), gets an id of the plugin's own.
+            // transcript's call and result records carry. An id already held
+            // for a parked call (the CLI never repeats one) gets an id of the
+            // plugin's own.
             const given = toolUseIdOf(extra);
-            const id =
-              given && !pendingTools.has(given) ? given : `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+            const id = pendingTools.has(given) ? `call_${randomUUID().replace(/-/g, "").slice(0, 24)}` : given;
             const pending: ParkedToolCall = {
               id,
               name,
@@ -2330,7 +2675,7 @@ async function collectTurnResponse(
     lastErrorNorm = norm;
     // The first failure of a known kind is the cause; a later, vaguer
     // wording of the same failure (the error result after the synthetic
-    // record, the iterator's throw) must not turn a 429 or a refused
+    // record) must not turn a 429 or a refused
     // account into a 500.
     if (!errorText || errorKind === "unknown") {
       errorText = text;
@@ -2364,8 +2709,11 @@ async function collectTurnResponse(
       }
     }
   } catch (err) {
-    // Null: only CLI diagnostics after an error result already noted.
-    const message = thrownErrorText(err) ?? (errorText ? null : "Claude turn failed");
+    // After an error result the iterator's throw is the same failure: with a
+    // prompt that has a uuid the CLI's `cancelled` follows the result, and the
+    // SDK throws "Claude Code process exited with code 1" instead of the
+    // result's text, so only a throw with no failure before it is noted.
+    const message = errorText ? null : (thrownErrorText(err) ?? "Claude turn failed");
     if (message) {
       recordRateLimitErrorText(message, bridge.configDir);
       forgetDeadSession(bridge.conversationKey, message);
@@ -2461,6 +2809,9 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
     return assistantErrorText(e) ? "error" : "neutral";
   }
   if (e.type === "result") {
+    // A record appended without a turn gets a result of its own: not the
+    // turn's answer, not its failure.
+    if (!isTurnResult(e)) return "neutral";
     // Nothing reached the probe yet, so a 5xx "success" produced nothing.
     return e.is_error || overloadedResultText(e) ? "error" : "content";
   }
@@ -2897,11 +3248,12 @@ function streamOpenAIResponse(
           }
         }
       } catch (err) {
-        // A limit/result failure typically arrives here right after the SDK
-        // emitted the same text as a result event — dedupe via sendError.
-        // Only diagnostics left: the result event said it all already.
-        const message =
-          thrownErrorText(err) ?? (lastErrorNorm ? null : "Claude turn failed");
+        // After an error result the iterator's throw is the same failure: with
+        // a prompt that has a uuid the CLI's `cancelled` follows the result,
+        // and the SDK throws "Claude Code process exited with code 1" instead
+        // of the result's text, so only a throw with no failure before it is
+        // noted (the result's limit was recorded by mapSdkEvent).
+        const message = lastErrorNorm ? null : (thrownErrorText(err) ?? "Claude turn failed");
         if (message) {
           recordRateLimitErrorText(message, bridge.configDir);
           forgetDeadSession(bridge.conversationKey, message);
@@ -3007,20 +3359,36 @@ function assistantErrorText(event: Record<string, unknown>): string | null {
     : `Claude API request failed (${event.error})`;
 }
 
-/** claude CLI text when `resume` points at a session it cannot load. */
-const LOST_SESSION_PATTERN =
+/** claude CLI text when `resume` points at a session it cannot load (test/cli-contract-live.ts checks it on the CLI). */
+export const LOST_SESSION_PATTERN =
   /no conversation found|no message found with message\.uuid|session\b.*\bnot found|could not (?:find|load|resume).*(?:session|conversation)/i;
 
 /**
- * A resume-target-missing error means the stored foreign session id is dead.
- * Clear it so the next turn transfers history instead of failing forever.
+ * The CLI could not continue the chat's transcript at the computed point
+ * (the file cannot be loaded; or the point is off its leaf chain and does
+ * not meet it at all, turn-point.ts leafChainAncestor). The chat moves to the next transcript version, so
+ * the retry transfers the history as text instead of failing forever.
  */
 function forgetDeadSession(conversationKey: string, errorText: string): void {
   if (!LOST_SESSION_PATTERN.test(errorText)) return;
-  log.warn("[opencode-claude] Claude session lost; clearing stored binding", {
+  // A summary resumes the chat's transcript without continuing it: nothing to
+  // mark, but OpenCode retries the summary, and the retry reads the request as
+  // text (summaryResumePoint).
+  const summaryPrefix = requestKeyNamespace("summary");
+  if (conversationKey.startsWith(summaryPrefix)) {
+    const chatKey = conversationKey.slice(summaryPrefix.length);
+    summaryAsText.add(chatKey);
+    log.warn("[opencode-claude] the chat's Claude session cannot be resumed for the summary; the retry reads the request as text", {
+      conversationKey: chatKey,
+    });
+    return;
+  }
+  const transcript = markTranscriptUnusable(conversationKey);
+  log.warn("[opencode-claude] Claude session lost; the chat moves to a new transcript", {
     conversationKey,
+    transcript: transcript?.name,
+    version: transcript?.version,
   });
-  clearForeignSessionId(conversationKey);
 }
 
 /**
@@ -3162,6 +3530,11 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (e.type === "__park__" && Array.isArray(e.tools)) {
     if (state) state.producedContent = true;
     return { kind: "park", tools: e.tools as ParkedToolCall[] };
+  }
+
+  // A note of the plugin's own on how the turn ran (TURN_NOTES).
+  if (e.type === "__note__" && typeof e.text === "string") {
+    return { kind: "reasoning", text: e.text };
   }
 
   // Structured subscription limit telemetry from the Agent SDK — record for

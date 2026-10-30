@@ -3,7 +3,9 @@
  * - A context overflow is a 400 context_length_exceeded that OpenCode
  *   compacts on; an image error is a non-retryable 400; an account decision
  *   (billing) is a 402 OpenCode does not retry.
- * - A lost session is noticed and the history goes to a new one.
+ * - A lost transcript is noticed and the history goes to a new one; one the
+ *   CLI reports lost (gone when the CLI loads it) moves the chat to the
+ *   next transcript version.
  * - Two cases fail by a finding and live in files of their own until it is
  *   fixed: an error the SDK reports twice (result event and iterator throw)
  *   shows once — turn-error-noted-twice-regression.ts; a meta request that
@@ -12,16 +14,18 @@
  * - A CLI that did not start is a retryable 500 and drops the memoized CLI
  *   path, so OpenCode's retry looks for the CLI again.
  *
- * main's behaviour and the series' steps before chain/turn-by-names (the
- * session file the plugin records, the journal's words for a lost one); the
- * series' own, with transcripts by name, is turn-errors-regression.ts. The
- * launch failure is feat/cli-auto-update's.
+ * The series' behaviour, from chain/turn-by-names on (transcripts by name,
+ * the journal's words for a lost one); main's and the earlier steps' is
+ * turn-errors-main-regression.ts.
  *
  * On the simulators (test/simulators/): each failure as Claude Code 2.1.312
  * reports it (`state.failures`, `summaryFailures`; BEHAVIOR.md "Failures of a
  * model call"): a synthetic error record, a `success` result with
- * `is_error`, then the SDK's throw. The lost session: its transcript file is
- * gone from Claude's profile. The CLI's "[ede_diagnostic]"
+ * `is_error`, then the SDK's throw. The lost transcript: its file is gone
+ * from Claude's profile. The transcript the CLI reports lost: its file is
+ * removed while the CLI starts (`state.holdStart`, the start held before
+ * the plugin's starter runs: `claude.heldStarts`), after the plugin read it,
+ * and the CLI refuses it ("No conversation found"). The CLI's "[ede_diagnostic]"
  * lines come with the error result of an interrupted turn: the user stops a
  * turn while it streams. The old cases of an overflow reported as
  * `error_during_execution` with only diagnostics are gone: CLI 2.1.312
@@ -42,7 +46,7 @@
  * 32MB)…" is a different failure, the request's size, not an image's:
  * request-too-large-regression.ts.
  *
- * Run: bun test/turn-errors-main-regression.ts
+ * Run: bun test/turn-errors-regression.ts
  */
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
@@ -51,6 +55,17 @@ import { join } from "node:path";
 import { testCases } from "./simulators/cases.ts";
 import type { ClaudeFailure } from "./simulators/claude-code.ts";
 import { createWorld, pluginModule } from "./simulators/world.ts";
+
+/**
+ * The history holding `earlier`, then the latest message `latest`: as `<conversation_history>` text with "Latest
+ * user message:" (before chain/record-per-message), or in OpenCode's form for a serialized part of a conversation
+ * ("…serialized record of this conversation from its start…", `<recent-context>`) with the message after it.
+ */
+const historyThen = (earlier: string, latest: string) =>
+  new RegExp(
+    `(<conversation_history>[\\s\\S]*${earlier}[\\s\\S]*Latest user message:\\n${latest}` +
+      `|serialized record of this conversation from its start[\\s\\S]*${earlier}[\\s\\S]*</recent-context>\\n+${latest})`,
+  );
 
 async function main() {
   const world = await createWorld("turn-errors");
@@ -101,7 +116,7 @@ async function main() {
       assert.equal(retries, 0, "not sent again");
     });
 
-    await cases.run("the chat's Claude session file is gone: the plugin notices and the history goes to a new session", async () => {
+    await cases.run("the chat's transcript is gone: the plugin notices and the history goes to a new transcript", async () => {
       const chat = opencode.newChat();
       await opencode.say(chat, "LOST-ONE");
       assert.ok((await opencode.turn(chat)).ok);
@@ -113,8 +128,46 @@ async function main() {
       assert.equal(turn.requests.length, 1, "in one request");
       const query = claude.queries.at(-1)!;
       assert.notEqual(query.params.resume, lost, "the lost session is not resumed");
-      assert.match(query.view, /<conversation_history>[\s\S]*LOST-ONE[\s\S]*Latest user message:\nLOST-TWO/, "the history reaches the new session");
-      assert.ok(world.journal().some((line) => /stored Claude session file missing/.test(line)), "the journal names the lost session");
+      assert.match(query.view, historyThen("LOST-ONE", "LOST-TWO"), "the history reaches the new transcript");
+      assert.ok(
+        world.journal().some((line) => line.includes("starting a new Claude transcript; transferring history") && line.includes(`"conversationKey":"${chat}"`) && line.includes("no transcript of this chat")),
+        "the journal names the lost transcript",
+      );
+    });
+
+    await cases.run("a transcript the CLI reports lost moves the chat to the next transcript version", async () => {
+      // The file is gone when the CLI loads it, after the plugin read it: OpenCode's retry transfers the history as text.
+      const names = await pluginModule("names");
+      const chat = opencode.newChat();
+      await opencode.say(chat, "hi");
+      assert.ok((await opencode.turn(chat)).ok);
+      const transcript = claude.queries.at(-1)!.name;
+      await opencode.say(chat, "LOST-POINT");
+      let release!: () => void;
+      claude.state.holdStart = new Promise<void>((resolve) => (release = resolve));
+      const from = claude.queries.length;
+      const held = claude.heldStarts;
+      const turning = opencode.turn(chat);
+      // The plugin read the transcript and is starting the CLI on it: the start is held, no process yet.
+      for (let waited = 0; claude.heldStarts === held; waited += 10) {
+        if (waited > 5_000) {
+          release();
+          await turning;
+          throw new Error("the query did not start");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      rmSync(claude.fileOf(transcript));
+      release();
+      const turn = await turning;
+      assert.ok(turn.ok, `the retry answered: ${turn.requests.map((r) => r.status).join(",")}`);
+      const [refused, retry] = claude.queries.slice(from);
+      assert.equal(refused!.outcome, "refused: no conversation", "the CLI could not load the transcript");
+      assert.equal(turn.requests[0]!.status, 500);
+      assert.equal(retry!.params.resume, undefined);
+      assert.equal(retry!.params.sessionId, names.transcriptName(chat, names.FIRST_EPOCH, 2), "the next version");
+      assert.match(retry!.view, historyThen("hi", "LOST-POINT"), "the history reaches the next version");
+      assert.ok(world.journal().some((line) => line.includes("Claude session lost; the chat moves to a new transcript") && line.includes(`"conversationKey":"${chat}"`)));
     });
 
     await cases.run("the user stops a turn while it streams: the CLI's diagnostics reach neither OpenCode nor the journal", async () => {

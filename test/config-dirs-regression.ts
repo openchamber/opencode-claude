@@ -1,7 +1,7 @@
 /**
  * Regression: the `configDirs` option runs a project on another Claude
  * account. Claude Code keeps one login per CLAUDE_CONFIG_DIR; a mapped
- * project's turns run with that directory, resume sessions from it, and keep
+ * project's turns run with that directory, resume transcripts from it, and keep
  * their own plan check and rate limits, while other projects stay on the
  * server's default account.
  *
@@ -14,13 +14,11 @@
  * })`). `configDirForDirectory` is a pure function of config-dir.ts; the
  * rate-limit gate is read and fed through rate-limit.ts. The old test's
  * paths were POSIX ("/src/work"); they are compared resolved here, so the
- * block runs on Windows too.
+ * block runs on Windows too. Where a turn ended in a transcript: the record
+ * the next question's record continues (named after its OpenCode id,
+ * names.ts userRecordName).
  *
- * main's resume: the session by its id (no `resumeSessionAt`); from
- * chain/turn-by-names a transcript named after the chat, resumed at the
- * record a turn ended on (config-dirs-regression.ts).
- *
- * Run: bun test/config-dirs-main-regression.ts
+ * Run: bun test/config-dirs-regression.ts
  */
 import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
@@ -30,11 +28,18 @@ import { join, resolve } from "node:path";
 import { contentText } from "./simulators/claude-code.ts";
 import { createWorld, pluginModule } from "./simulators/world.ts";
 
+/**
+ * The history as text: `<conversation_history>` before chain/record-per-message, OpenCode's form for a serialized
+ * part of a conversation there.
+ */
+const HISTORY_AS_TEXT = /<conversation_history>|serialized record of this conversation from its start/;
+
 async function main() {
   const world = await createWorld("config-dirs");
   const { opencode, claude } = world;
   const { configDirForDirectory } = await pluginModule("config-dir");
   const { rateLimitGate, recordRateLimitErrorText } = await pluginModule("rate-limit");
+  const names = await pluginModule("names");
 
   const map = { "/src/work": "/cfg/work", "/src/work/client": "/cfg/client" };
   assert.equal(configDirForDirectory(map, "/src/work"), resolve("/cfg/work"));
@@ -57,10 +62,10 @@ async function main() {
     instance = await opencode.startPlugin(configDir ? { configDirs: { [world.tmp]: configDir } } : undefined);
   };
   const turnIn = async (chat: string, text: string) => {
-    await opencode.say(chat, text);
+    const id = await opencode.say(chat, text);
     const turn = await opencode.turn(chat);
     const query = claude.queries.at(-1)!;
-    return { turn, query, params: query.params as Record<string, any>, prompt: query.input.map((m) => contentText(m.content)).join("\n") };
+    return { id, turn, query, params: query.params as Record<string, any>, prompt: query.input.map((m) => contentText(m.content)).join("\n") };
   };
 
   try {
@@ -87,23 +92,29 @@ async function main() {
     assert.ok(homeTurn.turn.ok, `the default account is not blocked: ${homeTurn.turn.requests.at(-1)?.status}`);
     assert.equal(homeTurn.params.env.CLAUDE_CONFIG_DIR, defaultConfig);
 
-    // The mapped chat resumes its session from its account's config dir.
+    // The mapped chat resumes its transcript from its account's config dir.
     await restart(workConfig);
     const second = await turnIn(work, "second");
     assert.ok(second.turn.ok);
     assert.equal(second.params.env.CLAUDE_CONFIG_DIR, workConfig);
-    assert.ok(claude.filesIn(join(workConfig, "projects")).records(first.query.name).length > 0, "Claude Code kept the mapped chat's session under its profile");
+    const workRecords = claude.filesIn(join(workConfig, "projects")).records(first.query.name);
+    assert.ok(workRecords.length > 0, "Claude Code kept the mapped chat's transcript under its profile");
     assert.equal(claude.records(first.query.name).length, 0, "and not under the default one");
-    assert.equal(second.params.resume, first.query.name, "the mapped chat resumes its session");
-    assert.doesNotMatch(second.prompt, /<conversation_history>/);
+    assert.equal(first.query.name, names.transcriptName(work, names.FIRST_EPOCH, 1), "the chat's transcript is named after it");
+    assert.equal(second.params.resume, first.query.name, "the mapped chat resumes its transcript");
+    // Where the first turn ended: the record the second question's record continues.
+    const question = workRecords.find((r) => r.uuid === names.userRecordName(second.id, 1));
+    assert.ok(question?.parentUuid, "the second question's record is named after it");
+    assert.equal(second.params.resumeSessionAt, question.parentUuid, "resumed at the end of the first turn");
+    assert.doesNotMatch(second.prompt, HISTORY_AS_TEXT);
 
-    // The same chat unmapped: the default account has no such session, so the history goes over as text.
+    // The same chat unmapped: the default account has no such transcript, so the history goes over as text.
     await restart();
     const third = await turnIn(work, "third");
     assert.ok(third.turn.ok);
     assert.equal(third.params.env.CLAUDE_CONFIG_DIR, defaultConfig);
     assert.equal(third.params.resume, undefined);
-    assert.match(third.prompt, /<conversation_history>/);
+    assert.match(third.prompt, HISTORY_AS_TEXT);
 
     // The plan check asks the mapped account's own login: signed in with an API key there.
     claude.cli.set({ authByConfigDir: { [clientConfig]: "apiKey" } });
