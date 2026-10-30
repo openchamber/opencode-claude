@@ -2094,6 +2094,18 @@ export function coerceStringArgument(value: unknown, schema: unknown): unknown {
   return value;
 }
 
+/**
+ * The id of the tool call an MCP request answers, as the CLI puts it in the
+ * request's `_meta` (`claudecode/toolUseId`): Claude Code 2.1.300 and later
+ * pass it on every call (probe 43, the 2.1.300 probe). A call without it (an
+ * older CLI, which this plugin still runs) has none.
+ */
+export function toolUseIdOf(extra: unknown): string | undefined {
+  const meta = (extra as { _meta?: Record<string, unknown> } | null | undefined)?._meta;
+  const id = meta?.["claudecode/toolUseId"];
+  return typeof id === "string" && id ? id : undefined;
+}
+
 export async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -2226,8 +2238,15 @@ export async function buildOpenCodeMcpServer(
           name,
           description,
           shape,
-          async (args: Record<string, unknown>) => {
-            const id = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+          async (args: Record<string, unknown>, extra?: unknown) => {
+            // The id Claude gave the call, which the CLI passes along (probe
+            // 43): OpenCode then shows the step under the same id the
+            // transcript's call and result records carry. A call without one
+            // (an older CLI), or with an id already held for a parked call
+            // (the CLI never repeats one), gets an id of the plugin's own.
+            const given = toolUseIdOf(extra);
+            const id =
+              given && !pendingTools.has(given) ? given : `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
             const pending: ParkedToolCall = {
               id,
               name,
