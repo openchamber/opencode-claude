@@ -5,193 +5,181 @@
  * - a superseded `claude auth login` child exiting late cannot tear down or
  *   fail the sign-in flow that replaced it.
  *
+ * On the simulators (test/simulators/): the `claude` the plugin finds on
+ * PATH is the Claude Code simulator's process (claude-cli.mjs, laid out as
+ * npm installs it); a slow or hung CLI is `claude.cli.set({ delayMs })`, its
+ * starts are `claude.cli.calls()`, a CLI installed later is `installCli` into
+ * a folder the plugin searched before (with its own handle). The sign-in is
+ * the CLI's `auth login --claudeai` up to its page (a new one each start);
+ * no code is ever sent. The world's PATH holds only its bin and node, so
+ * the installer first meets a host without npm, curl and bash (spawn fails);
+ * then the simulator's installers go into the world's bin
+ * (`claude.installers`: curl and bash, and npm except on Windows, where npm
+ * is a .cmd the plugin cannot spawn without a shell), one of them hanging or
+ * all succeeding. No real installer is ever started. The probes are the
+ * plugin's own (detect.ts, executable-path.ts, cli-login.ts, cli-install.ts).
+ *
  * Run: bun test/cli-probes-regression.ts
  */
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { EventEmitter } from "node:events";
-import { tmpdir } from "node:os";
+import assert from "node:assert/strict";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { assert } from "./helpers.ts";
+
+import { createWorld, pluginModule } from "./simulators/world.ts";
+
+/** Where the plugin finds the simulator's CLI in `bin`: npm's cli.js behind claude.cmd on Windows, the script elsewhere. */
+const cliIn = (bin: string) => (process.platform === "win32" ? join(bin, "node_modules", "@anthropic-ai", "claude-code", "cli.js") : `${bin}/claude`);
 
 async function main() {
-  const { probeClaudeAuthStatusCli, detectClaudeCode } = await import("../src/detect.ts");
-  const { resetClaudeCliResolutionCache, resolveClaudeCli } = await import(
-    "../src/executable-path.ts"
-  );
-
-  const dir = mkdtempSync(join(tmpdir(), "opencode-claude-probe-"));
+  const world = await createWorld("cli-probes");
+  const { claude } = world;
+  const { probeClaudeAuthStatusCli, detectClaudeCode } = world.plugin.detect;
+  const { resetClaudeCliResolutionCache, resolveClaudeCli, runCliProbe } = await pluginModule("executable-path");
+  const bin = join(world.tmp, "bin");
   try {
-    const cli = join(dir, "claude");
-    writeFileSync(
-      cli,
-      [
-        "#!/bin/sh",
-        "/bin/sleep 0.4",
-        'if [ "$1" = "auth" ]; then echo \'{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\'; else echo "2.1.300 (Claude Code)"; fi',
-      ].join("\n"),
-    );
-    chmodSync(cli, 0o755);
+    resetClaudeCliResolutionCache();
+    const cli = await resolveClaudeCli(process.env);
+    assert.equal(cli, cliIn(bin), "the plugin finds the CLI on PATH");
 
     // The event loop keeps ticking while the slow CLI answers (a sync spawn
     // would allow at most one tick).
+    claude.cli.set({ delayMs: 400, version: "2.1.300" });
     let ticks = 0;
     const ticker = setInterval(() => ticks++, 20);
-    const status = await probeClaudeAuthStatusCli({ binaryPath: cli, env: { PATH: dir, HOME: dir } });
+    const status = await probeClaudeAuthStatusCli({ binaryPath: cli });
     clearInterval(ticker);
     assert.equal(status?.loggedIn, true);
     assert.ok(ticks >= 8, `event loop blocked during the probe (${ticks} ticks)`);
 
-    resetClaudeCliResolutionCache();
-    assert.equal(await resolveClaudeCli({ PATH: dir, HOME: dir }), cli);
-    const detected = await detectClaudeCode({ env: { PATH: dir, HOME: dir }, binaryPath: cli });
+    const detected = await detectClaudeCode();
     assert.equal(detected.version, "2.1.300");
+    assert.equal(detected.status, "ready");
+    assert.deepEqual(claude.cli.calls().slice(-2).map((call) => call.args.join(" ")), ["--version", "auth status --json"], "detection ran the CLI it found");
 
     // A hung CLI is killed at the timeout instead of hanging the caller.
-    const hung = join(dir, "hung");
-    writeFileSync(hung, "#!/bin/sh\nexec /bin/sleep 30\n");
-    chmodSync(hung, 0o755);
-    const { runCliProbe } = await import("../src/executable-path.ts");
+    claude.cli.set({ delayMs: 30_000 });
     const started = Date.now();
-    const timedOut = await runCliProbe(hung, [], { timeoutMs: 300 });
+    const timedOut = await runCliProbe(cli, ["--version"], { timeoutMs: 300 });
     assert.equal(timedOut.failed, true);
     assert.ok(Date.now() - started < 5_000);
+    claude.cli.set({ delayMs: 0 });
+
+    // Concurrent callers share one probe (on Windows the shim is unwrapped on disk: no start at all).
+    resetClaudeCliResolutionCache();
+    const before = claude.cli.calls().length;
+    const both = await Promise.all([resolveClaudeCli(process.env), resolveClaudeCli(process.env)]);
+    assert.deepEqual(both, [cli, cli]);
+    assert.ok(claude.cli.calls().length - before <= 1, "one shared probe");
+
+    // A miss is remembered briefly.
+    const empty = join(world.tmp, "empty");
+    mkdirSync(empty);
+    const missEnv = { PATH: empty, HOME: empty, APPDATA: empty };
+    resetClaudeCliResolutionCache();
+    assert.equal(await resolveClaudeCli(missEnv), null);
+    // Installed behind our back: the cached miss still answers for a while…
+    const later = claude.installCli(empty);
+    assert.equal(await resolveClaudeCli(missEnv), null, "miss is cached");
+    // …while the install action's reset makes it visible at once.
+    resetClaudeCliResolutionCache();
+    assert.equal(await resolveClaudeCli(missEnv), cliIn(empty));
+    later.set({ version: "2.1.301" });
+    assert.equal((await detectClaudeCode({ binaryPath: cliIn(empty) })).version, "2.1.301", "the new install runs");
+    assert.equal(later.calls().length, 2, "the new install's own starts: version and sign-in");
     resetClaudeCliResolutionCache();
 
-    // Concurrent callers share one probe; a miss is remembered briefly.
-    const counted = mkdtempSync(join(tmpdir(), "opencode-claude-count-"));
-    try {
-      const log = join(counted, "calls");
-      writeFileSync(log, "");
-      writeFileSync(
-        join(counted, "claude"),
-        `#!/bin/sh\necho x >> ${log}\n/bin/sleep 0.2\necho "2.1.300 (Claude Code)"\n`,
-      );
-      chmodSync(join(counted, "claude"), 0o755);
-      const env = { PATH: counted, HOME: counted };
-      resetClaudeCliResolutionCache();
-      const both = await Promise.all([resolveClaudeCli(env), resolveClaudeCli(env)]);
-      assert.deepEqual(both, [join(counted, "claude"), join(counted, "claude")]);
-      const { readFileSync } = await import("node:fs");
-      assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 1, "one shared probe");
-
-      const empty = join(counted, "empty");
-      const { mkdirSync } = await import("node:fs");
-      mkdirSync(empty);
-      const missEnv = { PATH: empty, HOME: empty };
-      resetClaudeCliResolutionCache();
-      assert.equal(await resolveClaudeCli(missEnv), null);
-      // Installed behind our back: the cached miss still answers for a while…
-      writeFileSync(join(empty, "claude"), "#!/bin/sh\necho 2.1.300\n");
-      chmodSync(join(empty, "claude"), 0o755);
-      assert.equal(await resolveClaudeCli(missEnv), null, "miss is cached");
-      // …while the install action's reset makes it visible at once.
-      resetClaudeCliResolutionCache();
-      assert.equal(await resolveClaudeCli(missEnv), join(empty, "claude"));
-      resetClaudeCliResolutionCache();
-    } finally {
-      rmSync(counted, { recursive: true, force: true });
+    // Superseded login child: its late exit must not fail the current flow.
+    {
+      const { startClaudeCliLogin, cancelClaudeCliLogin, getClaudeCliLoginStatus, resetClaudeCliLoginForTests } = await pluginModule("cli-login");
+      const first = await startClaudeCliLogin({ urlTimeoutMs: 5_000 });
+      assert.equal(first.state, "awaiting-code", `the CLI's sign-in printed its page: ${JSON.stringify(first)}`);
+      cancelClaudeCliLogin();
+      const second = await startClaudeCliLogin({ urlTimeoutMs: 5_000 });
+      assert.equal(second.state, "awaiting-code");
+      assert.notEqual(second.url, first.url, "a new sign-in, a new page");
+      // The killed first child exits only now.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.equal(claude.cli.calls().filter((call) => call.args.join(" ") === "auth login --claudeai").length, 2);
+      assert.deepEqual(getClaudeCliLoginStatus(), { state: "awaiting-code", url: second.url });
+      cancelClaudeCliLogin();
+      resetClaudeCliLoginForTests();
     }
+
+    // Installer on a host without npm, curl and bash: every attempt is a result, not a throw.
+    {
+      // Never the machine's installers: the world's PATH holds only its bin and node. (Bun.which without a
+      // PATH reads the one the process started with; the installer spawns with process.env, the world's.)
+      for (const command of ["npm", "curl", "bash"]) assert.equal(Bun.which(command, { PATH: process.env.PATH! }), null, `${command} is not reachable from the world`);
+      const { installClaudeCli } = await pluginModule("cli-install");
+      const missing = await installClaudeCli();
+      assert.equal(missing.ok, false);
+      const message = missing.ok ? "" : missing.message;
+      assert.match(message, /^Install script failed: .*curl/m, `both installers named: ${message}`);
+      assert.match(message, /^npm install failed: .*npm/m);
+
+      // A temp-dir failure for the script is reported too.
+      const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+      process.env.TMPDIR = process.env.TEMP = process.env.TMP = join(world.tmp, "definitely-missing-dir", "nested");
+      try {
+        const noTmp = await installClaudeCli();
+        assert.equal(noTmp.ok, false);
+        assert.match(noTmp.ok ? "" : noTmp.message, /temp dir/);
+      } finally {
+        for (const [key, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+
+      // The installers on the world's PATH. On Windows npm is a .cmd the plugin cannot spawn without
+      // a shell, so the install goes through curl and bash there; elsewhere npm comes first.
+      const windows = process.platform === "win32";
+      const { installers } = claude;
+      installers.install(bin);
+      const commands = () => installers.calls().map((call) => call.command);
+
+      // One total budget: the step that hangs uses it up, the next one gets no fresh budget. The budget lets the
+      // simulator's installer (a compiled executable) start and note its call on a busy machine too; a fresh
+      // budget for the fallback would take twice as long.
+      installers.set(windows ? { curl: "hang" } : { npm: "hang" });
+      const budget = 2_000;
+      const startedInstall = Date.now();
+      const slow = await installClaudeCli({ timeoutMs: budget });
+      assert.equal(slow.ok, false);
+      assert.match(slow.ok ? "" : slow.message, /timed out/);
+      assert.deepEqual(commands(), windows ? ["curl"] : ["npm"], "no fresh budget for the fallback");
+      assert.ok(Date.now() - startedInstall < budget + 1_500);
+
+      // An install that succeeds: the CLI is found at once, without waiting for the cached miss.
+      installers.set({ npm: "ok", curl: "ok", bash: "ok" });
+      const before = installers.calls().length;
+      assert.deepEqual(await installClaudeCli(), { ok: true });
+      assert.deepEqual(installers.calls().slice(before).map((call) => call.command), windows ? ["curl", "bash"] : ["npm"]);
+      if (windows) {
+        // The official script put claude.exe in ~/.local/bin, where the plugin looks off PATH.
+        const nothing = join(world.tmp, "nothing");
+        mkdirSync(nothing);
+        const offPath = { PATH: nothing, HOME: process.env.HOME!, APPDATA: process.env.APPDATA! };
+        const installed = await resolveClaudeCli(offPath);
+        assert.equal(installed, join(process.env.HOME!, ".local", "bin", "claude.exe"));
+        assert.equal((await detectClaudeCode({ binaryPath: installed })).status, "ready", "the installed CLI runs");
+      } else {
+        assert.ok(await resolveClaudeCli(process.env), "the installed CLI is found");
+      }
+      resetClaudeCliResolutionCache();
+    }
+
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await world.dispose();
   }
-
-  // Installer: one total budget, and a temp-dir failure is a result, not a throw.
-  {
-    const { installClaudeCli } = await import("../src/cli-install.ts");
-    const hangingChild = () =>
-      Object.assign(new EventEmitter(), {
-        stdout: new EventEmitter(),
-        stderr: new EventEmitter(),
-        kill() {
-          return true;
-        },
-      });
-    const spawned: string[] = [];
-    const started = Date.now();
-    const slow = await installClaudeCli({
-      env: { PATH: "/usr/bin" },
-      timeoutMs: 300,
-      spawnInstall(command) {
-        spawned.push(command);
-        return hangingChild() as any;
-      },
-    });
-    assert.equal(slow.ok, false);
-    assert.match(slow.ok ? "" : slow.message, /timed out/);
-    assert.deepEqual(spawned, ["npm"], "no fresh budget for the fallback");
-    assert.ok(Date.now() - started < 1_500);
-
-    const savedTmp = process.env.TMPDIR;
-    process.env.TMPDIR = join(tmpdir(), "definitely-missing-dir", "nested");
-    try {
-      const noTmp = await installClaudeCli({
-        env: { PATH: "/usr/bin" },
-        spawnInstall() {
-          const child = hangingChild();
-          process.nextTick(() => child.emit("exit", 127));
-          return child as any;
-        },
-      });
-      assert.equal(noTmp.ok, false);
-      assert.match(noTmp.ok ? "" : noTmp.message, /temp dir/);
-    } finally {
-      if (savedTmp === undefined) delete process.env.TMPDIR;
-      else process.env.TMPDIR = savedTmp;
-    }
-  }
-
-  // Superseded login child: its late exit must not fail the current flow.
-  {
-    const { startClaudeCliLogin, cancelClaudeCliLogin, getClaudeCliLoginStatus, resetClaudeCliLoginForTests } =
-      await import("../src/cli-login.ts");
-    const fakeCli = () => {
-      const stream = () => Object.assign(new EventEmitter(), { setEncoding() {} });
-      return Object.assign(new EventEmitter(), {
-        exitCode: null as number | null,
-        killed: false,
-        stdout: stream(),
-        stderr: stream(),
-        stdin: Object.assign(new EventEmitter(), { writable: true, write: () => true }),
-        kill() {
-          this.killed = true;
-          return true;
-        },
-      });
-    };
-    const url = (n: number) => `https://claude.com/cai/oauth/authorize?code=true&state=s${n}`;
-    const tick = () => new Promise((r) => setTimeout(r, 0));
-    const children = [fakeCli(), fakeCli()];
-    let spawned = 0;
-    const start = () =>
-      startClaudeCliLogin({
-        binaryPath: "/usr/local/bin/claude",
-        env: { PATH: "/usr/local/bin" },
-        spawnLogin: () => children[spawned++] as any,
-      });
-
-    const first = start();
-    await tick();
-    children[0]!.stdout.emit("data", `visit: ${url(1)}\n`);
-    assert.deepEqual(await first, { state: "awaiting-code", url: url(1) });
-    cancelClaudeCliLogin();
-
-    const second = start();
-    await tick();
-    children[1]!.stdout.emit("data", `visit: ${url(2)}\n`);
-    assert.deepEqual(await second, { state: "awaiting-code", url: url(2) });
-
-    // The killed first child exits only now, and prints on its way out.
-    children[0]!.stdout.emit("data", `visit: ${url(9)}\n`);
-    children[0]!.exitCode = 143;
-    children[0]!.emit("exit", 143, "SIGTERM");
-    assert.deepEqual(getClaudeCliLoginStatus(), { state: "awaiting-code", url: url(2) });
-    resetClaudeCliLoginForTests();
-  }
-
   console.log("ok — cli probes regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

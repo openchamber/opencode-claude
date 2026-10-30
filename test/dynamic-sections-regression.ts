@@ -6,85 +6,68 @@
  * turns (titles) keep their own one-line prompt, and
  * OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep restores the old layout.
  *
+ * On the simulators (test/simulators/): a chat turn and OpenCode's title of
+ * the chat; the system prompt the plugin asked for is in the query's
+ * parameters. That the flag reaches Claude Code (the old test stubbed the
+ * SDK's `query`): for one request each, the plugin's real query starter and
+ * the real SDK start the simulated CLI process, which logs the SDK's
+ * `initialize` request (`claude.cli.calls()`) and refuses the turn.
+ *
  * Run: bun test/dynamic-sections-regression.ts
  */
-import type { StartClaudeQueryParams } from "../src/query.ts";
-import { assert, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-type PresetPrompt = { type?: string; excludeDynamicSections?: boolean };
+import { createWorld } from "./simulators/world.ts";
+
+type PresetPrompt = { type?: string; preset?: string; excludeDynamicSections?: boolean };
 
 async function main() {
-  // The flag reaches the SDK only for the claude_code preset.
-  const { startClaudeQuery } = await import("../src/query.ts");
-  const sdkPrompt = async (systemPrompt: StartClaudeQueryParams["systemPrompt"]) => {
-    let seen: any;
-    await startClaudeQuery({
-      prompt: "x",
-      cwd: process.cwd(),
-      systemPrompt,
-      queryImpl: () => (input: any) => {
-        seen = input.options;
-        return (async function* () {})();
-      },
-    } as any);
-    return seen.systemPrompt;
-  };
-  assert.deepEqual(
-    await sdkPrompt({ type: "preset", preset: "claude_code", excludeDynamicSections: true }),
-    { type: "preset", preset: "claude_code", excludeDynamicSections: true },
-  );
-  assert.deepEqual(await sdkPrompt({ type: "preset", preset: "claude_code" }), {
-    type: "preset",
-    preset: "claude_code",
-  });
-
-  const { post, proxy } = await startMockedProxy("dynamic-sections");
-  const prompts: unknown[] = [];
-  proxy.setClaudeQueryStarter(async (params) => {
-    prompts.push(params.systemPrompt);
-    return mockHandle(
-      (async function* () {
-        yield { type: "system", subtype: "init", session_id: "sess-dynamic" };
-        yield { ...textDelta("ok"), session_id: "sess-dynamic" };
-        yield { type: "result", is_error: false, usage: {}, session_id: "sess-dynamic" };
-      })(),
-    );
-  });
-  const turn = async (session: string, body: Record<string, unknown>) => {
-    const res = await post(session, body);
-    assert.equal(res.status, 200, await res.clone().text());
-    return prompts.at(-1);
-  };
-
+  const world = await createWorld("dynamic-sections");
+  const { opencode, claude } = world;
+  const systemPromptOf = () => claude.queries.at(-1)!.params.systemPrompt;
   try {
-    const chat = (await turn("dyn-chat", {
-      messages: [{ role: "user", content: "hello" }],
-    })) as PresetPrompt;
-    assert.equal(chat.type, "preset");
-    assert.equal(chat.excludeDynamicSections, true, "chat turns drop the dynamic sections");
+    await opencode.startPlugin();
+    const chat = opencode.newChat();
+    await opencode.say(chat, "hello");
+    const turn = await opencode.turn(chat);
+    assert.ok(turn.ok, `the turn answered: ${turn.requests.at(-1)?.status}`);
+    const preset = systemPromptOf() as PresetPrompt;
+    assert.equal(preset.type, "preset");
+    assert.equal(preset.preset, "claude_code");
+    assert.equal(preset.excludeDynamicSections, true, "chat turns drop the dynamic sections");
 
-    const title = await turn("dyn-title", {
-      messages: [
-        { role: "system", content: "You are a title generator. Output only a thread title." },
-        { role: "user", content: "hello" },
-      ],
-    });
-    assert.equal(typeof title, "string", "a title keeps its own one-line prompt");
+    const title = await opencode.title(chat);
+    assert.ok(title.title, `OpenCode titled the chat: ${title.requests.at(-1)?.status}`);
+    assert.equal(claude.queries.at(-1)!.kind, "summary", "a title is a query of its own, not saved");
+    assert.equal(typeof systemPromptOf(), "string", "a title keeps its own one-line prompt");
 
     process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS = "keep";
-    const kept = (await turn("dyn-keep", {
-      messages: [{ role: "user", content: "hello" }],
-    })) as PresetPrompt;
-    assert.equal(kept.excludeDynamicSections, undefined, "keep restores the old layout");
+    const kept = opencode.newChat();
+    await opencode.say(kept, "hello");
+    assert.ok((await opencode.turn(kept)).ok);
+    assert.equal((systemPromptOf() as PresetPrompt).type, "preset");
+    assert.equal((systemPromptOf() as PresetPrompt).excludeDynamicSections, undefined, "keep restores the old layout");
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+    delete process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS;
+
+    /** A chat turn through the plugin's real query starter and the real SDK (world.throughRealSdk): the flag in `initialize`. */
+    const flagsOfTurn = async () => [(await world.throughRealSdk()).initialize!.excludeDynamicSections];
+    const chatFlags = await flagsOfTurn();
+    assert.ok(chatFlags.every((flag) => flag === true), `the flag reaches Claude Code: ${JSON.stringify(chatFlags)}`);
+    process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS = "keep";
+    const keptFlags = await flagsOfTurn();
+    assert.ok(keptFlags.every((flag) => flag !== true), `keep: no flag reaches Claude Code: ${JSON.stringify(keptFlags)}`);
   } finally {
     delete process.env.OPENCODE_CLAUDE_DYNAMIC_SECTIONS;
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
   console.log("ok — dynamic sections regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

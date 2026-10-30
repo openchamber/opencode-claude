@@ -1,5 +1,88 @@
 # Changelog
 
+## 1.7.0 - 2026-10-30
+
+- **Background compaction works with Claude**: with OpenCode's
+  `experimental.background_compaction` on, one compaction started three new
+  Claude sessions, each re-reading the whole chat. The chat now keeps going
+  while the summary is written and moves to a new session once, when the
+  summary is swapped in. Thanks to @yhoyoex.
+- **Compact earlier with `compactAt`**: on 1M models OpenCode compacts near
+  850K tokens. Set `"compactAt": 400000` in the plugin options to compact
+  long chats sooner; Claude still has its full window. See the README.
+- **Model ids cleaned up**: Opus 5.x and Fable 5.x run at 1M under their
+  plain ids, so the `[1m]` suffix is gone from the picker. Opus 4.6 keeps a
+  separate 1M entry, and Sonnet 4.6 (1M), which always failed on a plan, is
+  gone. Chats on the old ids ask you to pick the model once more.
+
+## 1.6.1 - 2026-10-30
+
+- **Cache warming no longer eats your limits**: with OpenCode's `warming`
+  setting on, every ping re-read the whole chat from your plan, every few
+  minutes, without warming anything the chat uses. The plugin now answers
+  those pings itself.
+- **Images from tools reach Claude**: on OpenCode 2.x a screenshot read by a
+  tool arrived as base64 text Claude couldn't see. It now arrives as an
+  image, and other tool results lose the JSON wrapping. Thanks to
+  @mradwankhalil.
+- **Fix: switching back to Claude forgot the other model's work**: when the
+  other model's last step was a tool call, Claude got none of its turns. It
+  now gets them all. Thanks to @Vikt0r70.
+- **Fix: Code Mode tools on OpenCode 2.2.1**: the renamed tools heading
+  kept Claude from seeing which tools work inside `execute`. Thanks to
+  @JosueGalRe.
+
+## 1.6.0 - 2026-10-26
+
+- **A Claude account per project**: map project folders to another Claude
+  login with the `configDirs` option, so a work project can run on your
+  company plan and the rest on your own. Each account keeps its own limits.
+  Thanks to @dangreenlee.
+- **Titles in your host's style**: Claude now names sessions with the title
+  prompt OpenChamber or your `agents.title.system` sets, instead of the
+  plugin's own template, so titles come out short and easy to scan.
+- **Fix: the note before a question showed as thinking**: when Claude went
+  straight to a tool, like asking you something, the note explaining it hid
+  in the collapsed Thought block. It now shows as a message. Thanks to
+  @drsmile1001.
+- **Fast mode wording**: fast turns draw your plan limits faster; the 1.5.0
+  notes wrongly said they're billed as extra usage.
+
+## 1.5.0 - 2026-10-21
+
+- **Fast mode**: models that support it, like Opus 5.5, now have a separate
+  "Fast" entry in the model picker. Fast turns draw your plan limits
+  faster; if fast mode isn't available on your account, the turn runs at
+  normal speed and the log says why. Thanks to @linghengqian.
+- **Fix: messages sent mid-turn looked like tool output**: a message you
+  steered in while Claude ran tools arrived inside the tool result, and
+  Claude sometimes treated it as a prompt injection. It now arrives as your
+  own message.
+- **Fix: project folders with non-ASCII names**: folders named in Cyrillic
+  and other scripts broke sessions. Thanks to @theshasha.
+- **Session titles in your language**: titles are written in the language
+  of the request. Thanks to @theshasha.
+- **Fix: tool calls with string-encoded arguments**: Claude sometimes sent
+  tool arguments as a JSON string and the call failed. Thanks to
+  @bernhardberger.
+
+## 1.4.2 - 2026-10-18
+
+- **Claude sees OpenChamber's session context**: OpenChamber's guidance,
+  pinned notes, memory and checkout details never reached Claude, so it
+  didn't link the issues and PRs it worked on to the session. It now gets
+  them like any other model.
+- **Full tool instructions**: Claude Code cut tool descriptions at 2048
+  characters, so long OpenChamber tools lost their last rules and drawn
+  pages ignored the chat theme. The limit is now 8192. Thanks to
+  @yulia-ivashko.
+- **Fix: compaction loop with another provider's summarizer**: when a chat
+  was compacted by a non-Claude model, Claude kept going with the old
+  history and the chat compacted again and again. Thanks to @mradwankhalil.
+- **Sonnet 5 and 5.5 have their full 1M window**: they were listed at 200K
+  and compacted early. The separate "(1M)" entries are gone, so pick the
+  model again in sessions that used them. Thanks to @android6.
+
 ## 1.4.1 - 2026-10-13
 
 - **Opus 5.5's update before a tool call shows as text**: the short "found

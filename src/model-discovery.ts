@@ -35,6 +35,13 @@ export type ClaudeModelDiscovery = {
   windows: Map<string, number | null>;
   /** What the CLI reported before, for ids it could not answer now. */
   lastAnswers: Map<string, number | null>;
+  /**
+   * Whether the CLI gave a window for every listed model, now or from the
+   * cache. A CLI signed out still lists models, but its own short list, and
+   * sizes only the one it starts on; then the list must not replace the
+   * plugin's (models.ts modelsAfterIncompleteRefresh).
+   */
+  complete: boolean;
 };
 
 /** The part of the SDK's query the window questions use. */
@@ -114,14 +121,16 @@ export function settingsWindowVariables(
 const SWITCH_ON = ["1", "true", "yes", "on"];
 
 /**
- * Whether CLAUDE_CODE_DISABLE_1M_CONTEXT is on, in the environment or in
- * settings.json. Then every model runs at 200K and no `[1m]` variant can do
- * better, so asking them would only spend model requests.
+ * Whether CLAUDE_CODE_DISABLE_1M_CONTEXT is on, in settings.json or in the
+ * environment: Claude Code reads the `env` of its settings over the process
+ * environment, either way (CLI 2.1.312, probed). Then every model runs at
+ * 200K and the CLI refuses every `[1m]` variant, so asking them would only
+ * spend model requests.
  */
 export function oneMillionContextDisabled(env: Record<string, string | undefined>): boolean {
   const value =
-    env.CLAUDE_CODE_DISABLE_1M_CONTEXT ??
-    settingsWindowVariables(env).CLAUDE_CODE_DISABLE_1M_CONTEXT;
+    settingsWindowVariables(env).CLAUDE_CODE_DISABLE_1M_CONTEXT ??
+    env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
   return value !== undefined && SWITCH_ON.includes(value.trim().toLowerCase());
 }
 
@@ -233,7 +242,15 @@ export async function askMissingContextWindows(
     windows.set(id, window);
     added = true;
   }
-  if (options.skipExtended) return added;
+  if (options.skipExtended) {
+    // With the switch on the CLI refuses every `[1m]` id: a refusal without
+    // asking, so a variant listed from an earlier answer is not listed now.
+    for (const id of extendedProbeIds(rows, windows)) {
+      windows.set(id, null);
+      added = true;
+    }
+    return added;
+  }
   for (const id of extendedProbeIds(rows, windows)) {
     const window = await askContextWindow(q, id);
     if (window === "timeout" || window === "unreadable") return added;
@@ -287,11 +304,11 @@ export async function listClaudeSupportedModels(
     const windows = new Map<string, number | null>();
     // Read before this pass can rewrite the cache.
     const lastAnswers = readLastContextWindows();
+    const listed = listedModelIds(rows);
     // The list stands on its own: a failure while asking windows keeps it
     // and the windows already answered; the rest keep their last answer.
     try {
       const key = await contextWindowKey(q, env, pathToClaudeCodeExecutable ?? undefined);
-      const listed = listedModelIds(rows);
       const cached = cacheForListedModels(readContextWindowCache(key), listed);
       for (const [id, window] of Object.entries(cached?.windows ?? {})) windows.set(id, window);
       // With a cache, only ids the CLI could not answer last time are asked.
@@ -313,7 +330,14 @@ export async function listClaudeSupportedModels(
         err instanceof Error ? err.message : err,
       );
     }
-    return { rows, windows, lastAnswers };
+    const unanswered = listed.filter((id) => typeof windows.get(id) !== "number");
+    if (unanswered.length) {
+      log.warn(
+        "[opencode-claude] Claude Code gave no context window for some models; the model list keeps what it had",
+        { unanswered },
+      );
+    }
+    return { rows, windows, lastAnswers, complete: unanswered.length === 0 };
   } finally {
     release();
     q.close();

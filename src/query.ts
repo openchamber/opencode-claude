@@ -281,6 +281,8 @@ export type StartClaudeQueryParams = {
   forkSession?: boolean;
   permissionMode?: string;
   effort?: ClaudeEffort | string;
+  /** Claude Code's fast mode (draws plan limits faster). */
+  fastMode?: boolean;
   systemPrompt?:
     | string
     | {
@@ -422,6 +424,10 @@ export async function startClaudeQuery(
     settings.showThinkingSummaries = true;
     options.extraArgs = { "thinking-display": "summarized" };
   }
+
+  // The SDK's opt-in: without it the CLI reports fast mode off with
+  // `sdk_opt_in_required`, whatever the user picked in Claude Code.
+  if (params.fastMode === true) settings.fastMode = true;
 
   if (Object.keys(settings).length > 0) options.settings = settings;
 

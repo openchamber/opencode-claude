@@ -289,12 +289,15 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
     // Older / alternate shapes use `url` or raw base64 `data`.
     const fileData =
       typeof file.file_data === "string" ? file.file_data : null;
+    // OpenCode 2.x tool output parts carry the source as `uri`.
     const url =
       typeof file.url === "string"
         ? file.url
-        : fileData && /^data:/i.test(fileData)
-          ? fileData
-          : null;
+        : typeof file.uri === "string"
+          ? file.uri
+          : fileData && /^data:/i.test(fileData)
+            ? fileData
+            : null;
     const data =
       typeof file.data === "string"
         ? file.data
@@ -320,7 +323,11 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
 
     if (url) {
       if (pushDataUrl(blocks, url)) return;
-      if (isHttpUrl(url)) pushRemoteUrl(blocks, url, mediaType || name);
+      if (isHttpUrl(url)) {
+        pushRemoteUrl(blocks, url, mediaType || name);
+        return;
+      }
+      pushText(blocks, `[Attachment ${name || url} could not be relayed inline]`);
       return;
     }
     if (data) {
@@ -528,6 +535,52 @@ export function openaiToolResultToMcpContent(
   return result;
 }
 
+const TOOL_PART_TYPES = new Set([
+  "text",
+  "file",
+  "image",
+  "image_url",
+  "input_file",
+  "input_image",
+  "document",
+]);
+
+/**
+ * OpenCode 2.x returns tool output as content parts, and the openai-compatible
+ * request carries a tool message's content as a string, so the parts arrive
+ * JSON-encoded: `[{"type":"text",...},{"type":"file","uri":"data:image/png;base64,...",
+ * "mime":"image/png"}]`. Relayed as text, an image becomes kilobytes of base64
+ * the model cannot see. Decode exactly that shape; any other string stays
+ * the string it was.
+ */
+export function decodeToolMessageContent(content: unknown): unknown {
+  // With a cache breakpoint OpenCode wraps that string in one text part.
+  if (Array.isArray(content) && content.length === 1) {
+    const only = content[0] as { type?: unknown; text?: unknown } | null;
+    if (only?.type === "text" && typeof only.text === "string") {
+      const decoded = decodeToolMessageContent(only.text);
+      return decoded === only.text ? content : decoded;
+    }
+  }
+  if (typeof content !== "string") return content;
+  const text = content.trim();
+  if (!text.startsWith("[") || !text.endsWith("]")) return content;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return content;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return content;
+  const isPart = (part: unknown): boolean => {
+    if (!part || typeof part !== "object") return false;
+    const p = part as Record<string, unknown>;
+    if (typeof p.type !== "string" || !TOOL_PART_TYPES.has(p.type)) return false;
+    return p.type !== "text" || typeof p.text === "string";
+  };
+  return parsed.every(isPart) ? parsed : content;
+}
+
 const UNRELAYABLE_USER_MESSAGE =
   "[The user's latest message contained an attachment that could not be relayed to Claude (unsupported format or location). Tell the user it could not be read.]";
 
@@ -635,13 +688,13 @@ export function collectSteering(
  */
 export function collectSteeringMessages(
   messages: Array<{ role?: string; content?: unknown }>,
-): Array<{ key: string; blocks: McpToolResultContent[] }> {
+): Array<{ key: string; blocks: McpToolResultContent[]; prompt: string | AnthropicContentBlock[] }> {
   let lastTool = -1;
   for (let i = 0; i < messages.length; i++) {
     if (messages[i]?.role === "tool") lastTool = i;
   }
   if (lastTool < 0) return [];
-  const out: Array<{ key: string; blocks: McpToolResultContent[] }> = [];
+  const out: Array<{ key: string; blocks: McpToolResultContent[]; prompt: string | AnthropicContentBlock[] }> = [];
   const occurrences = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -653,10 +706,14 @@ export function collectSteeringMessages(
     const content = openaiToolResultToMcpContent(msg.content);
     const hasText = content.some((b) => b.type === "text" && b.text.trim());
     if (hasText || content.some((b) => b.type !== "text")) {
-      out.push({ key: `${nth}:${identity}`, blocks: content });
+      out.push({ key: `${nth}:${identity}`, blocks: content, prompt: userMessagePrompt(msg.content) });
     }
   }
   return out;
+}
+
+function isSystemUpdate(text: string): boolean {
+  return text.startsWith("<system-update>") && text.endsWith("</system-update>");
 }
 
 /** Append steering to a tool result so Claude reads it on resume. */
@@ -665,24 +722,35 @@ export function withSteering(
   steering: McpToolResultContent[],
 ): McpToolResultContent[] {
   if (steering.length === 0) return result;
-  const text = steering
+  const texts = steering
     .filter((b): b is { type: "text"; text: string } => b.type === "text")
     .map((b) => b.text.trim())
-    .filter(Boolean)
-    .join("\n\n");
+    .filter(Boolean);
+  // OpenCode sends a changed session context entry as `<system-update>` user
+  // text. It comes from the host, not the user, so it is not labelled as theirs.
+  const updates = texts.filter(isSystemUpdate);
+  const text = texts.filter((t) => !isSystemUpdate(t)).join("\n\n");
   const media = steering.filter((b) => b.type !== "text");
+  const userSent = text.length > 0 || media.length > 0;
   return [
     ...result,
-    {
-      type: "text",
-      text: [
-        "<system-reminder>",
-        "While this tool was running, the user sent the following message(s). Read them now and adjust your current work accordingly; they take priority over earlier instructions where they conflict:",
-        "",
-        text || "(attachments only, see below)",
-        "</system-reminder>",
-      ].join("\n"),
-    },
+    ...(updates.length > 0
+      ? [{ type: "text" as const, text: updates.join("\n\n") }]
+      : []),
+    ...(userSent
+      ? [
+          {
+            type: "text" as const,
+            text: [
+              "<system-reminder>",
+              "While this tool was running, the user sent the following message(s). Read them now and adjust your current work accordingly; they take priority over earlier instructions where they conflict:",
+              "",
+              text || "(attachments only, see below)",
+              "</system-reminder>",
+            ].join("\n"),
+          },
+        ]
+      : []),
     ...media,
   ];
 }
@@ -726,12 +794,15 @@ export function answeredToolStepIndex(messages: ToolStepMessage[]): number | nul
 export function answeredToolStepPrompt(
   messages: ToolStepMessage[],
   assistantIndex: number,
+  options: { otherModel?: boolean } = {},
 ): SdkUserPrompt {
   const { blocks, userBlocks } = toolStepBlocks(messages, assistantIndex);
   const content: AnthropicContentBlock[] = [
     {
       type: "text",
-      text: "<tool_results>\nYour previous step called the tools below, but the session that made those calls ended before OpenCode returned their results. They are relayed here. Do not repeat a call unless its result requires it.",
+      text: options.otherModel
+        ? "<tool_results>\nThe model that handled the turns above called the tools below as its last step. Their results are relayed here. Do not repeat a call unless its result requires it."
+        : "<tool_results>\nYour previous step called the tools below, but the session that made those calls ended before OpenCode returned their results. They are relayed here. Do not repeat a call unless its result requires it.",
     },
     ...blocks,
     {
@@ -739,7 +810,9 @@ export function answeredToolStepPrompt(
       text:
         userBlocks.length > 0
           ? "</tool_results>\n\nThe user sent the following after those calls. Respond to it with the results in mind:"
-          : `</tool_results>\n\n${HOST_STOP_NOTE} Continue the task from these results.`,
+          : options.otherModel
+            ? "</tool_results>\n\nContinue the task from these results."
+            : `</tool_results>\n\n${HOST_STOP_NOTE} Continue the task from these results.`,
     },
     ...userBlocks,
   ];
@@ -775,7 +848,7 @@ function toolStepBlocks(
   for (const [index, msg] of stepMessages.entries()) {
     if (msg?.role === "tool" && msg.tool_call_id) {
       const call = calls.get(msg.tool_call_id);
-      const result = openaiContentToAnthropicBlocks(msg.content);
+      const result = openaiContentToAnthropicBlocks(decodeToolMessageContent(msg.content));
       blocks.push(
         {
           type: "text",
@@ -795,41 +868,6 @@ function toolStepBlocks(
     }
   }
   return { blocks, userBlocks };
-}
-
-/**
- * The summary of a chat whose turn the plugin stopped to compact it. The
- * CLI recorded the turn's pending calls as rejected and the request as
- * interrupted by the user; the summary must not pass that on as the user's
- * decision. Results OpenCode already has for that step are relayed.
- */
-export function withStoppedTurnNote(
-  prompt: string | SdkUserPrompt,
-  history: ToolStepMessage[],
-): SdkUserPrompt {
-  const step = answeredToolStepIndex(history);
-  const { blocks } = step === null ? { blocks: [] } : toolStepBlocks(history, step);
-  const note: AnthropicContentBlock[] = [
-    {
-      type: "text",
-      text:
-        "<host_note>\nYour turn was stopped by the plugin so OpenCode could compact this chat. If your session shows your last tool calls as rejected, or the request as interrupted by the user, that came from the plugin, not from the user: nobody rejected anything or asked you to stop. Do not record it as a user decision; treat those calls as unfinished unless a result is relayed below." +
-        (blocks.length > 0 ? "\n\nResults OpenCode received for that step:" : ""),
-    },
-    ...blocks,
-    { type: "text", text: "</host_note>" },
-  ];
-  const content =
-    typeof prompt === "string"
-      ? [{ type: "text" as const, text: prompt }]
-      : Array.isArray(prompt.message.content)
-        ? prompt.message.content
-        : [{ type: "text" as const, text: prompt.message.content }];
-  return {
-    type: "user",
-    message: { role: "user", content: [...note, ...content] },
-    parent_tool_use_id: null,
-  };
 }
 
 export async function* promptAsStream(
@@ -918,7 +956,7 @@ function serializeHistoryMessage(
   }
 
   if (role === "tool") {
-    const text = extractTextContent(msg.content).trim();
+    const text = extractTextContent(decodeToolMessageContent(msg.content)).trim();
     if (!text) return null;
     // OpenAI-style tool messages carry only tool_call_id; the name is on the
     // assistant's call.
@@ -1058,4 +1096,82 @@ export function withLeadingText(
  */
 export function buildRuntimeInstructions(): string {
   return `<runtime_info>In case you're asked: you are running in ${currentHost().name} through the Claude Code harness. No need to mention this otherwise.</runtime_info>`;
+}
+
+/**
+ * Input of a chat turn that stays open while the turn runs, so a message the
+ * user sends mid-turn reaches Claude as a user message (`priority: "next"`:
+ * the CLI adds it after the running tool's result, as Claude Code does with a
+ * message typed while a tool runs). Ends with the turn.
+ */
+export type TurnInput = {
+  stream: AsyncGenerator<SdkUserPrompt, void, unknown>;
+  /** Resolves once the SDK has taken the message for the CLI. */
+  push(content: string | AnthropicContentBlock[]): Promise<void>;
+  end(): void;
+  ended(): boolean;
+};
+
+const TURN_INPUT_TAKE_MS = 2000;
+
+export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
+  type Entry = { prompt: SdkUserPrompt; taken: () => void };
+  const queue: Entry[] = [];
+  let wake: (() => void) | null = null;
+  let done = false;
+  const notify = () => {
+    wake?.();
+    wake = null;
+  };
+  const firstPrompt: SdkUserPrompt =
+    typeof first === "string"
+      ? { type: "user", message: { role: "user", content: first }, parent_tool_use_id: null }
+      : first;
+  async function* stream(): AsyncGenerator<SdkUserPrompt, void, unknown> {
+    try {
+      yield firstPrompt;
+      while (!done) {
+        const entry = queue.shift();
+        if (entry) {
+          entry.taken();
+          yield entry.prompt;
+          continue;
+        }
+        await new Promise<void>((resolve) => (wake = resolve));
+      }
+    } finally {
+      done = true;
+      for (const entry of queue.splice(0)) entry.taken();
+    }
+  }
+  return {
+    stream: stream(),
+    push(content) {
+      if (done) return Promise.resolve();
+      // A CLI that stops reading must not hold the tool results back.
+      return new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, TURN_INPUT_TAKE_MS);
+        timer.unref?.();
+        const taken = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        queue.push({
+          prompt: {
+            type: "user",
+            message: { role: "user", content },
+            parent_tool_use_id: null,
+            priority: "next",
+          } as SdkUserPrompt,
+          taken,
+        });
+        notify();
+      });
+    },
+    end() {
+      done = true;
+      notify();
+    },
+    ended: () => done,
+  };
 }

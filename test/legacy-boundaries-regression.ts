@@ -7,106 +7,121 @@
  * boundary whose leaf is not in the binding's session (an older build
  * carried one across a session change) can't be forked: history as text.
  *
- * Run: bun test/legacy-boundaries-regression.ts
+ * On the simulators (test/simulators/): the chats run in OpenCode with
+ * Claude Code writing the transcripts, first under the released 1.3.0
+ * itself (`world.build(releaseTree("v1.3.0"))`: its own record, its
+ * `TurnBoundary = { count, hash, leafUuid }` with no `sessionId`, its own
+ * fingerprints); then the user upgrades (OpenCode unloads it and loads the
+ * tree under test on the same folders). Chat b's first boundary carried
+ * over from another transcript is the one edit made by hand, kept as the
+ * author's own case of this test ("X1 was carried over from the session
+ * before legacy-b"): it checks the author's code only. No single user action
+ * of 1.3.0 or 1.3.1 leaves such a boundary (every turn that replaces a
+ * binding clears it first); one chat open in two OpenCode servers at once
+ * comes nearest, and even then the leaf stays in the binding's own
+ * transcript. The reverts after the upgrade are the
+ * user's (`undoBefore`, then a new message); the tree forks through the
+ * SDK's `forkSession` on the simulator's files.
+ *
+ * Run: bun test/legacy-boundaries-main-regression.ts
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { userHistoryFingerprints } from "../src/prompt.ts";
-import { assert, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
 
-const user = (content: string) => ({ role: "user", content });
-const assistant = (content: string) => ({ role: "assistant", content });
-const hash = (...texts: string[]) => userHistoryFingerprints(texts.map(user)).at(-1)!;
-const chain = (uuids: string[]) =>
-  uuids.map((uuid, i) => JSON.stringify({ type: "assistant", uuid, parentUuid: i ? uuids[i - 1] : null })).join("\n") + "\n";
+import { createWorld, pluginModule, releaseTree } from "./simulators/world.ts";
 
 async function main() {
-  const claudeConfig = mkdtempSync(join(tmpdir(), "opencode-claude-legacy-cfg-"));
-  process.env.CLAUDE_CONFIG_DIR = claudeConfig;
-  const projectDir = join(claudeConfig, "projects", "proj");
-  mkdirSync(projectDir, { recursive: true });
-  writeFileSync(join(projectDir, "legacy-a.jsonl"), chain(["A1", "A2", "A3"]));
-  writeFileSync(join(projectDir, "legacy-b.jsonl"), chain(["B2", "B3"]));
-
-  const { post, proxy } = await startMockedProxy("legacy-boundaries");
-  const { getForeignSessionId, getSessionTurns } = await import("../src/session-store.ts");
-  // The store as an older build left it: boundaries without sessionId.
-  const storeFile = join(process.env.XDG_DATA_HOME!, "opencode-claude", "sessions.json");
-  mkdirSync(join(process.env.XDG_DATA_HOME!, "opencode-claude"), { recursive: true });
-  const legacyTurns = (leaves: string[]) =>
-    leaves.map((leafUuid, i) => ({
-      count: i + 1,
-      hash: hash(...["u1", "u2", "u3"].slice(0, i + 1)),
-      leafUuid,
-    }));
-  writeFileSync(
-    storeFile,
-    JSON.stringify({
-      a: { conversationKey: "a", foreignSessionId: "legacy-a", leafUuid: "A3", turns: legacyTurns(["A1", "A2", "A3"]), updatedAt: 1 },
-      // "X1" was carried over from the session before legacy-b.
-      b: { conversationKey: "b", foreignSessionId: "legacy-b", leafUuid: "B3", turns: legacyTurns(["X1", "B2", "B3"]), updatedAt: 1 },
-    }),
-  );
-
-  const forks: string[] = [];
-  proxy.setClaudeSessionForker(async (id, at) => {
-    const fork = `fork-${forks.length + 1}`;
-    forks.push(`${id}@${at}`);
-    writeFileSync(join(projectDir, `${fork}.jsonl`), chain([`${fork}-${at}`]));
-    return fork;
-  });
-  let seen: Record<string, unknown> = {};
-  const answering = (leaf: string) =>
-    proxy.setClaudeQueryStarter(async (params) => {
-      seen = params as unknown as Record<string, unknown>;
-      const session = (params.resume as string | undefined) ?? "fresh";
-      return mockHandle(
-        (async function* () {
-          yield { type: "system", subtype: "init", session_id: session };
-          yield { type: "assistant", uuid: leaf, session_id: session, parent_tool_use_id: null, message: { content: [] } };
-          yield textDelta("ok");
-          yield { type: "result", is_error: false, usage: {}, session_id: session };
-        })(),
-      );
-    });
-  const send = async (key: string, leaf: string, messages: unknown[]) => {
-    answering(leaf);
-    const res = await post(key, { messages });
-    assert.equal(res.status, 200);
-    await res.text();
-    return { resume: seen.resume, transferred: /<conversation_history>/.test(String(seen.prompt)) };
-  };
-
+  const world = await createWorld("legacy-boundaries");
+  const { opencode, claude } = world;
   try {
+    // The user runs 1.3.0.
+    const released = await world.build(releaseTree("v1.3.0"));
+    let instance = await opencode.startPlugin(undefined, { setup: released.setup });
+    let store = await released.module("session-store");
+    const forks = () => world.journal().filter((line) => line.includes("resuming a fork of the Claude session")).map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { from: string; fork: string });
+    /** The user sends a message and Claude answers: its id, the chat's leaf after it, the query. */
+    const send = async (chat: string, text: string) => {
+      const id = await opencode.say(chat, text);
+      const turn = await opencode.turn(chat);
+      assert.ok(turn.ok, `${text}: ${turn.requests.map((r) => r.status).join(",")}`);
+      const query = claude.queries.at(-1)!;
+      // Transferred: this query's prompt carries the history (not a resumed record of an earlier one).
+      return { id, leaf: store.getSessionLeafUuid(chat) as string, query, transferred: JSON.stringify(query.input.map((i) => i.content)).includes("<conversation_history>") };
+    };
+    const where = (chat: string) => (store.getSessionTurns(chat) as Array<{ sessionId?: string; leafUuid?: string }>).map((t) => `${t.sessionId}:${t.leafUuid}`);
+    /** The record a fork's copy of `uuid` got (the SDK's forkSession: fresh uuids, `forkedFrom`). */
+    const copyOf = (fork: string, from: string, uuid: string) => claude.records(fork).find((r) => r.forkedFrom?.sessionId === from && r.forkedFrom?.messageUuid === uuid)?.uuid;
+
+    const a = opencode.newChat();
+    const a1 = await send(a, "u1");
+    const a2 = await send(a, "u2");
+    const a3 = await send(a, "u3");
+    const legacyA = a1.query.name;
+    assert.ok([a2, a3].every((t) => t.query.params.resume === legacyA), "one transcript for chat a");
+
+    const b = opencode.newChat();
+    await send(b, "u1");
+    const b2 = await send(b, "u2");
+    await send(b, "u3");
+    const legacyB = b2.query.params.resume as string;
+    // The session chat b had before: another transcript, whose leaf the old build carried over.
+    const before = opencode.newChat();
+    const carried = (await send(before, "u1 in the session before")).leaf;
+
+    // The user upgrades: OpenCode unloads 1.3.0, the record is as 1.3.0 left it, the tree under test loads.
+    await opencode.stopPlugin(instance);
+    const storeFile = join(process.env.XDG_DATA_HOME!, "opencode-claude", "sessions.json");
+    const record = JSON.parse(readFileSync(storeFile, "utf8")) as Record<string, { turns: Array<Record<string, unknown>> } & Record<string, unknown>>;
+    assert.equal(record[a]!.turns.length, 3);
+    assert.equal(record[b]!.turns.length, 3);
+    assert.ok([...record[a]!.turns, ...record[b]!.turns].every((turn) => !("sessionId" in turn) && typeof turn.leafUuid === "string"), "1.3.0's boundaries: a leaf, no session id");
+    // The one edit by hand (above): chat b's first boundary carried over from the session before.
+    record[b]!.turns[0]!.leafUuid = carried;
+    writeFileSync(storeFile, JSON.stringify(record, null, 2) + "\n");
+    instance = await opencode.startPlugin();
+    store = await pluginModule("session-store");
+
     // Legacy boundary in the binding's own session: fork from it.
-    let r = await send("a", "N3", [user("u1"), assistant("x"), user("u2"), assistant("y"), user("u3 edited")]);
-    assert.deepEqual(r, { resume: "fork-1", transferred: false });
-    assert.deepEqual(forks, ["legacy-a@A2"]);
+    opencode.undoBefore(a, a3.id);
+    const n3 = await send(a, "u3 edited");
+    assert.equal(forks().length, 1);
+    const fork1 = forks()[0]!.fork;
+    assert.equal(forks()[0]!.from, legacyA);
+    const copyA2 = copyOf(fork1, legacyA, a2.leaf);
+    assert.ok(copyA2, "the fork is cut at the second turn's leaf");
+    assert.deepEqual({ resume: n3.query.params.resume, transferred: n3.transferred }, { resume: fork1, transferred: false });
     // The fork stamped the older legacy boundary with where it came from.
-    assert.deepEqual(
-      getSessionTurns("a").map((t) => `${t.sessionId}:${t.leafUuid}`),
-      ["legacy-a:A1", "fork-1:fork-1-A2", "fork-1:N3"],
-    );
+    assert.deepEqual(where(a), [`${legacyA}:${a1.leaf}`, `${fork1}:${copyA2}`, `${fork1}:${n3.leaf}`]);
     // And a rewind across that fork still forks from legacy-a.
-    r = await send("a", "N2", [user("u1"), assistant("x"), user("u2 edited")]);
-    assert.deepEqual(r, { resume: "fork-2", transferred: false });
-    assert.equal(forks.at(-1), "legacy-a@A1");
+    opencode.undoBefore(a, a2.id);
+    const n2 = await send(a, "u2 edited");
+    assert.equal(forks().length, 2);
+    const fork2 = forks()[1]!.fork;
+    assert.equal(forks()[1]!.from, legacyA);
+    assert.ok(copyOf(fork2, legacyA, a1.leaf), "the fork is cut at the first turn's leaf");
+    assert.deepEqual({ resume: n2.query.params.resume, transferred: n2.transferred }, { resume: fork2, transferred: false });
+    assert.ok(!n2.query.view.includes("u3") && !n2.query.view.includes("u2\n"), `Claude sees no undone message: ${n2.query.view}`);
 
     // Legacy boundary whose leaf isn't in the binding's session: text.
-    r = await send("b", "M2", [user("u1"), assistant("x"), user("u2 edited")]);
-    assert.deepEqual(r, { resume: undefined, transferred: true });
-    assert.equal(forks.length, 2);
-    assert.equal(getForeignSessionId("b"), "fresh");
+    opencode.undoBefore(b, b2.id);
+    const m2 = await send(b, "u2 edited");
+    assert.deepEqual({ resume: m2.query.params.resume, transferred: m2.transferred }, { resume: undefined, transferred: true });
+    assert.equal(forks().length, 2);
+    assert.notEqual(m2.query.name, legacyB);
+    assert.equal(store.getForeignSessionId(b), m2.query.name);
+    assert.ok(world.journal().some((line) => line.includes("OpenCode history no longer matches the Claude session; transferring history")));
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    proxy.setClaudeSessionForker(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
-  console.log("ok — legacy boundaries regression passed");
+  console.log("ok - legacy boundaries regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

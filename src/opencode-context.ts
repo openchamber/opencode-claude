@@ -1,12 +1,13 @@
 /**
  * Parts of OpenCode's system prompt that are the user's own setup rather
- * than OpenCode's boilerplate: project instruction files and MCP server
- * notes. The rest of that prompt (its stock prompt, model identity, date and
+ * than OpenCode's boilerplate: project instruction files, MCP server notes
+ * and the session context a host attached. The rest of that prompt (its stock prompt, model identity, date and
  * environment) is not forwarded; Claude Code brings its own.
  */
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse } from "node:path";
+import { claudeConfigDir } from "./config-dir.js";
 import { metaSystemPrompt } from "./request-kind.js";
 
 type MessageLike = { role?: string; content?: unknown };
@@ -56,9 +57,8 @@ function claudeCodeReadsAgentsMd(path: string, dirs: Set<string>): boolean {
 }
 
 /** CLAUDE.md files Claude Code loads itself for this working directory. */
-function claudeMdFiles(cwd: string): string[] {
-  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-  const files = [join(configDir, "CLAUDE.md")];
+function claudeMdFiles(cwd: string, configDir?: string): string[] {
+  const files = [join(claudeConfigDir(configDir), "CLAUDE.md")];
   let dir = cwd;
   const { root } = parse(cwd);
   for (;;) {
@@ -126,9 +126,13 @@ function withImports(files: string[]): string[] {
  * reads as CLAUDE.md (the same file through a symlink or an `@path` import,
  * or the same text) are skipped so the rules don't arrive twice.
  */
-export function openCodeInstructionFiles(messages: MessageLike[], cwd: string): string {
+export function openCodeInstructionFiles(
+  messages: MessageLike[],
+  cwd: string,
+  configDir?: string,
+): string {
   const system = metaSystemPrompt(messages);
-  const loaded = withImports(claudeMdFiles(cwd));
+  const loaded = withImports(claudeMdFiles(cwd, configDir));
   const loadedPaths = new Set(loaded.map(realPath));
   const loadedTexts = new Set(
     loaded.map((file) => readText(file)?.trim()).filter((text): text is string => !!text),
@@ -158,4 +162,26 @@ export function mcpInstructions(messages: MessageLike[]): string {
   const end = system.indexOf("</mcp_instructions>", start);
   if (end < 0) return "";
   return system.slice(start, end + "</mcp_instructions>".length).trim();
+}
+
+const CONTEXT_BLOCK = /<context key="[^"\n]+">\n[\s\S]*?\n<\/context>/g;
+
+/** Index of the first message after OpenCode's leading system prompt. */
+function leadingSystemEnd(messages: MessageLike[]): number {
+  let i = 0;
+  while (i < messages.length && messages[i]?.role === "system") i++;
+  return i;
+}
+
+/**
+ * Session context entries a host attached through OpenCode's session
+ * instructions API (OpenChamber's guidance, pinned notes, memory, checkout),
+ * as OpenCode renders them into its system prompt: `<context key="…">`
+ * blocks. Only their values as of the session start (or its last compaction)
+ * sit there. Later changes reach the proxy as `<system-update>` user text,
+ * which Claude already gets with the next prompt.
+ */
+export function sessionContextBlocks(messages: MessageLike[]): string {
+  const system = metaSystemPrompt(messages.slice(0, leadingSystemEnd(messages)));
+  return [...system.matchAll(CONTEXT_BLOCK)].map((m) => m[0]).join("\n\n");
 }

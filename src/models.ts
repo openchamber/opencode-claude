@@ -17,7 +17,15 @@ export type ClaudeModel = {
   resolvedId?: string;
   /** Effort levels the model accepts; defaults to all when reasoning. */
   efforts?: ClaudeEffort[];
+  /** Runs in Claude Code's fast mode; `resolvedId` is the plain model. */
+  fast?: boolean;
 };
+
+/**
+ * Suffix of a fast-mode entry's id. OpenCode has no speed setting, so fast
+ * mode is a model of its own in the picker ("Opus 5.5 Fast").
+ */
+export const FAST_MODEL_SUFFIX = ":fast";
 
 const LIMIT_1M = { context: 1_000_000, output: 128_000 } as const;
 const LIMIT_200K = { context: 200_000, output: 64_000 } as const;
@@ -62,6 +70,7 @@ export type SdkModelRow = {
   displayName?: string;
   resolvedModel?: string;
   supportedEffortLevels?: string[];
+  supportsFastMode?: boolean;
 };
 
 /** Output limit that goes with a context window. */
@@ -124,7 +133,8 @@ export function modelNameFromId(id: string | undefined): string | undefined {
  * context window of each id is the one the CLI reported now (`windows`); an
  * id it could not answer this time keeps what it reported before
  * (`lastAnswers`, from the window cache), and an id it never answered gets
- * 200K, which can only compact a chat early, never overflow it. Claude Code
+ * 1M, the window of every current model; the next answer corrects an older
+ * model that runs at 200K (Haiku 4.5, Opus 4.6, Sonnet 4.6). Claude Code
  * selects 1M through a `[1m]` suffix on the model id (the suffix never
  * reaches the API); a model gets a second "(1M)" entry only when its `[1m]`
  * variant runs a larger window than the plain id (Opus 4.6), and a refused
@@ -152,7 +162,7 @@ export function modelsFromSdk(
       modelNameFromId(value) ??
       (row.displayName?.trim() || value);
     const answered = answer(base);
-    const plain = typeof answered === "number" ? answered : LIMIT_200K.context;
+    const plain = typeof answered === "number" ? answered : LIMIT_1M.context;
     out.push(model(base, name, limitFor(plain), undefined, efforts));
     // null: the CLI refused the variant for this account. Not answered this
     // time: its last answer keeps the variant, so a session on it keeps its
@@ -164,12 +174,38 @@ export function modelsFromSdk(
   }
   // An alias row and its concrete row resolve to the same model.
   const seen = new Set<string>();
-  return out.filter((m) => !seen.has(m.id) && seen.add(m.id));
+  const unique = out.filter((m) => !seen.has(m.id) && seen.add(m.id));
+  // Fast mode where the CLI says the model supports it, next to its model.
+  const fastFamilies = new Set(
+    rows
+      .filter((row) => row?.supportsFastMode === true)
+      .map((row) => (row.resolvedModel || row.value || "").trim().replace(/\[1m\]$/i, ""))
+      .filter((id) => id && id !== "default"),
+  );
+  return unique.flatMap((m) =>
+    fastFamilies.has(m.id.replace(/\[1m\]$/i, ""))
+      ? [m, { ...m, id: `${m.id}${FAST_MODEL_SUFFIX}`, name: `${m.name} Fast`, resolvedId: m.id, fast: true }]
+      : [m],
+  );
 }
 
-let discovered: ClaudeModel[] | null = readCachedModels();
+/**
+ * The list the CLI reported, one for the whole OpenCode server. OpenCode
+ * gives each project folder its own copy of a local plugin's modules (it
+ * clears the module cache when a folder loads the plugin), so a list kept
+ * in the module was one per folder: a refresh reached only the folder that
+ * ran it, and the others kept what they had read at load. On globalThis,
+ * like the refresh time (index.ts). The version in the key changes with the
+ * shape of ClaudeModel, so a copy of an older build keeps a list of its own.
+ */
+const CATALOG_KEY = Symbol.for("@openchamber/opencode-claude/model-catalog/v1");
+
+const catalogRuntime = ((globalThis as Record<symbol, unknown>)[CATALOG_KEY] ??= {
+  discovered: readCachedModels(),
+}) as { discovered: ClaudeModel[] | null };
 
 function buildCatalog(): ClaudeModel[] {
+  const discovered = catalogRuntime.discovered;
   return discovered?.length ? discovered : FALLBACK_MODELS;
 }
 
@@ -180,10 +216,29 @@ export function getClaudeModels(): ClaudeModel[] {
 /** Replace the discovered list and remember it for the next start. */
 export function setDiscoveredModels(models: ClaudeModel[]): boolean {
   if (!models.length) return false;
-  const changed = JSON.stringify(models) !== JSON.stringify(discovered);
-  discovered = models;
+  const changed = JSON.stringify(models) !== JSON.stringify(catalogRuntime.discovered);
+  catalogRuntime.discovered = models;
   if (changed) writeCachedModels(models);
   return changed;
+}
+
+/**
+ * The list after a refresh the CLI did not fully answer (signed out, a
+ * network or API failure): what it listed and could not size says nothing
+ * about the account, so every model already listed stays as it is, and only
+ * a model new to the list is added. A refresh the CLI fully answers replaces
+ * the list (setDiscoveredModels).
+ */
+export function modelsAfterIncompleteRefresh(found: ClaudeModel[]): ClaudeModel[] {
+  const current = catalogRuntime.discovered;
+  if (!current?.length) return found;
+  const ids = new Set(current.map((m) => m.id));
+  return [...current, ...found.filter((m) => !ids.has(m.id))];
+}
+
+/** Whether the picked catalog entry runs in fast mode. */
+export function isFastModelId(modelId: string): boolean {
+  return getClaudeModels().find((m) => m.id === modelId)?.fast === true;
 }
 
 export function resolveClaudeModelId(modelId: string): string {

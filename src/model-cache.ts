@@ -53,6 +53,13 @@ export type ContextWindowCache = {
   /** The listed models the windows were taken for. */
   models: string[];
   windows: Record<string, number | null>;
+  /**
+   * What the CLI answered under an earlier key or an expired day, for the
+   * ids `windows` does not hold yet. Not used as a cache, only as the last
+   * answer (readLastContextWindows): a pass under a new key that the CLI
+   * answers only in part (signed out, offline) keeps the rest that way.
+   */
+  earlier?: Record<string, number | null>;
 };
 
 const CONTEXT_WINDOW_CACHE_TTL_MS = 24 * 60 * 60_000;
@@ -88,8 +95,11 @@ export function readLastContextWindows(): Map<string, number | null> {
       readFileSync(dataFilePath("context-windows.json"), "utf8"),
     ) as Partial<ContextWindowCache>;
     const answers = new Map<string, number | null>();
-    for (const [id, window] of Object.entries(parsed.windows ?? {})) {
-      if (typeof window === "number" || window === null) answers.set(id, window);
+    // The current key's answers come last and win.
+    for (const source of [parsed.earlier, parsed.windows]) {
+      for (const [id, window] of Object.entries(source ?? {})) {
+        if (typeof window === "number" || window === null) answers.set(id, window);
+      }
     }
     return answers;
   } catch {
@@ -110,13 +120,22 @@ export function cacheForListedModels(
   return listed.every((id) => cache.models.includes(id)) ? cache : null;
 }
 
+/**
+ * Write the cache. An answer the file holds is never dropped: one the new
+ * cache does not repeat moves to `earlier`, so it stays the last answer.
+ */
 export function writeContextWindowCache(cache: ContextWindowCache): void {
   try {
     const file = dataFilePath("context-windows.json");
     mkdirSync(dirname(file), { recursive: true });
+    const earlier: Record<string, number | null> = {};
+    for (const [id, window] of readLastContextWindows()) {
+      if (!(id in cache.windows)) earlier[id] = window;
+    }
+    const written: ContextWindowCache = { ...cache, earlier };
     // Whole file or nothing: two OpenCode servers can write it at once.
     const temp = `${file}.${process.pid}.tmp`;
-    writeFileSync(temp, JSON.stringify(cache, null, 2));
+    writeFileSync(temp, JSON.stringify(written, null, 2));
     renameSync(temp, file);
   } catch {
     // Without the file the windows are asked again next time.

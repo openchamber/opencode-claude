@@ -12,7 +12,9 @@
 // Type-only: the v2 host loads a plain `{ id, setup }` object, so the plugin
 // needs none of OpenCode's runtime packages.
 import type { Model, Plugin, Provider } from "@opencode/plugin";
+import { configDirForDirectory } from "./config-dir.js";
 import {
+  CONFIG_DIR_HEADER,
   DIRECTORY_HEADER,
   EFFORT_HEADER,
   KIND_HEADER,
@@ -33,6 +35,7 @@ import {
 import {
   buildEffortVariants,
   getClaudeModels,
+  modelsAfterIncompleteRefresh,
   modelsFromSdk,
   setDiscoveredModels,
   type ClaudeModel,
@@ -51,9 +54,12 @@ export function applyClaudeRequestContextHeaders(
   headers: Record<string, string>,
   directory: string,
   sessionID?: string,
+  configDir?: string,
 ): void {
-  headers[DIRECTORY_HEADER] = directory;
+  // Header values must be Latin-1: fetch rejects a raw path like C:\项目.
+  headers[DIRECTORY_HEADER] = encodeURIComponent(directory);
   if (sessionID) headers["x-opencode-claude-session"] = sessionID;
+  if (configDir) headers[CONFIG_DIR_HEADER] = encodeURIComponent(configDir);
 }
 
 type ProviderInfo = Provider.Info;
@@ -63,7 +69,24 @@ type IntegrationEditor = Parameters<
 >[0];
 type AuthRegistration = Parameters<IntegrationEditor["method"]["update"]>[0];
 
-export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
+/** OpenCode keeps this share of the window free before it compacts. */
+const COMPACTION_RESERVE_SHARE = 0.15;
+
+/**
+ * The `compactAt` option: compact a chat at about this many tokens instead
+ * of near a 1M window. OpenCode compacts when the prompt reaches its input
+ * limit minus a reserve, so the input limit is set to put that point here.
+ * The context window stays the model's own; only smaller models are left
+ * alone.
+ */
+export function compactionInputLimit(model: ClaudeModel, compactAt: unknown): number | undefined {
+  if (typeof compactAt !== "number" || !Number.isFinite(compactAt) || compactAt <= 0) return undefined;
+  const input = Math.round(compactAt / (1 - COMPACTION_RESERVE_SHARE));
+  return input < model.contextWindow ? input : undefined;
+}
+
+export function buildProviderModel(model: ClaudeModel, id: string, compactAt?: unknown): ModelInfo {
+  const input = compactionInputLimit(model, compactAt);
   return {
     id,
     modelID: id,
@@ -87,12 +110,13 @@ export function buildProviderModel(model: ClaudeModel, id: string): ModelInfo {
       // its own (compaction.buffer overrides it). A 900k input on top of
       // that compacted 1M chats at 81%, not the intended 90%.
       output: model.maxTokens,
+      ...(input ? { input } : {}),
     },
   } as unknown as ModelInfo;
 }
 
-export function buildClaudeProviderModels(models: ClaudeModel[]): ModelInfo[] {
-  return models.map((model) => buildProviderModel(model, model.id));
+export function buildClaudeProviderModels(models: ClaudeModel[], compactAt?: unknown): ModelInfo[] {
+  return models.map((model) => buildProviderModel(model, model.id, compactAt));
 }
 
 export function buildProviderInfo(baseURL: string): ProviderInfo {
@@ -116,18 +140,42 @@ export function buildProviderInfo(baseURL: string): ProviderInfo {
 const MODEL_REFRESH_INTERVAL_MS = 10 * 60_000;
 
 /**
- * Kept on globalThis, like the bridge runtime (bridge-pool.ts): OpenCode
- * imports a changed local plugin afresh on reload, and a module-level time
- * would start over in the new copy, which then asks the CLI for every
- * window again while the old copy's pass may still be running.
+ * Kept on globalThis, like the model list (models.ts) and the bridge runtime
+ * (bridge-pool.ts). OpenCode gives each project folder its own copy of the
+ * plugin's modules, and a new copy on each reload of a changed plugin; the
+ * list is one for the server, so one refresh serves every folder:
+ * - lastModelRefresh: a module-level time would start over in each copy,
+ *   and each would ask the CLI again;
+ * - providerReloads: each folder's provider reload, so a changed list
+ *   reaches every folder, not only the one whose setup ran the refresh.
+ * The version in the key changes with this shape.
  */
-const MODEL_REFRESH_KEY = Symbol.for("@openchamber/opencode-claude/model-refresh/v1");
+const MODEL_REFRESH_KEY = Symbol.for("@openchamber/opencode-claude/model-refresh/v2");
 
-export const modelRefreshRuntime: { lastModelRefresh: number } = ((globalThis as Record<symbol, unknown>)[
+type ModelRefreshRuntime = {
+  lastModelRefresh: number;
+  providerReloads: Set<() => Promise<void>>;
+};
+
+export const modelRefreshRuntime: ModelRefreshRuntime = ((globalThis as Record<symbol, unknown>)[
   MODEL_REFRESH_KEY
-] ??= { lastModelRefresh: 0 }) as { lastModelRefresh: number };
+] ??= { lastModelRefresh: 0, providerReloads: new Set() }) as ModelRefreshRuntime;
 
-async function refreshModelCatalog(reload: () => Promise<void>) {
+/** Reload the provider in every folder, so each one lists the new models. */
+async function reloadProviderEverywhere(): Promise<void> {
+  await Promise.all(
+    [...modelRefreshRuntime.providerReloads].map((reload) =>
+      reload().catch((err: unknown) =>
+        log.warn(
+          "[opencode-claude] could not reload the model list in a project folder",
+          err instanceof Error ? err.message : err,
+        ),
+      ),
+    ),
+  );
+}
+
+export async function refreshModelCatalog(): Promise<void> {
   const now = Date.now();
   if (now - modelRefreshRuntime.lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
   modelRefreshRuntime.lastModelRefresh = now;
@@ -135,9 +183,10 @@ async function refreshModelCatalog(reload: () => Promise<void>) {
     const found = await listClaudeSupportedModels();
     if (!found?.rows.length) return;
     // A window the CLI could not answer this time keeps its last answer.
-    const models = modelsFromSdk(found.rows, found.windows, found.lastAnswers);
+    const fromCli = modelsFromSdk(found.rows, found.windows, found.lastAnswers);
+    const models = found.complete ? fromCli : modelsAfterIncompleteRefresh(fromCli);
     if (setDiscoveredModels(models)) {
-      await reload();
+      await reloadProviderEverywhere();
     }
   } catch (err) {
     log.warn(
@@ -208,6 +257,11 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       process.env.OPENCODE_CLAUDE_DEBUG ??= "1";
     }
     const directory = ctx.location.directory;
+    // A project mapped to another Claude account in the `configDirs` option.
+    const configDir = configDirForDirectory(
+      (ctx.options as { configDirs?: unknown } | undefined)?.configDirs,
+      directory,
+    );
     // Bind first (ephemeral port by default) so the provider points at the
     // live listener for this process.
     try {
@@ -224,9 +278,15 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     await ctx.provider.transform((providers) => {
       providers.add({
         info: buildProviderInfo(currentProxyBaseUrl()),
-        models: buildClaudeProviderModels(getClaudeModels()),
+        models: buildClaudeProviderModels(
+          getClaudeModels(),
+          (ctx.options as { compactAt?: unknown } | undefined)?.compactAt,
+        ),
       });
     });
+    // A refresh from any folder reloads this one too (reloadProviderEverywhere).
+    const reloadProvider = () => ctx.provider.reload();
+    modelRefreshRuntime.providerReloads.add(reloadProvider);
 
     await ctx.session.hook(
       "model.request",
@@ -249,6 +309,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
           request.headers,
           directory,
           request.sessionID,
+          configDir,
         );
       },
       { providerID: PROVIDER_ID },
@@ -258,7 +319,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     // Refresh the catalog from the CLI in the background; the cached or
     // fallback list serves until it lands.
     if (cliPresent) {
-      void refreshModelCatalog(() => ctx.provider.reload());
+      void refreshModelCatalog();
     }
 
     await ctx.integration.transform((integrations) => {
@@ -288,6 +349,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     });
 
     return async () => {
+      modelRefreshRuntime.providerReloads.delete(reloadProvider);
       stopWatching();
       await releaseProxy();
     };

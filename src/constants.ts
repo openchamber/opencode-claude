@@ -6,8 +6,10 @@ export const EFFORT_HEADER = "x-opencode-claude-effort";
 export const SESSION_HEADER = "x-opencode-claude-session";
 /** OpenCode request kind: primary, compaction, title or generate. */
 export const KIND_HEADER = "x-opencode-claude-kind";
-/** Active OpenCode project directory forwarded to the local Agent SDK proxy. */
+/** Active OpenCode project directory forwarded to the local Agent SDK proxy, URI-encoded. */
 export const DIRECTORY_HEADER = "x-opencode-claude-directory";
+/** Claude Code config directory mapped to that project (`configDirs` option), URI-encoded. */
+export const CONFIG_DIR_HEADER = "x-opencode-claude-config-dir";
 
 export const EFFORT_LEVELS = [
   "low",

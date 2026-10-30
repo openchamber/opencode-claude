@@ -5,52 +5,54 @@
  * other ("Claude Code ended the turn without any output"). Each standalone
  * call now gets its own key.
  *
+ * On the simulators (test/simulators/): OpenCode's `Generate.text`
+ * (`generateText`: no session, no hook) four times at once with one
+ * preamble; Claude Code answers each slowly (`state.blockPauseMs`), so the
+ * four queries run side by side, as they did in the old test (a stub turn of
+ * 200 ms that ended without output when stopped); a query the plugin
+ * stopped would end without its answer.
+ *
  * Run: bun test/concurrent-generate-regression.ts
  */
-import { assert, sleep, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
+
+import { createWorld } from "./simulators/world.ts";
+
+const PAUSE_MS = 200;
 
 async function main() {
-  const { port, proxy } = await startMockedProxy("concurrent-generate");
-  // Like the CLI: a stopped turn ends without output.
-  proxy.setClaudeQueryStarter(async () => {
-    let stop!: () => void;
-    const stopped = new Promise<"stop">((r) => (stop = () => r("stop")));
-    return {
-      stream: (async function* () {
-        yield { type: "system", subtype: "init", session_id: "gen" };
-        if ((await Promise.race([sleep(200), stopped])) === "stop") {
-          yield { type: "result", subtype: "error_during_execution", is_error: true, errors: [], session_id: "gen" };
-          return;
-        }
-        yield textDelta("NO");
-        yield { type: "result", is_error: false, usage: {}, session_id: "gen" };
-      })(),
-      interrupt: async () => stop(),
-      close: () => stop(),
-      getPid: () => null,
-    };
-  });
-  const preamble = "You classify items. Answer with YES or NO only. ".repeat(8);
-  const results = await Promise.all(
-    [1, 2, 3, 4].map(async (i) => {
-      const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "sonnet",
-          stream: false,
-          messages: [{ role: "user", content: `${preamble}\nItem ${i}: is ${i} even?` }],
-        }),
-      });
-      return { status: res.status, body: (await res.json()) as any };
-    }),
-  );
-  for (const { status, body } of results) {
-    assert.equal(status, 200, JSON.stringify(body));
-    assert.equal(body.choices[0].message.content, "NO");
+  const world = await createWorld("concurrent-generate");
+  const { opencode, claude } = world;
+  try {
+    await opencode.startPlugin();
+    claude.state.summaryReplies = ["NO", "NO", "NO", "NO"];
+    claude.state.blockPauseMs = PAUSE_MS;
+    const preamble = "You classify items. Answer with YES or NO only. ".repeat(8);
+    const before = claude.queries.length;
+    const results = await Promise.all(
+      [1, 2, 3, 4].map((i) => opencode.generateText(`${preamble}\nItem ${i}: is ${i} even?`)),
+    );
+    claude.state.blockPauseMs = 0;
+    for (const result of results) {
+      assert.equal(result.reply.status, 200, `${result.reply.raw ?? ""}`);
+      assert.equal(result.failure, undefined, `${JSON.stringify(result.failure)}`);
+      assert.equal(result.text, "NO");
+    }
+    const queries = claude.queries.slice(before);
+    assert.equal(queries.length, 4, "one Claude Code query per call");
+    assert.deepEqual(queries.map((q) => q.outcome), ["answered", "answered", "answered", "answered"], "no call stopped another");
+    // The four ran side by side: each query was still running when the last one started.
+    const lastStart = Math.max(...queries.map((q) => q.startedAt));
+    assert.ok(
+      queries.every((q) => q.endedAt !== undefined && q.endedAt - q.startedAt >= PAUSE_MS * 0.75 && q.endedAt > lastStart),
+      `the queries overlapped (${queries.map((q) => Math.round((q.endedAt ?? NaN) - q.startedAt)).join(", ")} ms)`,
+    );
+    assert.ok(queries.every((q) => q.closedAt === undefined || q.closedAt >= q.endedAt!), "none was closed before its answer ended");
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+  } finally {
+    await world.dispose();
   }
-  console.log("concurrent-generate regression ok");
-  await proxy.stopProxy?.();
+  console.log("ok — concurrent-generate regression passed");
 }
 
 main().then(

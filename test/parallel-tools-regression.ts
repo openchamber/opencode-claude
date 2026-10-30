@@ -4,153 +4,90 @@
  * period), and read-only tools, subagents included, carry readOnlyHint in the
  * tools/list Claude Code reads. (Ported from the fork's 1c66cb8.)
  *
+ * On the simulators (test/simulators/): Claude Code starts each call as soon
+ * as its block is complete, while the message still streams, read-only tools
+ * side by side (CLI 2.1.312, BEHAVIOR.md "Tool calls and stops");
+ * `blockPauseMs` makes the model stream slowly, `stallBeforeStop` holds the
+ * message's end.
+ *
  * Run: bun test/parallel-tools-regression.ts
  */
-import { assert, mcpExtra, mcpHandlers, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-type RegisteredTool = {
-  annotations?: { readOnlyHint?: boolean };
-  handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ content: Array<{ text: string }> }>;
-};
+import { listPluginTools } from "./simulators/claude-code.ts";
+import type { ToolDefinitions } from "./simulators/opencode.ts";
+import { createWorld } from "./simulators/world.ts";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const toolSchema = (name: string) => ({
-  type: "function",
-  function: {
-    name,
-    description: name,
-    parameters: { type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"] },
-  },
-});
-
-async function readSse(res: Response) {
-  const text = await res.text();
-  const calls = new Map<number, { id: string; name: string; args: string }>();
-  let content = "";
-  let finish: string | null = null;
-  for (const line of text.split("\n")) {
-    if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
-    const choice = JSON.parse(line.slice(6)).choices?.[0];
-    if (!choice) continue;
-    if (choice.delta?.content) content += choice.delta.content;
-    for (const tc of choice.delta?.tool_calls ?? []) {
-      calls.set(tc.index, { id: tc.id, name: tc.function.name, args: tc.function.arguments });
-    }
-    if (choice.finish_reason) finish = choice.finish_reason;
-  }
-  return { content, calls: [...calls.values()], finish };
-}
+const tool = (name: string) => ({ description: name, input: { type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"] } });
+const TOOLS: ToolDefinitions = { read: tool("read"), edit: tool("edit"), task: tool("task"), subagent: tool("subagent") };
+const READS = [
+  { name: "read", input: { filePath: "a.txt" } },
+  { name: "read", input: { filePath: "b.txt" } },
+];
 
 async function main() {
-  const { post, proxy } = await startMockedProxy("parallel");
-  const tools = [toolSchema("read"), toolSchema("edit"), toolSchema("task"), toolSchema("subagent")];
-  const postTools = (messages: unknown[]) =>
-    post("parallel-tools", { stream: true, tools, messages });
+  const world = await createWorld("parallel");
+  const { opencode, claude } = world;
+  opencode.state.tools = TOOLS;
 
-  let registered: Record<string, RegisteredTool> = {};
-  let listed: Array<Record<string, any>> = [];
-  let quiet = false;
-  // The real CLI: tool_use blocks stream, message_stop closes the message,
-  // and only then are the calls started, microseconds to milliseconds apart.
-  let afterStop = false;
-  proxy.setClaudeQueryStarter(async (params) => {
-    registered = (params.mcpServers as any).opencode.instance._registeredTools;
-    listed = (await mcpHandlers(params).get("tools/list")!({ method: "tools/list", params: {} }, mcpExtra)).tools;
-    return mockHandle(
-      (async function* () {
-        yield { type: "system", subtype: "init", session_id: "par-sess" };
-        yield { type: "stream_event", event: { type: "message_start" } };
-        yield textDelta("reading two files");
-        if (afterStop) {
-          for (const _ of [0, 1]) {
-            yield { type: "stream_event", event: { type: "content_block_start", content_block: { type: "tool_use", name: "mcp__opencode__read" } } };
-          }
-          yield { type: "stream_event", event: { type: "message_stop" } };
-          const a = registered.read!.handler({ filePath: "a.txt" }, mcpExtra);
-          await sleep(5);
-          const b = registered.read!.handler({ filePath: "b.txt" }, mcpExtra);
-          const done = await Promise.all([a, b]);
-          yield textDelta(`GOT ${done.map((r) => r.content[0]!.text).join("+")}`);
-          yield { type: "result", is_error: false, result: "" };
-          return;
-        }
-        // The CLI starts read-only calls while the message still streams:
-        // the second one arrives after the first has already parked.
-        const first = registered.read!.handler({ filePath: "a.txt" }, mcpExtra);
-        // The CLI emits an `assistant` event per completed content block;
-        // it must not be taken for the end of the message.
-        yield { type: "assistant", message: { role: "assistant", content: [] } };
-        await sleep(150);
-        const second = registered.read!.handler({ filePath: "b.txt" }, mcpExtra);
-        await sleep(50);
-        // Without message_stop the quiet period has to release the park.
-        if (!quiet) yield { type: "stream_event", event: { type: "message_stop" } };
-        const results = await Promise.all([first, second]);
-        yield textDelta(`GOT ${results.map((r) => r.content[0]!.text).join("+")}`);
-        yield { type: "result", is_error: false, result: "" };
-      })(),
-    );
-  });
-
+  /** Claude reads two files in one message; OpenCode answers each read with the file's letter. */
   async function roundTrip() {
-    const userTurn = [{ role: "user", content: "read a.txt and b.txt" }];
-    const first = await readSse(await postTools(userTurn));
-    assert.equal(first.finish, "tool_calls");
-    assert.match(first.content, /reading two files/);
-    assert.equal(first.calls.length, 2, "both calls of the message in one response");
-    assert.deepEqual(first.calls.map((c) => JSON.parse(c.args).filePath), ["a.txt", "b.txt"]);
-    const second = await readSse(
-      await postTools([
-        ...userTurn,
-        {
-          role: "assistant",
-          content: first.content,
-          tool_calls: first.calls.map((c) => ({
-            id: c.id,
-            type: "function",
-            function: { name: c.name, arguments: c.args },
-          })),
-        },
-        { role: "tool", tool_call_id: first.calls[0]!.id, content: "A" },
-        { role: "tool", tool_call_id: first.calls[1]!.id, content: "B" },
-      ]),
-    );
-    assert.equal(second.finish, "stop");
-    assert.match(second.content, /GOT A\+B/);
+    const chat = opencode.newChat();
+    await opencode.say(chat, "read a.txt and b.txt");
+    claude.state.toolSteps = [READS];
+    const turn = await opencode.turn(chat, { toolOutput: (call) => (call.input.filePath === "a.txt" ? "A" : "B") });
+    assert.ok(turn.ok, `the turn answered: ${turn.requests.map((r) => r.status).join(",")}`);
+    const [first, second] = turn.requests;
+    assert.equal(turn.requests.length, 2, "one request with the calls, one with their results");
+    assert.equal(first!.reply!.finish, "tool_calls");
+    assert.equal(first!.reply!.toolCalls.length, 2, "both calls of the message in one response");
+    assert.deepEqual(first!.reply!.toolCalls.map((c) => c.input.filePath), ["a.txt", "b.txt"]);
+    assert.equal(second!.reply!.finish, "stop");
+    const results = claude.records(claude.queries.at(-1)!.name).filter((r) => r.toolUseResult).map((r) => JSON.stringify(r.toolUseResult));
+    assert.equal(results.length, 2);
+    assert.ok(results[0]!.includes('"A"') && results[1]!.includes('"B"'), `Claude got each file's result: ${results}`);
+    return first!;
   }
 
   try {
+    await opencode.startPlugin();
+    // The model streams slowly: the second call arrives after the first has already parked.
+    claude.state.blockPauseMs = 150;
     await roundTrip();
+    claude.state.blockPauseMs = 0;
+
     // Annotation: only read-only tools (and task) may run side by side, in
-    // the served tools/list as well as the SDK registration.
-    const byName = Object.fromEntries(listed.map((t) => [t.name, t]));
+    // the tools/list Claude Code read.
+    const params = claude.queries.at(-1)!.params as Record<string, any>;
+    const byName = Object.fromEntries((await listPluginTools(params)).map((t) => [t.name, t]));
     assert.equal(byName.read.annotations?.readOnlyHint, true);
     assert.equal(byName.task.annotations?.readOnlyHint, true);
     assert.equal(byName.subagent.annotations?.readOnlyHint, true);
     assert.equal(byName.edit.annotations, undefined);
     assert.equal(byName.edit._meta?.["anthropic/alwaysLoad"], true);
-    assert.equal(registered.read!.annotations?.readOnlyHint, true);
-    assert.equal(registered.edit!.annotations?.readOnlyHint, undefined);
 
-    // Calls started after message_stop still travel as one group.
-    afterStop = true;
-    const fast = Date.now();
-    await roundTrip();
-    assert.ok(Date.now() - fast < 2_000, "the announced group completes the hold, no quiet wait");
-    afterStop = false;
+    // A message that ends at once: message_stop completes the hold, no quiet wait. The quiet period is 3 s after the
+    // stream's last event, so a hold it released takes longer than that from the request; a loaded machine spends
+    // over 2 s on the query's start alone (the PR assembly's runs, 30.10.2026: 2160 and 2365 ms).
+    const fast = await roundTrip();
+    assert.ok(fast.doneAt - fast.sentAt < 3_000, `the group completes the hold at message_stop (${Math.round(fast.doneAt - fast.sentAt)} ms)`);
 
-    quiet = true;
-    const started = Date.now();
-    await roundTrip();
-    assert.ok(Date.now() - started >= 2_500, "quiet period released the park");
+    // A stream that stalls before message_stop: the quiet period releases the park.
+    claude.state.stallBeforeStop = new Promise((resolve) => setTimeout(resolve, 3_500));
+    const quiet = await roundTrip();
+    assert.ok(quiet.doneAt - quiet.sentAt >= 2_500, `quiet period released the park (${Math.round(quiet.doneAt - quiet.sentAt)} ms)`);
+
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
   console.log("ok — parallel tools regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

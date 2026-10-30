@@ -18,6 +18,7 @@
  * - OPENCODE_CLAUDE_RATE_LIMIT_STORE — override store path (tests)
  * - OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0 — disable the 429 gate
  */
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -51,16 +52,23 @@ const FALLBACK_BLOCK_MS = 10 * 60 * 1000;
  */
 const REJECTION_EVENT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
-function storePath(): string {
-  const override = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
-  if (override && override.trim()) return override.trim();
+/**
+ * A project mapped to another Claude account (`configDirs` option) keeps that
+ * account's limits in a store of its own, so one account's limit never
+ * blocks the other's turns.
+ */
+function storePath(configDir?: string): string {
+  const override = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE?.trim();
   const xdg = process.env.XDG_DATA_HOME;
   const base = xdg ? xdg : join(homedir(), ".local", "share");
-  return join(base, "opencode-claude", "rate-limit.json");
+  const path = override || join(base, "opencode-claude", "rate-limit.json");
+  if (!configDir) return path;
+  const account = createHash("sha256").update(configDir).digest("hex").slice(0, 12);
+  return `${path.replace(/\.json$/, "")}-${account}.json`;
 }
 
-function readState(): ClaudeRateLimitState | null {
-  const path = storePath();
+function readState(configDir?: string): ClaudeRateLimitState | null {
+  const path = storePath(configDir);
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -71,9 +79,9 @@ function readState(): ClaudeRateLimitState | null {
   }
 }
 
-function writeState(state: ClaudeRateLimitState): void {
+function writeState(state: ClaudeRateLimitState, configDir?: string): void {
   try {
-    const path = storePath();
+    const path = storePath(configDir);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(state, null, 2) + "\n", "utf8");
   } catch {
@@ -94,10 +102,13 @@ function asString(value: unknown): string | undefined {
  * on its own — the SDK reports "rejected" for turns that still complete
  * (overage pool rejection); only a hard error result confirms the limit.
  */
-export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null {
+export function recordRateLimitInfo(
+  info: unknown,
+  configDir?: string,
+): ClaudeRateLimitState | null {
   if (!info || typeof info !== "object") return null;
   const raw = info as Record<string, unknown>;
-  const prev = readState() ?? { limited: false, updatedAt: 0 };
+  const prev = readState(configDir) ?? { limited: false, updatedAt: 0 };
   const resetsAtSec = asNumber(raw.resetsAt);
   const next: ClaudeRateLimitState = {
     ...prev,
@@ -129,7 +140,7 @@ export function recordRateLimitInfo(info: unknown): ClaudeRateLimitState | null 
     next.limited = false;
     delete next.limitedUntil;
   }
-  writeState(next);
+  writeState(next, configDir);
   return next;
 }
 
@@ -307,9 +318,10 @@ export function parseResetTimeFromText(
  */
 export function recordRateLimitErrorText(
   text: string,
+  configDir?: string,
 ): ClaudeRateLimitState | null {
   if (!text || !isClaudeRateLimitText(text)) return null;
-  const stored: ClaudeRateLimitState = readState() ?? {
+  const stored: ClaudeRateLimitState = readState(configDir) ?? {
     limited: false,
     updatedAt: 0,
   };
@@ -342,7 +354,7 @@ export function recordRateLimitErrorText(
     message: text.trim().slice(0, 300),
     updatedAt: now,
   };
-  writeState(next);
+  writeState(next, configDir);
   return next;
 }
 
@@ -384,13 +396,16 @@ export type RateLimitSnapshot = {
 };
 
 /** Current snapshot; auto-clears an expired hard block (self-healing). */
-export function getRateLimitSnapshot(now: number = Date.now()): RateLimitSnapshot {
-  const state = readState();
+export function getRateLimitSnapshot(
+  now: number = Date.now(),
+  configDir?: string,
+): RateLimitSnapshot {
+  const state = readState(configDir);
   if (!state) return { limited: false };
   let { limited, limitedUntil } = state;
   if (limited && limitedUntil !== undefined && now >= limitedUntil) {
     limited = false;
-    writeState({ ...state, limited: false, updatedAt: now });
+    writeState({ ...state, limited: false, updatedAt: now }, configDir);
   }
   const resetsAt = state.resetsAt;
   const resetInSeconds =
@@ -433,13 +448,16 @@ export type RateLimitGate =
  * until the known/estimated reset. OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0
  * disables the gate entirely.
  */
-export function rateLimitGate(now: number = Date.now()): RateLimitGate {
+export function rateLimitGate(
+  now: number = Date.now(),
+  configDir?: string,
+): RateLimitGate {
   const flag = (process.env.OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL ?? "")
     .toLowerCase();
   if (flag === "0" || flag === "false" || flag === "off") {
     return { blocked: false };
   }
-  const snap = getRateLimitSnapshot(now);
+  const snap = getRateLimitSnapshot(now, configDir);
   if (!snap.limited) return { blocked: false };
   const until = snap.limitedUntil ?? snap.resetsAt;
   const retryAfterSeconds =

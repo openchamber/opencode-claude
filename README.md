@@ -79,9 +79,12 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 ## Using it
 
-**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. The context window of each model is the one your CLI runs it with: current models run at 1M, a model that reaches 1M only through Claude Code's `[1m]` variant (Opus 4.6) is listed twice, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` lists everything at 200K. Context limits and effort levels show up in OpenCode's model details.
 
-The plugin asks the CLI for these windows once and keeps the answers in `~/.local/share/opencode-claude/context-windows.json`. Asking costs a tiny request per model (Claude Code checks a model it switches to with a one-token call), so it asks again only when something changes: the CLI is updated, you sign in to another account or change plans, a setting that changes windows (`CLAUDE_CODE_DISABLE_1M_CONTEXT`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `DISABLE_COMPACT`) changes in the environment or in Claude Code's `settings.json`, or a new model appears. Otherwise it asks again after a day.
+**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. The context window of each model is the one your CLI runs it with: current models run at 1M, a model that reaches 1M only through Claude Code's `[1m]` variant (Opus 4.6) is listed twice, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` lists everything at 200K. Context limits and effort levels show up in OpenCode's model details. Configs and agents have to name a listed id, like `claude-code/claude-opus-5-5`: aliases such as `opus` and ids the picker doesn't show aren't models here.
+
+The plugin asks the CLI for these windows once and keeps the answers in `~/.local/share/opencode-claude/context-windows.json`. Asking costs a tiny request per model (Claude Code checks a model it switches to with a one-token call), so it asks again only when something changes: the CLI is updated, you sign in to another account or change plans, a setting that changes windows (`CLAUDE_CODE_DISABLE_1M_CONTEXT`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `DISABLE_COMPACT`) changes in the environment or in Claude Code's `settings.json`, or a new model appears. Otherwise it asks again after a day. When the CLI cannot answer for every model (it is signed out, offline, or the API fails), the list stays as it was and only a new model is added; the next refresh asks again.
+
+**Fast mode.** Models your CLI runs in [fast mode](https://code.claude.com/docs/en/fast-mode) get a second entry, like "Opus 5.5 Fast". Fast turns draw your plan limits faster. If your account can't use fast mode, the turn runs at normal speed and the log says why.
 
 **Effort.** Pick an effort variant (low, medium, high, xhigh, max) where the model supports it. While Claude thinks, a summary of its reasoning streams into the reasoning block.
 
@@ -92,6 +95,22 @@ The plugin asks the CLI for these windows once and keeps the answers in `~/.loca
 **Skills and agents.** OpenCode's skills (from `.claude`, `.agents` and `.opencode`) are listed for Claude and load through OpenCode's skill tool. A custom agent's own prompt, like a `writer` subagent's, is passed on as that agent's role.
 
 **Titles and summaries.** Session titles run as small one-off requests on Haiku, so they barely touch your limits. Compaction summaries are written by the chat's own model from its Claude session, so they cover the whole conversation with full tool results; most of it comes from the prompt cache. The session itself isn't changed.
+
+**Several Claude accounts.** Claude Code keeps one login per config directory. To run some projects on another account (say, a work plan), sign that account in with its own directory, then map project folders to it in the plugin options; the deepest matching folder wins and everything else stays on your default login:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-work claude auth login --claudeai
+```
+
+```json
+{ "plugins": [{ "package": "@openchamber/opencode-claude", "options": { "configDirs": { "~/work": "~/.claude-work" } } }] }
+```
+
+**Compacting earlier.** On 1M models OpenCode compacts a chat near 850K tokens, and every step of a long chat re-reads all of it. To compact sooner, set `compactAt` in the plugin options; Claude still has its full window for a turn that runs over:
+
+```json
+{ "plugins": [{ "package": "@openchamber/opencode-claude", "options": { "compactAt": 400000 } }] }
+```
 
 **Model fallback.** If Claude Code declines a request on one model and retries on another (for example Fable to Opus), you'll see a note in the reasoning, and the session switches to the model that's actually answering.
 
