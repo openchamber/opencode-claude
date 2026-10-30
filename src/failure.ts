@@ -10,9 +10,22 @@
  * - image            → 400 (the same image fails the same way on retry)
  * - billing          → 402 (Anthropic moved this usage off the plan; retrying
  *                      can't change that, only the user's account settings can)
+ * - account          → 403 (the subscription can't serve Claude Code: payment
+ *                      past due, account on hold, access disabled by the
+ *                      organization; only the user can fix it)
+ * - request_too_large → 413 (the API's size limit, almost always by the
+ *                      images and documents the transcript gathered; a chat
+ *                      turn answers it as context_overflow, see
+ *                      failureResponse in proxy.ts)
  * - refusal          → 400 refusal (Claude declined; a retry is refused too)
  * - overloaded       → 503 overloaded_error (retryable; OpenCode backs off)
  * - unknown          → 500
+ *
+ * The kind comes from what the SDK states outright when it does
+ * (statedFailureKind), else from the text: Claude Code words one failure
+ * differently from case to case (the same `oauth_org_not_allowed` read
+ * "a payment is past due" live and "your organization has disabled Claude
+ * subscription access" against a stub).
  */
 import { isClaudeRateLimitText } from "./rate-limit.js";
 
@@ -24,6 +37,8 @@ export type ClaudeFailureKind =
   | "refusal"
   | "overloaded"
   | "billing"
+  | "account"
+  | "request_too_large"
   | "unknown";
 
 const AUTH_FAILURE_PATTERN =
@@ -40,10 +55,12 @@ const CONTEXT_OVERFLOW_PATTERN =
 /**
  * Anthropic refusing to count this usage against the plan ("Third-party
  * apps now draw from extra usage, not plan limits"), or extra usage being
- * off or exhausted. A billing decision on the account, not a transient error.
+ * off or exhausted, or a 402 the CLI passed on without a code of its own
+ * ("API Error: 402 …"). A billing decision on the account, not a transient
+ * error.
  */
 const BILLING_FAILURE_PATTERN =
-  /draw from extra usage|extra usage (?:is )?(?:not enabled|disabled|required|exhausted|limit)|out of extra usage|credit balance is too low/i;
+  /draw from extra usage|extra usage (?:is )?(?:not enabled|disabled|required|exhausted|limit)|out of extra usage|credit balance is too low|\bAPI Error: 402\b/i;
 
 const IMAGE_FAILURE_PATTERN =
   /could not process image|\bimage\b[^\n]*?\b(?:exceeds?|too large|could not be processed|is not valid|invalid|unsupported|not supported|dimensions)\b/i;
@@ -66,6 +83,41 @@ export function classifyClaudeFailure(text: string): ClaudeFailureKind {
   return "unknown";
 }
 
+/**
+ * The kind the SDK states for a failed model call, or null when it states
+ * none and the text has to tell. A synthetic assistant record names it in
+ * `error` (SDKAssistantMessageError); an error result carries the refused
+ * call's HTTP status in `api_error_status`. General codes (`invalid_request`,
+ * `server_error`, `unknown`) and other statuses say nothing the text does
+ * not: "Prompt is too long" under `invalid_request` is a context overflow.
+ * An overload is `server_error` with status 529 (Claude Code 2.1.300 and
+ * later name `overloaded` only in the `api_retry` event; the 2.1.300 probe).
+ */
+export function statedFailureKind(event: Record<string, unknown>): ClaudeFailureKind | null {
+  switch (event.error) {
+    case "rate_limit":
+      return "rate_limit";
+    case "authentication_failed":
+    case "cloud_credential_error":
+      return "auth";
+    case "billing_error":
+      return "billing";
+    case "oauth_org_not_allowed":
+    case "account_on_hold":
+    case "verification_required":
+      return "account";
+  }
+  if (event.type === "result" && event.is_error) {
+    if (event.api_error_status === 401) return "auth";
+    if (event.api_error_status === 402) return "billing";
+    // The API's 413: the request outgrew its size limit, almost always by
+    // the images and documents the transcript gathered ("Request too large
+    // (max 32MB). Accumulated images and attachments …").
+    if (event.api_error_status === 413) return "request_too_large";
+  }
+  return null;
+}
+
 export function failureStatusFor(kind: ClaudeFailureKind): number {
   switch (kind) {
     case "auth":
@@ -80,6 +132,10 @@ export function failureStatusFor(kind: ClaudeFailureKind): number {
       return 503;
     case "billing":
       return 402;
+    case "account":
+      return 403;
+    case "request_too_large":
+      return 413;
     default:
       return 500;
   }
@@ -97,6 +153,10 @@ export function failureTypeFor(kind: ClaudeFailureKind): string {
       return "invalid_request_error";
     case "billing":
       return "billing_error";
+    case "account":
+      return "permission_error";
+    case "request_too_large":
+      return "invalid_request_error";
     default:
       return "server_error";
   }
@@ -115,6 +175,14 @@ export function failureCodeFor(kind: ClaudeFailureKind): string {
       return "claude_image_error";
     case "billing":
       return "claude_extra_usage";
+    case "account":
+      return "claude_account";
+    // Without the words `request_too_large`, which OpenCode reads anywhere in
+    // the reply as an overflow and would cut a summary's history instead of
+    // resending it without media (packages/ai/src/provider-error.ts; the
+    // status 413 makes it payload-too-large, compaction.ts deliver).
+    case "request_too_large":
+      return "claude_payload_too_large";
     // OpenCode reads this code as a content-policy block, not a retry.
     case "refusal":
       return "refusal";

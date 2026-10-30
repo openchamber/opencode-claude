@@ -30,6 +30,7 @@ import {
 import { buildClaudeCodeChildEnv, MCP_DESCRIPTION_LIMIT } from "./auth-env.js";
 import {
   classifyClaudeFailure,
+  type ClaudeFailureKind,
   failureCodeFor,
   failureHintFor,
   failureStatusFor,
@@ -37,6 +38,7 @@ import {
   metaFailureText,
   overloadedResultText,
   resultErrorText,
+  statedFailureKind,
   thrownErrorText,
 } from "./failure.js";
 import {
@@ -989,17 +991,27 @@ async function handleChatCompletions(
         conversationKey: existing.conversationKey,
         resolved,
       });
-      return stream
-        ? streamOpenAIResponse(
-            existing.continueStream(),
-            body.model || model,
-            existing,
-          )
-        : collectTurnResponse(
-            existing.continueStream(),
-            body.model || model,
-            existing,
-          );
+      // A continuation is this request's attempt against Claude: if it meets
+      // the plan limit, OpenCode's retry of the same request stays blocked
+      // by the gate instead of starting the turn again.
+      rememberGateCheck(`${conversationKey}:${messages.length}`);
+      if (!stream) {
+        return collectTurnResponse(existing.continueStream(), body.model || model, existing);
+      }
+      // The call after the tool results can fail before any content (the
+      // subscription refused): that must be a real HTTP error, as on the
+      // turn's first response, not a stream whose answer is the error text.
+      const probe = await probeTurnEvents(existing.continueStream());
+      if (probe.status === "failed") {
+        return failureResponse(
+          probe.errorText,
+          existing.conversationKey,
+          existing.metaKind,
+          existing.configDir,
+          probe.kind,
+        );
+      }
+      return streamOpenAIResponse(probe.replay, body.model || model, existing);
     }
     // Still parked — do not start a parallel Claude turn (OpenCode may retry
     // or send a follow-up before tool results arrive). Re-emit pending calls.
@@ -1910,7 +1922,7 @@ async function startNewTurn(input: {
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
-      return failureResponse(probe.errorText, conversationKey, metaKind, configDir);
+      return failureResponse(probe.errorText, conversationKey, metaKind, configDir, probe.kind);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
@@ -2308,21 +2320,27 @@ async function collectTurnResponse(
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
   let errorText: string | null = null;
+  let errorKind: ClaudeFailureKind | null = null;
   let sawContent = false;
   const toolCalls: ParkedToolCall[] = [];
 
-  const noteError = (text: string) => {
+  const noteError = (text: string, stated: ClaudeFailureKind | null = null) => {
     const norm = normalizeClaudeErrorText(text);
-    if (!norm || norm === lastErrorNorm) return;
+    if (!norm) return;
+    // A later report of the same failure can still name its kind: the
+    // error result's HTTP status after the synthetic record's general code.
+    if (norm === lastErrorNorm) {
+      if (errorKind === "unknown" && stated) errorKind = stated;
+      return;
+    }
     lastErrorNorm = norm;
-    // The limit is the real cause; a later, vaguer wording of the same
-    // failure (the result event) must not downgrade the 429 to a 500.
-    if (
-      !errorText ||
-      classifyClaudeFailure(errorText) !== "rate_limit" ||
-      classifyClaudeFailure(text) === "rate_limit"
-    ) {
+    // The first failure of a known kind is the cause; a later, vaguer
+    // wording of the same failure (the error result after the synthetic
+    // record, the iterator's throw) must not turn a 429 or a refused
+    // account into a 500.
+    if (!errorText || errorKind === "unknown") {
       errorText = text;
+      errorKind = stated ?? classifyClaudeFailure(text);
     }
     content += `\n\n[claude-code error] ${text}`;
   };
@@ -2347,7 +2365,7 @@ async function collectTurnResponse(
         // keep one copy, and keep any usage that came with it.
         if (mapped.usage) resultUsage = mapped.usage;
         forgetDeadSession(bridge.conversationKey, mapped.text);
-        noteError(mapped.text);
+        noteError(mapped.text, mapped.stated);
       }
     }
   } catch (err) {
@@ -2366,7 +2384,7 @@ async function collectTurnResponse(
   // produced partial work first, preserve the real 429 so OpenCode starts its
   // retry countdown instead of treating the run as a successful answer, and
   // the real context overflow so OpenCode compacts instead.
-  const failureKind = errorText ? classifyClaudeFailure(errorText) : null;
+  const failureKind = errorKind;
   if (
     errorText &&
     (!sawContent || failureKind === "rate_limit" || failureKind === "context_overflow")
@@ -2378,6 +2396,7 @@ async function collectTurnResponse(
       bridge.conversationKey,
       bridge.metaKind,
       bridge.configDir,
+      mapState.refusalText ? null : errorKind,
     );
   }
 
@@ -2427,7 +2446,7 @@ async function collectTurnResponse(
  */
 type TurnProbe =
   | { status: "alive"; replay: AsyncIterable<unknown> }
-  | { status: "failed"; errorText: string };
+  | { status: "failed"; errorText: string; kind: ClaudeFailureKind | null };
 
 function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   if (!event || typeof event !== "object") return "neutral";
@@ -2439,8 +2458,12 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   // buffered and replayed once content arrives. OpenCode sets no response
   // header timeout by default, so holding the head meanwhile is safe, and
   // each retry resets the stall watchdog (plus the announced delay).
+  // An assistant record is neutral too: the proxy forwards only its usage,
+  // its text and tool calls come as stream events and parks. In a
+  // continuation it can be a record of the call before the tool, followed
+  // by the failure of the next call.
   if (e.type === "assistant") {
-    return assistantErrorText(e) ? "error" : "content";
+    return assistantErrorText(e) ? "error" : "neutral";
   }
   if (e.type === "result") {
     // Nothing reached the probe yet, so a 5xx "success" produced nothing.
@@ -2505,6 +2528,24 @@ async function* chainBuffered(
   }
 }
 
+/**
+ * The kind the error result after a synthetic error record states, read on
+ * to that result (it follows at once); null when none comes or it states
+ * none. The iterator's throw after the result ends the reading.
+ */
+async function statedKindOfResult(iterator: AsyncIterator<unknown>): Promise<ClaudeFailureKind | null> {
+  try {
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) return null;
+      const event = next.value as Record<string, unknown> | null;
+      if (event?.type === "result") return statedFailureKind(event);
+    }
+  } catch {
+    return null;
+  }
+}
+
 async function probeTurnEvents(
   events: AsyncIterable<unknown>,
 ): Promise<TurnProbe> {
@@ -2512,13 +2553,13 @@ async function probeTurnEvents(
   const buffered: unknown[] = [];
   // A refusal without fallback, when the turn then fails, is the cause.
   let refusal: string | null = null;
-  const fail = async (errorText: string): Promise<TurnProbe> => {
+  const fail = async (errorText: string, stated: ClaudeFailureKind | null = null): Promise<TurnProbe> => {
     try {
       await iterator.return?.(undefined as never);
     } catch {
       // ignore
     }
-    return { status: "failed", errorText: refusal ?? errorText };
+    return refusal ? { status: "failed", errorText: refusal, kind: null } : { status: "failed", errorText, kind: stated };
   };
   try {
     while (true) {
@@ -2530,7 +2571,11 @@ async function probeTurnEvents(
       }
       const kind = rawProbeKind(next.value);
       if (kind === "error") {
-        return fail(rawErrorText(next.value));
+        // A synthetic record with a general code (`invalid_request`) says
+        // no kind; the error result right after it names the refused
+        // call's HTTP status (statedFailureKind).
+        const stated = statedFailureKind(raw!) ?? (raw?.type === "result" ? null : await statedKindOfResult(iterator));
+        return fail(rawErrorText(next.value), stated);
       }
       buffered.push(next.value);
       if (kind === "content") {
@@ -2588,11 +2633,17 @@ function failureResponse(
   conversationKey: string,
   metaKind?: string | null,
   configDir?: string,
+  statedKind?: ClaudeFailureKind | null,
 ): Response {
   const errorText = metaFailureText(rawErrorText, metaKind);
   recordRateLimitErrorText(errorText, configDir);
   forgetDeadSession(conversationKey, errorText);
-  const kind = classifyClaudeFailure(errorText);
+  // A chat turn that outgrew the API's size limit is answered as an
+  // overflow: OpenCode compacts the chat, and the turn after it starts a
+  // transcript without the images that grew it. A summary keeps the 413:
+  // OpenCode then resends it as text without media.
+  const failed = statedKind ?? classifyClaudeFailure(errorText);
+  const kind = failed === "request_too_large" && !metaKind ? "context_overflow" : failed;
   log.warn("[opencode-claude] turn failed fast", {
     kind,
     conversationKey,
@@ -2840,7 +2891,7 @@ function streamOpenAIResponse(
             forgetDeadSession(bridge.conversationKey, mapped.text);
             log.warn("[opencode-claude] mid-stream turn error", {
               conversationKey: bridge.conversationKey,
-              kind: classifyClaudeFailure(mapped.text),
+              kind: mapped.stated ?? classifyClaudeFailure(mapped.text),
               message: mapped.text.slice(0, 300),
             });
             sendError(mapped.text);
@@ -2919,7 +2970,7 @@ type MappedEvent =
   | { kind: "park"; tools: ParkedToolCall[] }
   | { kind: "usage"; usage: OpenAIUsage }
   | { kind: "usage-delta"; usage: OpenAIUsage; messageId: string | null }
-  | { kind: "error"; text: string; usage?: OpenAIUsage | null }
+  | { kind: "error"; text: string; usage?: OpenAIUsage | null; stated?: ClaudeFailureKind | null }
   | { kind: "ignore" };
 
 /** Text carried by Claude's synthetic assistant API-error message. */
@@ -3257,7 +3308,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
             : ""
         }`;
       }
-      return { kind: "error", text: note, usage };
+      return { kind: "error", text: note, usage, stated: statedFailureKind(e) };
     }
     if (usage) {
       return {
@@ -3294,7 +3345,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
           }`;
         }
       }
-      return { kind: "error", text: note, usage };
+      return { kind: "error", text: note, usage, stated: statedFailureKind(e) };
     }
     if (usage) return { kind: "usage", usage };
     return { kind: "ignore" };
