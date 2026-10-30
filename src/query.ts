@@ -313,8 +313,6 @@ export type StartClaudeQueryParams = {
   pathToClaudeCodeExecutable?: string;
   /** Required when permissionMode is bypassPermissions. */
   allowDangerouslySkipPermissions?: boolean;
-  /** Auto-compact long conversations (Claude Code default). */
-  autoCompactEnabled?: boolean;
   /** Stop utility queries such as title generation after one model turn. */
   maxTurns?: number;
   /** false keeps one-shot utility turns out of ~/.claude/projects history. */
@@ -405,13 +403,18 @@ export async function startClaudeQuery(
     options.thinking = { type: "adaptive" };
   }
 
-  if (params.autoCompactEnabled !== false) {
-    options.autoCompactEnabled = true;
-  }
-
   if (params.persistSession === false) options.persistSession = false;
 
   const settings: Record<string, unknown> = {};
+  // OpenCode compacts the chat, so Claude Code's own auto-compaction stays
+  // off. Two compactors with their own thresholds would work on one session:
+  // a compaction boundary the CLI writes into the transcript makes every
+  // resume before it impossible, and OpenCode never sees that summary. An
+  // overflow still ends well: the CLI's "Prompt is too long" comes back to
+  // OpenCode as a context overflow (failure.ts), which compacts and retries.
+  // The switch is the `autoCompactEnabled` setting; a top-level option of
+  // that name is unknown to the SDK and changed nothing.
+  settings.autoCompactEnabled = false;
   if (params.isolateMcp === true) {
     options.strictMcpConfig = true;
     settings.disableClaudeAiConnectors = true;

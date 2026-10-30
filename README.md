@@ -93,6 +93,8 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 **Titles and summaries.** Session titles run as small one-off requests on Haiku, so they barely touch your limits. Compaction summaries are written by the chat's own model from its Claude session, so they cover the whole conversation with full tool results; most of it comes from the prompt cache. The session itself isn't changed.
 
+**Compaction.** OpenCode compacts the chat; Claude Code's own auto-compaction is off for these sessions, so one summary covers the conversation and the Claude session has no compaction boundary of its own. If a request still overflows, Claude Code's error reaches OpenCode as a context overflow, and OpenCode compacts and retries.
+
 **Several Claude accounts.** Claude Code keeps one login per config directory. To run some projects on another account (say, a work plan), sign that account in with its own directory, then map project folders to it in the plugin options; the deepest matching folder wins and everything else stays on your default login:
 
 ```bash

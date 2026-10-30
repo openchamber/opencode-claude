@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Only OpenCode compacts the chat**: Claude Code's own auto-compaction was
+  meant to be off for summaries and on for chat turns, but the plugin set it
+  through an option the Agent SDK does not have, so the CLI compacted on its
+  own at its own threshold, on top of OpenCode's compaction. A compaction
+  boundary the CLI writes into the transcript blocks every resume before it,
+  so a revert past it had to transfer the whole history as text. The CLI's
+  auto-compaction is now off for every request through the `autoCompactEnabled`
+  setting; an overflow still comes back to OpenCode as a context overflow,
+  which compacts and retries.
+
 ## 1.7.0 - 2026-10-30
 
 - **Background compaction works with Claude**: with OpenCode's

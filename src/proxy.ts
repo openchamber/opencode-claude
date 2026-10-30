@@ -1630,7 +1630,6 @@ async function startNewTurn(input: {
           effort: summaryResume.profile?.effort ?? selection.effort,
           env,
           mcpServers,
-          autoCompactEnabled: false,
           // A tool call is refused (dontAsk with nothing allowed), so one
           // extra turn lets Claude write the summary after it.
           maxTurns: 2,
@@ -1656,7 +1655,6 @@ async function startNewTurn(input: {
     fastMode,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
-    autoCompactEnabled: !isMetaRequest,
     maxTurns: isMetaRequest ? 1 : undefined,
     // Titles and summaries are never resumed; saving them would fill the
     // user's Claude Code history with "create a title" sessions.
