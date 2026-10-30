@@ -23,6 +23,7 @@ import {
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
 import { installClaudeCli } from "./cli-install.js";
+import { startClaudeCliAutoUpdate } from "./cli-update.js";
 import {
   startClaudeCliLogin,
   submitClaudeCliLoginCode,
@@ -35,12 +36,12 @@ import {
 import {
   buildEffortVariants,
   getClaudeModels,
+  modelsAfterIncompleteRefresh,
   modelsFromSdk,
   setDiscoveredModels,
   type ClaudeModel,
-  type SdkModelRow,
 } from "./models.js";
-import { listClaudeSupportedModels } from "./query.js";
+import { listClaudeSupportedModels } from "./model-discovery.js";
 import { closeSessionBridges } from "./bridge-pool.js";
 import {
   getClaudeProxyBaseUrl,
@@ -138,17 +139,55 @@ export function buildProviderInfo(baseURL: string): ProviderInfo {
 // OpenCode starts a plugin instance per location and recycles idle ones, so
 // setup runs many times a day; the account's model list rarely changes.
 const MODEL_REFRESH_INTERVAL_MS = 10 * 60_000;
-let lastModelRefresh = 0;
 
-async function refreshModelCatalog(reload: () => Promise<void>) {
+/**
+ * Kept on globalThis, like the model list (models.ts) and the bridge runtime
+ * (bridge-pool.ts). OpenCode gives each project folder its own copy of the
+ * plugin's modules, and a new copy on each reload of a changed plugin; the
+ * list is one for the server, so one refresh serves every folder:
+ * - lastModelRefresh: a module-level time would start over in each copy,
+ *   and each would ask the CLI again;
+ * - providerReloads: each folder's provider reload, so a changed list
+ *   reaches every folder, not only the one whose setup ran the refresh.
+ * The version in the key changes with this shape.
+ */
+const MODEL_REFRESH_KEY = Symbol.for("@openchamber/opencode-claude/model-refresh/v2");
+
+type ModelRefreshRuntime = {
+  lastModelRefresh: number;
+  providerReloads: Set<() => Promise<void>>;
+};
+
+export const modelRefreshRuntime: ModelRefreshRuntime = ((globalThis as Record<symbol, unknown>)[
+  MODEL_REFRESH_KEY
+] ??= { lastModelRefresh: 0, providerReloads: new Set() }) as ModelRefreshRuntime;
+
+/** Reload the provider in every folder, so each one lists the new models. */
+async function reloadProviderEverywhere(): Promise<void> {
+  await Promise.all(
+    [...modelRefreshRuntime.providerReloads].map((reload) =>
+      reload().catch((err: unknown) =>
+        log.warn(
+          "[opencode-claude] could not reload the model list in a project folder",
+          err instanceof Error ? err.message : err,
+        ),
+      ),
+    ),
+  );
+}
+
+export async function refreshModelCatalog(): Promise<void> {
   const now = Date.now();
-  if (now - lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
-  lastModelRefresh = now;
+  if (now - modelRefreshRuntime.lastModelRefresh < MODEL_REFRESH_INTERVAL_MS) return;
+  modelRefreshRuntime.lastModelRefresh = now;
   try {
-    const rows = await listClaudeSupportedModels();
-    if (!rows?.length) return;
-    if (setDiscoveredModels(modelsFromSdk(rows as SdkModelRow[]))) {
-      await reload();
+    const found = await listClaudeSupportedModels();
+    if (!found?.rows.length) return;
+    // A window the CLI could not answer this time keeps its last answer.
+    const fromCli = modelsFromSdk(found.rows, found.windows, found.lastAnswers);
+    const models = found.complete ? fromCli : modelsAfterIncompleteRefresh(fromCli);
+    if (setDiscoveredModels(models)) {
+      await reloadProviderEverywhere();
     }
   } catch (err) {
     log.warn(
@@ -246,6 +285,9 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
         ),
       });
     });
+    // A refresh from any folder reloads this one too (reloadProviderEverywhere).
+    const reloadProvider = () => ctx.provider.reload();
+    modelRefreshRuntime.providerReloads.add(reloadProvider);
 
     await ctx.session.hook(
       "model.request",
@@ -278,7 +320,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     // Refresh the catalog from the CLI in the background; the cached or
     // fallback list serves until it lands.
     if (cliPresent) {
-      void refreshModelCatalog(() => ctx.provider.reload());
+      void refreshModelCatalog();
     }
 
     await ctx.integration.transform((integrations) => {
@@ -291,6 +333,14 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     });
 
     const stopWatching = watchSessionInterrupts(ctx);
+    // Claude Code's own updater never runs under the Agent SDK (see
+    // cli-update.ts). Started even without a CLI: the install action may
+    // add one later, and the check skips until it is there. New models
+    // arrive with the catalog read at the next plugin load. Started here,
+    // after the awaited host calls, so a failure above leaves no timer.
+    const stopCliAutoUpdate = startClaudeCliAutoUpdate({
+      options: ctx.options as { cliAutoUpdate?: unknown } | undefined,
+    });
     // Claude Code already moved the session to its fallback model; move the
     // OpenCode session too so the picker and the next turns match it.
     setModelFallbackHandler((sessionID, modelId, variant) => {
@@ -308,6 +358,8 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
     });
 
     return async () => {
+      modelRefreshRuntime.providerReloads.delete(reloadProvider);
+      stopCliAutoUpdate();
       stopWatching();
       await releaseProxy();
     };
@@ -430,11 +482,16 @@ async function probeCliPresence(): Promise<boolean> {
   if (cliPresentAt && Date.now() - cliPresentAt < CLI_PRESENT_TTL_MS) return true;
   if (cliProbe) return cliProbe;
   const probe = (async () => {
+    // The cap is cleared once the probe settles: a timer left pending keeps a
+    // short-lived host process (a test, a script) alive for its 3 seconds.
+    let cap: ReturnType<typeof setTimeout> | undefined;
     try {
       const detection = await Promise.race([
         detectClaudeCode(),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
-      ]);
+        new Promise<null>((resolve) => {
+          cap = setTimeout(() => resolve(null), 3000);
+        }),
+      ]).finally(() => clearTimeout(cap));
       const present = detection ? detection.status !== "missing-cli" : true;
       // A missing CLI is not remembered, so a fresh install shows at once.
       if (detection && present) cliPresentAt = Date.now();

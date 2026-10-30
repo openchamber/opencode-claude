@@ -906,30 +906,26 @@ export type ConversationHistoryMessage = {
   name?: string;
 };
 
-/** Default history budget — generous on purpose ("keep it big"). */
-const DEFAULT_HISTORY_MAX_CHARS = 400_000;
-const TOOL_RESULT_MAX_CHARS = 1_000;
-const ATTACHMENT_NOTE = "[attachment(s) omitted from transferred history]";
+/**
+ * The history as Claude gets it: text, or text with the images and
+ * documents of the chat in their places. It goes whole: OpenCode already
+ * fit the request to the model (and replaced old images over its budget),
+ * and a history that still does not fit comes back as "Prompt is too long",
+ * which OpenCode compacts on.
+ */
+export type ConversationTranscript = string | AnthropicContentBlock[];
 
-export function historyMaxChars(): number {
-  const raw = process.env.OPENCODE_CLAUDE_HISTORY_MAX_CHARS;
-  const parsed = raw ? Number(raw) : NaN;
-  return Number.isInteger(parsed) && parsed >= 0
-    ? parsed
-    : DEFAULT_HISTORY_MAX_CHARS;
-}
+/** A user message's attachment that could not be turned into a Claude block. */
+const UNRELAYABLE_ATTACHMENT = "[an attachment that could not be passed on]";
 
-function truncateMiddle(text: string, max: number): string {
-  if (text.length <= max) return text;
-  const head = text.slice(0, Math.floor(max / 2));
-  const tail = text.slice(text.length - Math.floor(max / 2));
-  return `${head}\n… [${text.length - max} chars omitted] …\n${tail}`;
-}
+/** One message of the history: its text lines, and its files as blocks where they stand. */
+type HistoryPiece = string | AnthropicContentBlock;
 
 function serializeHistoryMessage(
   msg: ConversationHistoryMessage,
   toolNames: ReadonlyMap<string, string>,
-): string | null {
+  previous: ConversationHistoryMessage | undefined,
+): HistoryPiece[] | null {
   if (!msg || typeof msg !== "object") return null;
   const role = msg.role;
   // System prompts are OpenCode-internal and huge; the Claude Code preset
@@ -937,10 +933,22 @@ function serializeHistoryMessage(
   if (role === "system") return null;
 
   if (role === "user") {
+    // OpenCode puts the files of a step's tool results into one user message
+    // after them, without saying which result each came from: they go as
+    // one group after the results.
+    if (isSyntheticToolMediaMessage(msg, previous)) {
+      const files = openaiContentToAnthropicBlocks(msg.content).filter((block) => block.type !== "text");
+      return files.length > 0 ? ["Files the tools above returned:", ...files] : null;
+    }
     const text = extractTextContent(msg.content).trim();
     const hasAttach = contentHasAttachments(msg.content);
     if (!text && !hasAttach) return null;
-    return `User:\n${text}${hasAttach ? `\n${ATTACHMENT_NOTE}` : ""}`.trim();
+    if (!hasAttach) return [`User:\n${text}`];
+    const blocks = openaiContentToAnthropicBlocks(msg.content);
+    const pieces: HistoryPiece[] = ["User:"];
+    for (const block of blocks) pieces.push(block.type === "text" ? block.text : block);
+    if (!blocks.some((block) => block.type !== "text")) pieces.push(UNRELAYABLE_ATTACHMENT);
+    return pieces;
   }
 
   if (role === "assistant") {
@@ -952,7 +960,7 @@ function serializeHistoryMessage(
       if (name) parts.push(`[called tool: ${name}]`);
     }
     if (parts.length === 0) return null;
-    return `Assistant:\n${parts.join("\n")}`;
+    return [`Assistant:\n${parts.join("\n")}`];
   }
 
   if (role === "tool") {
@@ -965,7 +973,7 @@ function serializeHistoryMessage(
       (typeof msg.tool_call_id === "string" &&
         (toolNames.get(msg.tool_call_id) || msg.tool_call_id)) ||
       "tool";
-    return `Tool result (${label}):\n${truncateMiddle(text, TOOL_RESULT_MAX_CHARS)}`;
+    return [`Tool result (${label}):\n${text}`];
   }
 
   return null;
@@ -992,59 +1000,58 @@ export function priorMessagesOf(
 }
 
 /**
- * Serialize prior conversation into a compact transcript, keeping the NEWEST
- * messages within the char budget (older turns are dropped first).
+ * Serialize prior conversation into a transcript, whole: messages apart by a
+ * blank line, a message's lines by a newline, its files where they stand.
+ * Text only while the history has no files.
  */
 export function buildConversationTranscript(
   messages: ConversationHistoryMessage[],
-  maxChars: number = historyMaxChars(),
-): string {
-  if (maxChars <= 0) return "";
+): ConversationTranscript {
   const toolNames = new Map<string, string>();
   for (const msg of messages) {
     for (const call of msg?.tool_calls ?? []) {
       if (call?.id && call.function?.name) toolNames.set(call.id, call.function.name);
     }
   }
-  const serialized: string[] = [];
-  for (const msg of messages) {
-    const line = serializeHistoryMessage(msg, toolNames);
-    if (line) serialized.push(line);
-  }
-  if (serialized.length === 0) return "";
-
-  const kept: string[] = [];
-  let total = 0;
-  let omitted = 0;
-  for (let i = serialized.length - 1; i >= 0; i--) {
-    const entry = serialized[i];
-    if (total + entry.length > maxChars) {
-      omitted = i + 1;
-      break;
+  const blocks: AnthropicContentBlock[] = [];
+  let text = "";
+  // Whether the next line goes after a blank line (a new message) or a newline.
+  let separator = "";
+  messages.forEach((msg, index) => {
+    const pieces = serializeHistoryMessage(msg, toolNames, messages[index - 1]);
+    if (!pieces) return;
+    if (blocks.length > 0 || text) separator = "\n\n";
+    for (const piece of pieces) {
+      if (typeof piece === "string") {
+        text += separator + piece;
+        separator = "\n";
+        continue;
+      }
+      // No empty text block between two files: the API refuses one.
+      if (text + separator) blocks.push({ type: "text", text: text + separator });
+      blocks.push(piece);
+      text = "";
+      separator = "";
     }
-    kept.unshift(entry);
-    total += entry.length;
-  }
-  const header = omitted > 0 ? `[${omitted} earlier message(s) omitted]\n\n` : "";
-  return header + kept.join("\n\n");
+  });
+  if (blocks.length === 0) return text;
+  if (text) blocks.push({ type: "text", text });
+  return blocks;
 }
 
-/**
- * Prepend a transferred-history block to a prompt. Text prompts get a plain
- * prefix; multimodal prompts get an extra leading text block so attachments
- * still reach Claude.
- *
- * `missed` marks a transcript of only the turns a resumed session never saw
- * (another model answered them, or they failed before Claude ran).
- */
-export function withConversationContext(
-  prompt: string | SdkUserPrompt,
-  transcript: string,
-  missed = false,
-): string | SdkUserPrompt {
-  const body = transcript.trim();
-  if (!body) return prompt;
-  const intro = missed
+/** The text of a transcript, files left out: for the journal's length. */
+export function transcriptText(transcript: ConversationTranscript): string {
+  if (typeof transcript === "string") return transcript;
+  return transcript.map((block) => (block.type === "text" ? block.text : "")).join("");
+}
+
+/** How many images and documents a transcript carries. */
+export function transcriptFiles(transcript: ConversationTranscript): number {
+  return typeof transcript === "string" ? 0 : transcript.filter((block) => block.type !== "text").length;
+}
+
+function historyIntro(missed: boolean): string {
+  return missed
     ? "These messages were added to this chat after your last turn, without you " +
       "(for example, the user switched to another model for them). Treat them as part " +
       "of the conversation — do not re-do completed work — and respond to the user's " +
@@ -1053,11 +1060,70 @@ export function withConversationContext(
       "Claude session could not be resumed. Treat it as established context — do not " +
       "re-do completed work — and respond to the user's latest message, which follows " +
       "the history.\n\n";
+}
+
+const HISTORY_END = "\n</conversation_history>\n\nLatest user message:\n";
+
+/**
+ * withConversationContext for a history with files: one prompt of blocks,
+ * the history's text and files in order, then the latest user message.
+ */
+function withFilesInContext(
+  prompt: string | SdkUserPrompt,
+  transcript: AnthropicContentBlock[],
+  missed: boolean,
+): SdkUserPrompt {
+  let latest: AnthropicContentBlock[];
+  if (typeof prompt === "string") latest = [{ type: "text", text: prompt }];
+  else if (typeof prompt.message.content === "string") latest = [{ type: "text", text: prompt.message.content }];
+  else latest = prompt.message.content;
+  const content = joinTextBlocks([
+    { type: "text", text: "<conversation_history>\n" + historyIntro(missed) },
+    ...transcript,
+    { type: "text", text: HISTORY_END },
+    ...latest,
+  ]);
+  if (typeof prompt === "string") {
+    return { type: "user", message: { role: "user", content }, parent_tool_use_id: null };
+  }
+  return { ...prompt, message: { role: "user", content } };
+}
+
+/** Adjacent text blocks as one, so the text reads as it does in a text prompt. */
+function joinTextBlocks(blocks: AnthropicContentBlock[]): AnthropicContentBlock[] {
+  const joined: AnthropicContentBlock[] = [];
+  for (const block of blocks) {
+    const last = joined[joined.length - 1];
+    if (block.type === "text" && last?.type === "text") {
+      joined[joined.length - 1] = { type: "text", text: last.text + block.text };
+      continue;
+    }
+    joined.push(block);
+  }
+  return joined;
+}
+
+/**
+ * Prepend a transferred-history block to a prompt. Text prompts get a plain
+ * prefix; multimodal prompts get an extra leading text block so attachments
+ * still reach Claude. A history with files makes one prompt of blocks.
+ *
+ * `missed` marks a transcript of only the turns a resumed session never saw
+ * (another model answered them, or they failed before Claude ran).
+ */
+export function withConversationContext(
+  prompt: string | SdkUserPrompt,
+  transcript: ConversationTranscript,
+  missed = false,
+): string | SdkUserPrompt {
+  if (typeof transcript !== "string") return withFilesInContext(prompt, transcript, missed);
+  const body = transcript.trim();
+  if (!body) return prompt;
   const prefix =
     "<conversation_history>\n" +
-    intro +
+    historyIntro(missed) +
     body +
-    "\n</conversation_history>\n\nLatest user message:\n";
+    HISTORY_END;
   if (typeof prompt === "string") {
     return prefix + prompt;
   }

@@ -313,8 +313,6 @@ export type StartClaudeQueryParams = {
   pathToClaudeCodeExecutable?: string;
   /** Required when permissionMode is bypassPermissions. */
   allowDangerouslySkipPermissions?: boolean;
-  /** Auto-compact long conversations (Claude Code default). */
-  autoCompactEnabled?: boolean;
   /** Stop utility queries such as title generation after one model turn. */
   maxTurns?: number;
   /** false keeps one-shot utility turns out of ~/.claude/projects history. */
@@ -405,13 +403,18 @@ export async function startClaudeQuery(
     options.thinking = { type: "adaptive" };
   }
 
-  if (params.autoCompactEnabled !== false) {
-    options.autoCompactEnabled = true;
-  }
-
   if (params.persistSession === false) options.persistSession = false;
 
   const settings: Record<string, unknown> = {};
+  // OpenCode compacts the chat, so Claude Code's own auto-compaction stays
+  // off. Two compactors with their own thresholds would work on one session:
+  // a compaction boundary the CLI writes into the transcript makes every
+  // resume before it impossible, and OpenCode never sees that summary. An
+  // overflow still ends well: the CLI's "Prompt is too long" comes back to
+  // OpenCode as a context overflow (failure.ts), which compacts and retries.
+  // The switch is the `autoCompactEnabled` setting; a top-level option of
+  // that name is unknown to the SDK and changed nothing.
+  settings.autoCompactEnabled = false;
   if (params.isolateMcp === true) {
     options.strictMcpConfig = true;
     settings.disableClaudeAiConnectors = true;
@@ -568,52 +571,4 @@ export async function startClaudeQuery(
     close,
     getPid,
   });
-}
-
-/**
- * Ask the local CLI which models this account can use. Starts a Claude Code
- * process with no prompt: no model call is made and nothing is persisted.
- */
-export async function listClaudeSupportedModels(
-  timeoutMs = 20_000,
-): Promise<unknown[] | null> {
-  const sdk = await loadClaudeAgentSdk();
-  const queryFn = (sdk as { query?: Function }).query;
-  if (typeof queryFn !== "function") return null;
-  let release: () => void = () => {};
-  const idle = (async function* () {
-    await new Promise<void>((resolve) => {
-      release = resolve;
-    });
-  })();
-  const env = buildClaudeCodeChildEnv(process.env);
-  const pathToClaudeCodeExecutable = await resolveClaudeCodeExecutable({ env });
-  const q = queryFn({
-    prompt: idle,
-    options: {
-      env,
-      persistSession: false,
-      settingSources: [],
-      strictMcpConfig: true,
-      settings: { disableClaudeAiConnectors: true },
-      ...(pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable } : {}),
-      ...(pathToClaudeCodeExecutable && isJsEntrypoint(pathToClaudeCodeExecutable)
-        ? { executable: "node" as const }
-        : {}),
-    },
-  }) as { supportedModels?: () => Promise<unknown[]>; close?: () => void };
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    if (typeof q.supportedModels !== "function") return null;
-    return await Promise.race([
-      q.supportedModels(),
-      new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-    release();
-    q.close?.();
-  }
 }

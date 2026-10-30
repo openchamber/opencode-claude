@@ -79,9 +79,14 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 ## Using it
 
-**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. Most current models run with a 1M context; Opus 4.6 also comes as a separate 1M version. Context limits and effort levels show up in OpenCode's model details. Configs and agents have to name a listed id, like `claude-code/claude-opus-5-5`: aliases such as `opus` and ids the picker doesn't show aren't models here.
+
+**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. The context window of each model is the one your CLI runs it with: current models run at 1M, a model that reaches 1M only through Claude Code's `[1m]` variant (Opus 4.6) is listed twice, and `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` lists everything at 200K. Context limits and effort levels show up in OpenCode's model details. Configs and agents have to name a listed id, like `claude-code/claude-opus-5-5`: aliases such as `opus` and ids the picker doesn't show aren't models here.
+
+The plugin asks the CLI for these windows once and keeps the answers in `~/.local/share/opencode-claude/context-windows.json`. Asking costs a tiny request per model (Claude Code checks a model it switches to with a one-token call), so it asks again only when something changes: the CLI is updated, you sign in to another account or change plans, a setting that changes windows (`CLAUDE_CODE_DISABLE_1M_CONTEXT`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `DISABLE_COMPACT`) changes in the environment or in Claude Code's `settings.json`, or a new model appears. Otherwise it asks again after a day. When the CLI cannot answer for every model (it is signed out, offline, or the API fails), the list stays as it was and only a new model is added; the next refresh asks again.
 
 **Fast mode.** Models your CLI runs in [fast mode](https://code.claude.com/docs/en/fast-mode) get a second entry, like "Opus 5.5 Fast". Fast turns draw your plan limits faster. If your account can't use fast mode, the turn runs at normal speed and the log says why.
+
+**Keeping the CLI current.** Claude Code only updates itself from its interactive screen, so a CLI used from OpenCode alone would stay on the version it was installed with, and new models would never appear. The plugin runs `claude update` for you, in the background, about once an hour; a new version is picked up by the next chat turn, and its models the next time the plugin reads the model list: when OpenCode loads the plugin (for example after a restart), at most once every ten minutes. Several OpenCode servers on one machine share the schedule: the one that starts the update marks it `running` in `~/.local/share/opencode-claude/cli-update.json`, and the others skip. Every run ends with `claude --version`, and an update the CLI reports but did not put in place is recorded as a failure. A chat turn that starts while the CLI cannot be launched (the update is replacing it, or another program holds the file) fails with a server error, which OpenCode retries on its own a few seconds later, up to ten times; the plugin looks for the CLI again before each retry. The file holds the outcome of the last run, and `cli-update.log` next to it keeps one line per update and per failure. To turn it off, pass `cliAutoUpdate: false` in the plugin options (`{ "package": "@openchamber/opencode-claude", "options": { "cliAutoUpdate": false } }`); Claude Code's own `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` in the server's environment are honoured too. Installs owned by winget, Homebrew or a Linux package manager are left to them.
 
 **Effort.** Pick an effort variant (low, medium, high, xhigh, max) where the model supports it. While Claude thinks, a summary of its reasoning streams into the reasoning block.
 
@@ -92,6 +97,8 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 **Skills and agents.** OpenCode's skills (from `.claude`, `.agents` and `.opencode`) are listed for Claude and load through OpenCode's skill tool. A custom agent's own prompt, like a `writer` subagent's, is passed on as that agent's role.
 
 **Titles and summaries.** Session titles run as small one-off requests on Haiku, so they barely touch your limits. Compaction summaries are written by the chat's own model from its Claude session, so they cover the whole conversation with full tool results; most of it comes from the prompt cache. The session itself isn't changed.
+
+**Compaction.** OpenCode compacts the chat; Claude Code's own auto-compaction is off for these sessions, so one summary covers the conversation and the Claude session has no compaction boundary of its own. If a request still overflows, Claude Code's error reaches OpenCode as a context overflow, and OpenCode compacts and retries.
 
 **Several Claude accounts.** Claude Code keeps one login per config directory. To run some projects on another account (say, a work plan), sign that account in with its own directory, then map project folders to it in the plugin options; the deepest matching folder wins and everything else stays on your default login:
 
@@ -118,7 +125,7 @@ Your plan's limits go mostly to context: each step of an agent loop re-reads the
 - Start a new session for a new task instead of stretching one session over a day's work.
 - Coming back to a long session after a break costs more, because the cache has expired and the whole context is written again.
 - Plugins that rewrite OpenCode's history on every turn (context pruning and the like) break the cache and make every turn much more expensive with Claude.
-- 1M models compact around 90% of the window. If you don't need the room, the regular versions stay smaller.
+- 1M models compact around 90% of the window. If you don't need the room, `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` keeps every model at 200K.
 
 ## Troubleshooting
 
@@ -127,7 +134,9 @@ Your plan's limits go mostly to context: each step of an agent loop re-reads the
 | No Claude Code provider in OpenCode | Check that `plugins` in `opencode.json` includes `@openchamber/opencode-claude`, then restart OpenCode |
 | Authentication error | Run `claude auth status`. If you're signed out or on an API key, run `claude auth login --claudeai` |
 | `claude` works with my company API key in the terminal but not in OpenCode | The plugin only runs on a Claude plan. With an API key or a company gateway you don't need this plugin at all: use OpenCode's built-in Anthropic provider |
-| "Model unavailable" on an old session | The model ids changed in 1.1. Pick the model again in that session |
+| "Model unavailable" on an old session | The model ids changed in 1.1, and models that run at 1M on their own (Opus 5.5, Fable 5.1, Sonnet 5.5…) later lost their `[1m]` suffix. Pick the model again in that session |
+| A model listed under its raw id, like `claude-opus-5-5[1m]` | Your `opencode.json` has settings for an id the plugin no longer lists, and OpenCode adds that model on its own. Rename the entry under `providers.claude-code.models` to the plain id (`claude-opus-5-5`) or remove it |
+| A context window that looks wrong | Delete `~/.local/share/opencode-claude/context-windows.json`. The windows are asked from the CLI again on the next start |
 | A rate-limit error with a reset time | Your plan's limit was reached. It clears at the reset time, or on your next message if you reset your limits early |
 | Something else | Turn on the debug log (below) and share it in an issue or on Discord |
 
@@ -148,10 +157,10 @@ Most people won't need these. Set them in the environment of the OpenCode server
 | `OPENCODE_CLAUDE_DEBUG=1` | Same as the `debug` option above |
 | `OPENCODE_CLAUDE_PROXY_PORT` | Fixed port for the local proxy (default: any free port) |
 | `OPENCODE_CLAUDE_CWD` | Working directory for Claude Code, if you need to override the project folder |
-| `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` | How much history to replay when a Claude session can't be resumed (default 400000, `0` turns it off) |
 | `OPENCODE_CLAUDE_TURN_STALL_MS` | End a turn when Claude Code goes silent this long (default 10 minutes) |
 | `OPENCODE_CLAUDE_PARKED_TURN_TTL_MS` | Close a turn waiting on tool results after this long (default 1 hour, `0` never) |
 | `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` | Always send turns to Claude, even when a limit is known to be active |
+| `OPENCODE_CLAUDE_CLI_UPDATE_INTERVAL_MS` | How often the plugin runs `claude update` (default 1 hour) |
 | `OPENCODE_CLAUDE_DYNAMIC_SECTIONS=keep` | Keep the working directory, memory path and git status in Claude Code's system prompt. By default they go in the first message instead, so every session shares the prompt and a new one reads it from the cache |
 
 ## Development

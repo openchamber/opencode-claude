@@ -16,6 +16,7 @@ import {
   sessionContextBlocks,
 } from "./opencode-context.js";
 import {
+  acquireChatLock,
   bridgeRuntime,
   clearAllBridges,
   deleteBridge,
@@ -28,15 +29,19 @@ import {
   type ParkedToolCall,
 } from "./bridge-pool.js";
 import { buildClaudeCodeChildEnv, MCP_DESCRIPTION_LIMIT } from "./auth-env.js";
+import { resetClaudeCliResolutionCache } from "./executable-path.js";
 import {
   classifyClaudeFailure,
+  type ClaudeFailureKind,
   failureCodeFor,
   failureHintFor,
   failureStatusFor,
   failureTypeFor,
+  isClaudeLaunchFailure,
   metaFailureText,
   overloadedResultText,
   resultErrorText,
+  statedFailureKind,
   thrownErrorText,
 } from "./failure.js";
 import {
@@ -98,6 +103,8 @@ import {
   historyAfterUserCount,
   promptAsStream,
   createTurnInput,
+  transcriptFiles,
+  transcriptText,
   userHistoryFingerprints,
   withConversationContext,
   withLeadingText,
@@ -503,6 +510,9 @@ async function handleRequest(req: Request): Promise<Response> {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log.error("[opencode-claude] chat completions error", message);
+      // A launcher locked at spawn throws here (see isClaudeLaunchFailure);
+      // OpenCode retries the 500, and the retry looks for the CLI again.
+      if (isClaudeLaunchFailure(message)) resetClaudeCliResolutionCache();
       return Response.json(
         { error: { message, type: "server_error" } },
         { status: 500 },
@@ -637,15 +647,6 @@ type SummaryResumePoint = {
   liveTurn?: OpenAIMessage[];
 };
 
-/**
- * Text budget for a summary that reads the history as text: about three
- * characters per token of the chat model's window. OpenCode already sized
- * the request to that window, so this only guards against a runaway one.
- */
-function summaryHistoryMaxChars(model: string): number {
-  return (/\[1m\]$/i.test(model) ? 1_000_000 : 200_000) * 3;
-}
-
 const SUMMARY_NUDGE_MARKER = "did not fill in the required summary template";
 
 /**
@@ -769,11 +770,19 @@ export function setModelFallbackHandler(handler: ModelFallbackHandler | null): v
   modelFallbackHandler = handler;
 }
 
-/** Catalog id for the CLI's fallback model, keeping the 1M variant if picked. */
+/**
+ * Catalog id for the CLI's fallback model. A `[1m]` variant the CLI names
+ * explicitly stays as named. A plain name (the CLI usually reports the model
+ * without the suffix) gets the 1M variant when the original ran at 1M: by its
+ * window in the catalog, since a native 1M model has no `[1m]` in its id.
+ */
 export function catalogIdForFallback(fallback: string, original: string): string {
-  const ids = new Set(getClaudeModels().map((m) => m.id));
+  const models = getClaudeModels();
+  const ids = new Set(models.map((m) => m.id));
+  if (/\[1m\]$/i.test(fallback) && ids.has(fallback)) return fallback;
   const base = fallback.replace(/\[1m\]$/i, "");
-  const wants1M = /\[1m\]$/i.test(original);
+  const originalWindow = models.find((m) => m.id === original)?.contextWindow ?? 0;
+  const wants1M = /\[1m\]$/i.test(original) || originalWindow >= 1_000_000;
   for (const candidate of wants1M ? [`${base}[1m]`, base] : [base, `${base}[1m]`]) {
     if (ids.has(candidate)) return candidate;
   }
@@ -989,17 +998,27 @@ async function handleChatCompletions(
         conversationKey: existing.conversationKey,
         resolved,
       });
-      return stream
-        ? streamOpenAIResponse(
-            existing.continueStream(),
-            body.model || model,
-            existing,
-          )
-        : collectTurnResponse(
-            existing.continueStream(),
-            body.model || model,
-            existing,
-          );
+      // A continuation is this request's attempt against Claude: if it meets
+      // the plan limit, OpenCode's retry of the same request stays blocked
+      // by the gate instead of starting the turn again.
+      rememberGateCheck(`${conversationKey}:${messages.length}`);
+      if (!stream) {
+        return collectTurnResponse(existing.continueStream(), body.model || model, existing);
+      }
+      // The call after the tool results can fail before any content (the
+      // subscription refused): that must be a real HTTP error, as on the
+      // turn's first response, not a stream whose answer is the error text.
+      const probe = await probeTurnEvents(existing.continueStream());
+      if (probe.status === "failed") {
+        return failureResponse(
+          probe.errorText,
+          existing.conversationKey,
+          existing.metaKind,
+          existing.configDir,
+          probe.kind,
+        );
+      }
+      return streamOpenAIResponse(probe.replay, body.model || model, existing);
     }
     // Still parked — do not start a parallel Claude turn (OpenCode may retry
     // or send a follow-up before tool results arrive). Re-emit pending calls.
@@ -1021,7 +1040,7 @@ async function handleChatCompletions(
 
   // Everything from here spawns a claude process. One chat spawns one at a
   // time: a second request waits, then stops what the first one started.
-  const releaseSpawnLock = await acquireSpawnLock(conversationKey);
+  const releaseSpawnLock = await acquireChatLock(conversationKey);
   try {
     return await startNewTurn({
       req,
@@ -1040,28 +1059,6 @@ async function handleChatCompletions(
   } finally {
     releaseSpawnLock();
   }
-}
-
-const spawnLocks = new Map<string, Promise<void>>();
-
-/**
- * Serialize turn starts per conversation. Resolves with an idempotent
- * release; the lock is held only until the new turn is in the bridge pool.
- */
-async function acquireSpawnLock(key: string): Promise<() => void> {
-  const previous = spawnLocks.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  const tail = previous.then(() => held);
-  spawnLocks.set(key, tail);
-  await previous;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    release();
-    if (spawnLocks.get(key) === tail) spawnLocks.delete(key);
-  };
 }
 
 async function startNewTurn(input: {
@@ -1426,23 +1423,20 @@ async function startNewTurn(input: {
 
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
-  // messages into the prompt so Claude sees the whole conversation.
-  // A summary that can't resume gets the history sized to the chat model's
-  // window: OpenCode already fit the request to it.
+  // messages into the prompt so Claude sees the whole conversation, with
+  // its images and documents. A summary that can't resume gets it the same
+  // way: OpenCode already fit the request to the model.
   // A resumed session gets only the turns it missed, if any.
-  const transcript = resume
-    ? buildConversationTranscript(missedMessages)
-    : metaKind === "summary"
-      ? buildConversationTranscript(priorMessages, summaryHistoryMaxChars(model))
-      : buildConversationTranscript(priorMessages);
-  if (transcript) {
+  const transcript = buildConversationTranscript(resume ? missedMessages : priorMessages);
+  if (transcript.length > 0) {
     log.info(
       resume
         ? "[opencode-claude] injecting turns the resumed Claude session missed"
         : "[opencode-claude] injecting transferred conversation history",
       {
         conversationKey,
-        transcriptChars: transcript.length,
+        transcriptChars: transcriptText(transcript).length,
+        transcriptFiles: transcriptFiles(transcript),
         historyMessages: resume ? missedMessages.length : priorMessages.length,
       },
     );
@@ -1630,7 +1624,6 @@ async function startNewTurn(input: {
           effort: summaryResume.profile?.effort ?? selection.effort,
           env,
           mcpServers,
-          autoCompactEnabled: false,
           // A tool call is refused (dontAsk with nothing allowed), so one
           // extra turn lets Claude write the summary after it.
           maxTurns: 2,
@@ -1656,7 +1649,6 @@ async function startNewTurn(input: {
     fastMode,
     env,
     mcpServers: isMetaRequest ? undefined : mcpServers,
-    autoCompactEnabled: !isMetaRequest,
     maxTurns: isMetaRequest ? 1 : undefined,
     // Titles and summaries are never resumed; saving them would fill the
     // user's Claude Code history with "create a title" sessions.
@@ -1691,7 +1683,7 @@ async function startNewTurn(input: {
     metaKind,
     handle,
     pendingTools,
-    reportedUsage: new Map(),
+    seenCalls: new Set(),
     forwardedSteering: new Set(),
     createdAt: Date.now(),
     input: turnInput,
@@ -1910,7 +1902,7 @@ async function startNewTurn(input: {
   if (stream) {
     const probe = await probeTurnEvents(consumeStream());
     if (probe.status === "failed") {
-      return failureResponse(probe.errorText, conversationKey, metaKind, configDir);
+      return failureResponse(probe.errorText, conversationKey, metaKind, configDir, probe.kind);
     }
     return streamOpenAIResponse(probe.replay, body.model || model, bridge);
   }
@@ -2094,6 +2086,18 @@ export function coerceStringArgument(value: unknown, schema: unknown): unknown {
   return value;
 }
 
+/**
+ * The id of the tool call an MCP request answers, as the CLI puts it in the
+ * request's `_meta` (`claudecode/toolUseId`): Claude Code 2.1.300 and later
+ * pass it on every call (probe 43, the 2.1.300 probe). A call without it (an
+ * older CLI, which this plugin still runs) has none.
+ */
+export function toolUseIdOf(extra: unknown): string | undefined {
+  const meta = (extra as { _meta?: Record<string, unknown> } | null | undefined)?._meta;
+  const id = meta?.["claudecode/toolUseId"];
+  return typeof id === "string" && id ? id : undefined;
+}
+
 export async function buildOpenCodeMcpServer(
   tools: OpenAITool[],
   pendingTools: Map<string, ParkedToolCall>,
@@ -2226,8 +2230,15 @@ export async function buildOpenCodeMcpServer(
           name,
           description,
           shape,
-          async (args: Record<string, unknown>) => {
-            const id = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+          async (args: Record<string, unknown>, extra?: unknown) => {
+            // The id Claude gave the call, which the CLI passes along (probe
+            // 43): OpenCode then shows the step under the same id the
+            // transcript's call and result records carry. A call without one
+            // (an older CLI), or with an id already held for a parked call
+            // (the CLI never repeats one), gets an id of the plugin's own.
+            const given = toolUseIdOf(extra);
+            const id =
+              given && !pendingTools.has(given) ? given : `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
             const pending: ParkedToolCall = {
               id,
               name,
@@ -2303,32 +2314,39 @@ async function collectTurnResponse(
 
   let content = "";
   let reasoning = "";
-  const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
+  const usageTracker = new TurnUsageTracker(bridge.seenCalls);
   const mapState: MapState = { messageId: null, configDir: bridge.configDir };
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
   let errorText: string | null = null;
+  let errorKind: ClaudeFailureKind | null = null;
   let sawContent = false;
   const toolCalls: ParkedToolCall[] = [];
 
-  const noteError = (text: string) => {
+  const noteError = (text: string, stated: ClaudeFailureKind | null = null) => {
     const norm = normalizeClaudeErrorText(text);
-    if (!norm || norm === lastErrorNorm) return;
+    if (!norm) return;
+    // A later report of the same failure can still name its kind: the
+    // error result's HTTP status after the synthetic record's general code.
+    if (norm === lastErrorNorm) {
+      if (errorKind === "unknown" && stated) errorKind = stated;
+      return;
+    }
     lastErrorNorm = norm;
-    // The limit is the real cause; a later, vaguer wording of the same
-    // failure (the result event) must not downgrade the 429 to a 500.
-    if (
-      !errorText ||
-      classifyClaudeFailure(errorText) !== "rate_limit" ||
-      classifyClaudeFailure(text) === "rate_limit"
-    ) {
+    // The first failure of a known kind is the cause; a later, vaguer
+    // wording of the same failure (the error result after the synthetic
+    // record, the iterator's throw) must not turn a 429 or a refused
+    // account into a 500.
+    if (!errorText || errorKind === "unknown") {
       errorText = text;
+      errorKind = stated ?? classifyClaudeFailure(text);
     }
     content += `\n\n[claude-code error] ${text}`;
   };
 
   try {
     for await (const event of events) {
+      if (isCompactBoundary(event)) usageTracker.compacted();
       const mapped = mapSdkEvent(event, mapState);
       if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
@@ -2347,7 +2365,7 @@ async function collectTurnResponse(
         // keep one copy, and keep any usage that came with it.
         if (mapped.usage) resultUsage = mapped.usage;
         forgetDeadSession(bridge.conversationKey, mapped.text);
-        noteError(mapped.text);
+        noteError(mapped.text, mapped.stated);
       }
     }
   } catch (err) {
@@ -2366,7 +2384,7 @@ async function collectTurnResponse(
   // produced partial work first, preserve the real 429 so OpenCode starts its
   // retry countdown instead of treating the run as a successful answer, and
   // the real context overflow so OpenCode compacts instead.
-  const failureKind = errorText ? classifyClaudeFailure(errorText) : null;
+  const failureKind = errorKind;
   if (
     errorText &&
     (!sawContent || failureKind === "rate_limit" || failureKind === "context_overflow")
@@ -2378,6 +2396,7 @@ async function collectTurnResponse(
       bridge.conversationKey,
       bridge.metaKind,
       bridge.configDir,
+      mapState.refusalText ? null : errorKind,
     );
   }
 
@@ -2427,7 +2446,7 @@ async function collectTurnResponse(
  */
 type TurnProbe =
   | { status: "alive"; replay: AsyncIterable<unknown> }
-  | { status: "failed"; errorText: string };
+  | { status: "failed"; errorText: string; kind: ClaudeFailureKind | null };
 
 function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   if (!event || typeof event !== "object") return "neutral";
@@ -2439,8 +2458,12 @@ function rawProbeKind(event: unknown): "content" | "error" | "neutral" {
   // buffered and replayed once content arrives. OpenCode sets no response
   // header timeout by default, so holding the head meanwhile is safe, and
   // each retry resets the stall watchdog (plus the announced delay).
+  // An assistant record is neutral too: the proxy forwards only its usage,
+  // its text and tool calls come as stream events and parks. In a
+  // continuation it can be a record of the call before the tool, followed
+  // by the failure of the next call.
   if (e.type === "assistant") {
-    return assistantErrorText(e) ? "error" : "content";
+    return assistantErrorText(e) ? "error" : "neutral";
   }
   if (e.type === "result") {
     // Nothing reached the probe yet, so a 5xx "success" produced nothing.
@@ -2505,6 +2528,24 @@ async function* chainBuffered(
   }
 }
 
+/**
+ * The kind the error result after a synthetic error record states, read on
+ * to that result (it follows at once); null when none comes or it states
+ * none. The iterator's throw after the result ends the reading.
+ */
+async function statedKindOfResult(iterator: AsyncIterator<unknown>): Promise<ClaudeFailureKind | null> {
+  try {
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) return null;
+      const event = next.value as Record<string, unknown> | null;
+      if (event?.type === "result") return statedFailureKind(event);
+    }
+  } catch {
+    return null;
+  }
+}
+
 async function probeTurnEvents(
   events: AsyncIterable<unknown>,
 ): Promise<TurnProbe> {
@@ -2512,13 +2553,13 @@ async function probeTurnEvents(
   const buffered: unknown[] = [];
   // A refusal without fallback, when the turn then fails, is the cause.
   let refusal: string | null = null;
-  const fail = async (errorText: string): Promise<TurnProbe> => {
+  const fail = async (errorText: string, stated: ClaudeFailureKind | null = null): Promise<TurnProbe> => {
     try {
       await iterator.return?.(undefined as never);
     } catch {
       // ignore
     }
-    return { status: "failed", errorText: refusal ?? errorText };
+    return refusal ? { status: "failed", errorText: refusal, kind: null } : { status: "failed", errorText, kind: stated };
   };
   try {
     while (true) {
@@ -2530,7 +2571,11 @@ async function probeTurnEvents(
       }
       const kind = rawProbeKind(next.value);
       if (kind === "error") {
-        return fail(rawErrorText(next.value));
+        // A synthetic record with a general code (`invalid_request`) says
+        // no kind; the error result right after it names the refused
+        // call's HTTP status (statedFailureKind).
+        const stated = statedFailureKind(raw!) ?? (raw?.type === "result" ? null : await statedKindOfResult(iterator));
+        return fail(rawErrorText(next.value), stated);
       }
       buffered.push(next.value);
       if (kind === "content") {
@@ -2588,11 +2633,20 @@ function failureResponse(
   conversationKey: string,
   metaKind?: string | null,
   configDir?: string,
+  statedKind?: ClaudeFailureKind | null,
 ): Response {
   const errorText = metaFailureText(rawErrorText, metaKind);
   recordRateLimitErrorText(errorText, configDir);
   forgetDeadSession(conversationKey, errorText);
-  const kind = classifyClaudeFailure(errorText);
+  // The CLI did not start: OpenCode retries the 500 below in a few seconds,
+  // and that attempt must look for the CLI again, not reuse the old path.
+  if (isClaudeLaunchFailure(errorText)) resetClaudeCliResolutionCache();
+  // A chat turn that outgrew the API's size limit is answered as an
+  // overflow: OpenCode compacts the chat, and the turn after it starts a
+  // transcript without the images that grew it. A summary keeps the 413:
+  // OpenCode then resends it as text without media.
+  const failed = statedKind ?? classifyClaudeFailure(errorText);
+  const kind = failed === "request_too_large" && !metaKind ? "context_overflow" : failed;
   log.warn("[opencode-claude] turn failed fast", {
     kind,
     conversationKey,
@@ -2712,7 +2766,7 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
-      const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
+      const usageTracker = new TurnUsageTracker(bridge.seenCalls);
       const mapState: MapState = { messageId: null, configDir: bridge.configDir };
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
@@ -2759,6 +2813,7 @@ function streamOpenAIResponse(
 
       try {
         for await (const event of events) {
+          if (isCompactBoundary(event)) usageTracker.compacted();
           const mapped = mapSdkEvent(event, mapState);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
@@ -2840,7 +2895,7 @@ function streamOpenAIResponse(
             forgetDeadSession(bridge.conversationKey, mapped.text);
             log.warn("[opencode-claude] mid-stream turn error", {
               conversationKey: bridge.conversationKey,
-              kind: classifyClaudeFailure(mapped.text),
+              kind: mapped.stated ?? classifyClaudeFailure(mapped.text),
               message: mapped.text.slice(0, 300),
             });
             sendError(mapped.text);
@@ -2919,7 +2974,7 @@ type MappedEvent =
   | { kind: "park"; tools: ParkedToolCall[] }
   | { kind: "usage"; usage: OpenAIUsage }
   | { kind: "usage-delta"; usage: OpenAIUsage; messageId: string | null }
-  | { kind: "error"; text: string; usage?: OpenAIUsage | null }
+  | { kind: "error"; text: string; usage?: OpenAIUsage | null; stated?: ClaudeFailureKind | null }
   | { kind: "ignore" };
 
 /** Text carried by Claude's synthetic assistant API-error message. */
@@ -3099,6 +3154,12 @@ function refusalNote(state: MapState): string | null {
   return REFUSAL_NOTE;
 }
 
+/** Claude Code compacted the conversation (auto-compact or /compact). */
+function isCompactBoundary(event: unknown): boolean {
+  const e = event as { type?: unknown; subtype?: unknown } | null;
+  return e?.type === "system" && e.subtype === "compact_boundary";
+}
+
 function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
@@ -3145,7 +3206,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   }
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.
-  if (e.type === "system" && e.subtype === "compact_boundary") {
+  if (isCompactBoundary(e)) {
     return {
       kind: "reasoning",
       text: formatCompactNote(e.compact_metadata),
@@ -3257,7 +3318,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
             : ""
         }`;
       }
-      return { kind: "error", text: note, usage };
+      return { kind: "error", text: note, usage, stated: statedFailureKind(e) };
     }
     if (usage) {
       return {
@@ -3294,7 +3355,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
           }`;
         }
       }
-      return { kind: "error", text: note, usage };
+      return { kind: "error", text: note, usage, stated: statedFailureKind(e) };
     }
     if (usage) return { kind: "usage", usage };
     return { kind: "ignore" };

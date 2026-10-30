@@ -1,14 +1,12 @@
 /**
  * Claude Code model catalog (from OpenChamber harness registry).
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import {
   EFFORT_LEVELS,
   isClaudeEffort,
   type ClaudeEffort,
 } from "./constants.js";
+import { readCachedModels, writeCachedModels } from "./model-cache.js";
 
 export type ClaudeModel = {
   id: string;
@@ -75,24 +73,46 @@ export type SdkModelRow = {
   supportsFastMode?: boolean;
 };
 
+/** Output limit that goes with a context window. */
+function limitFor(context: number): { context: number; output: number } {
+  const output = context > LIMIT_200K.context ? LIMIT_1M.output : LIMIT_200K.output;
+  return { context, output };
+}
+
+/** Concrete model id of a `supportedModels()` row, without `[1m]`. */
+function rowBaseId(row: SdkModelRow): string | undefined {
+  const value = typeof row?.value === "string" ? row.value.trim() : "";
+  // The CLI's "default" row only repeats another model.
+  if (!value || value === "default") return undefined;
+  return (row.resolvedModel || value).replace(/\[1m\]$/i, "");
+}
+
+/** Concrete ids of the listed models, without `[1m]`, each once. */
+export function listedModelIds(rows: SdkModelRow[]): string[] {
+  const ids: string[] = [];
+  for (const row of rows) {
+    const base = rowBaseId(row);
+    if (base && !ids.includes(base)) ids.push(base);
+  }
+  return ids;
+}
+
 /**
- * 1M context rules per model family, from the window the CLI reports for
- * each plain id (Claude Code 2.1.312, a subscription plan). Claude Code
- * selects 1M through a `[1m]` suffix where the plain id runs at 200K.
- * - default: offered only as the 1M variant
- * - optional: offered as both the plain model and a 1M variant
- * - fixed: the plain id already runs at 1M
- * Anything else is 200K. Sonnet 4.6's 1M needs usage credits, so it isn't
- * offered.
+ * `[1m]` variants worth asking the CLI about: only where the plain id runs
+ * below 1M (Opus 4.6). A model that already runs at 1M gains nothing from
+ * the suffix, and every question costs a model request.
  */
-const ONE_M_FAMILIES: Array<{ match: RegExp; mode: "default" | "optional" | "fixed" }> = [
-  { match: /^claude-fable-5/, mode: "fixed" },
-  { match: /^claude-opus-5/, mode: "fixed" },
-  { match: /^claude-opus-4-[78]/, mode: "fixed" },
-  { match: /^claude-opus-4-6/, mode: "optional" },
-  { match: /^claude-sonnet-5/, mode: "fixed" },
-  { match: /^claude-haiku-5/, mode: "fixed" },
-];
+export function extendedProbeIds(
+  rows: SdkModelRow[],
+  windows: ReadonlyMap<string, number | null>,
+): string[] {
+  return listedModelIds(rows)
+    .filter((id) => {
+      const plain = windows.get(id);
+      return typeof plain === "number" && plain < LIMIT_1M.context && !windows.has(`${id}[1m]`);
+    })
+    .map((id) => `${id}[1m]`);
+}
 
 /**
  * Display name from the concrete model id ("claude-opus-5-5[1m]" →
@@ -110,34 +130,46 @@ export function modelNameFromId(id: string | undefined): string | undefined {
 
 /**
  * Map the CLI's own model list (supportedModels) into the catalog. The
- * CLI's "default" row only repeats another model, so it is skipped.
+ * context window of each id is the one the CLI reported now (`windows`); an
+ * id it could not answer this time keeps what it reported before
+ * (`lastAnswers`, from the window cache), and an id it never answered gets
+ * 1M, the window of every current model; the next answer corrects an older
+ * model that runs at 200K (Haiku 4.5, Opus 4.6, Sonnet 4.6). Claude Code
+ * selects 1M through a `[1m]` suffix on the model id (the suffix never
+ * reaches the API); a model gets a second "(1M)" entry only when its `[1m]`
+ * variant runs a larger window than the plain id (Opus 4.6), and a refused
+ * variant is not listed.
  */
-export function modelsFromSdk(rows: SdkModelRow[]): ClaudeModel[] {
+export function modelsFromSdk(
+  rows: SdkModelRow[],
+  windows?: ReadonlyMap<string, number | null>,
+  lastAnswers?: ReadonlyMap<string, number | null>,
+): ClaudeModel[] {
+  const answer = (id: string) => {
+    const now = windows?.get(id);
+    return now === undefined ? lastAnswers?.get(id) : now;
+  };
   const out: ClaudeModel[] = [];
   for (const row of rows) {
-    const value = typeof row?.value === "string" ? row.value.trim() : "";
-    if (!value || value === "default") continue;
+    // The concrete id, like t3code: a session stays on the model it picked
+    // instead of moving when the CLI's `opus` alias points somewhere new.
+    const base = rowBaseId(row);
+    if (!base) continue;
+    const value = row.value.trim();
     const efforts = (row.supportedEffortLevels ?? []).filter(isClaudeEffort);
     const name =
       modelNameFromId(row.resolvedModel) ??
       modelNameFromId(value) ??
       (row.displayName?.trim() || value);
-    // The concrete id, like t3code: a session stays on the model it picked
-    // instead of moving when the CLI's `opus` alias points somewhere new.
-    const family = (row.resolvedModel || value).replace(/\[1m\]$/i, "");
-    const base = family;
-    const rule = /\[1m\]$/i.test(value)
-      ? { mode: "default" as const }
-      : ONE_M_FAMILIES.find((f) => f.match.test(family));
-    if (rule?.mode === "default") {
-      out.push(model(`${base}[1m]`, name, LIMIT_1M, undefined, efforts));
-    } else if (rule?.mode === "fixed") {
-      out.push(model(base, name, LIMIT_1M, undefined, efforts));
-    } else if (rule?.mode === "optional") {
-      out.push(model(base, name, LIMIT_200K, undefined, efforts));
-      out.push(model(`${base}[1m]`, `${name} (1M)`, LIMIT_1M, undefined, efforts));
-    } else {
-      out.push(model(base, name, LIMIT_200K, undefined, efforts));
+    const answered = answer(base);
+    const plain = typeof answered === "number" ? answered : LIMIT_1M.context;
+    out.push(model(base, name, limitFor(plain), undefined, efforts));
+    // null: the CLI refused the variant for this account. Not answered this
+    // time: its last answer keeps the variant, so a session on it keeps its
+    // model until the next refresh asks again.
+    const extended = answer(`${base}[1m]`);
+    if (typeof extended === "number" && extended > plain) {
+      out.push(model(`${base}[1m]`, `${name} (1M)`, limitFor(extended), undefined, efforts));
     }
   }
   // An alias row and its concrete row resolve to the same model.
@@ -157,9 +189,23 @@ export function modelsFromSdk(rows: SdkModelRow[]): ClaudeModel[] {
   );
 }
 
-let discovered: ClaudeModel[] | null = readCachedModels();
+/**
+ * The list the CLI reported, one for the whole OpenCode server. OpenCode
+ * gives each project folder its own copy of a local plugin's modules (it
+ * clears the module cache when a folder loads the plugin), so a list kept
+ * in the module was one per folder: a refresh reached only the folder that
+ * ran it, and the others kept what they had read at load. On globalThis,
+ * like the refresh time (index.ts). The version in the key changes with the
+ * shape of ClaudeModel, so a copy of an older build keeps a list of its own.
+ */
+const CATALOG_KEY = Symbol.for("@openchamber/opencode-claude/model-catalog/v1");
+
+const catalogRuntime = ((globalThis as Record<symbol, unknown>)[CATALOG_KEY] ??= {
+  discovered: readCachedModels(),
+}) as { discovered: ClaudeModel[] | null };
 
 function buildCatalog(): ClaudeModel[] {
+  const discovered = catalogRuntime.discovered;
   return discovered?.length ? discovered : FALLBACK_MODELS;
 }
 
@@ -170,34 +216,24 @@ export function getClaudeModels(): ClaudeModel[] {
 /** Replace the discovered list and remember it for the next start. */
 export function setDiscoveredModels(models: ClaudeModel[]): boolean {
   if (!models.length) return false;
-  const changed = JSON.stringify(models) !== JSON.stringify(discovered);
-  discovered = models;
+  const changed = JSON.stringify(models) !== JSON.stringify(catalogRuntime.discovered);
+  catalogRuntime.discovered = models;
   if (changed) writeCachedModels(models);
   return changed;
 }
 
-function modelCachePath(): string {
-  const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-  return join(base, "opencode-claude", "models.json");
-}
-
-function readCachedModels(): ClaudeModel[] | null {
-  try {
-    const parsed = JSON.parse(readFileSync(modelCachePath(), "utf8"));
-    return Array.isArray(parsed) && parsed.length ? (parsed as ClaudeModel[]) : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeCachedModels(models: ClaudeModel[]): void {
-  try {
-    const file = modelCachePath();
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify(models, null, 2));
-  } catch {
-    // The cache only speeds up the next start.
-  }
+/**
+ * The list after a refresh the CLI did not fully answer (signed out, a
+ * network or API failure): what it listed and could not size says nothing
+ * about the account, so every model already listed stays as it is, and only
+ * a model new to the list is added. A refresh the CLI fully answers replaces
+ * the list (setDiscoveredModels).
+ */
+export function modelsAfterIncompleteRefresh(found: ClaudeModel[]): ClaudeModel[] {
+  const current = catalogRuntime.discovered;
+  if (!current?.length) return found;
+  const ids = new Set(current.map((m) => m.id));
+  return [...current, ...found.filter((m) => !ids.has(m.id))];
 }
 
 /** Whether the picked catalog entry runs in fast mode. */
