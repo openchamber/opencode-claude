@@ -4,7 +4,6 @@
  */
 import { withGracefulStop, type StoppableClaudeQueryHandle } from "./query.js";
 import type { McpToolResultContent, TurnInput } from "./prompt.js";
-import type { OpenAIUsage } from "./usage.js";
 
 export type ParkedToolCall = {
   id: string;
@@ -22,10 +21,10 @@ export type ParkedBridge = {
   handle: StoppableClaudeQueryHandle;
   pendingTools: Map<string, ParkedToolCall>;
   /**
-   * Usage already reported to OpenCode per SDK assistant message, so a
-   * continuation reports only what a call grew by since the last response.
+   * Message ids of the API calls a response of this bridge already saw: a
+   * call's usage is reported by the response that saw it first, never again.
    */
-  reportedUsage: Map<string, OpenAIUsage>;
+  seenCalls: Set<string>;
   /** Keys of mid-turn user messages already attached to a tool result. */
   forwardedSteering: Set<string>;
   createdAt: number;

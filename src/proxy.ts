@@ -1691,7 +1691,7 @@ async function startNewTurn(input: {
     metaKind,
     handle,
     pendingTools,
-    reportedUsage: new Map(),
+    seenCalls: new Set(),
     forwardedSteering: new Set(),
     createdAt: Date.now(),
     input: turnInput,
@@ -2303,7 +2303,7 @@ async function collectTurnResponse(
 
   let content = "";
   let reasoning = "";
-  const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
+  const usageTracker = new TurnUsageTracker(bridge.seenCalls);
   const mapState: MapState = { messageId: null, configDir: bridge.configDir };
   let resultUsage: OpenAIUsage | null = null;
   let lastErrorNorm: string | null = null;
@@ -2329,6 +2329,7 @@ async function collectTurnResponse(
 
   try {
     for await (const event of events) {
+      if (isCompactBoundary(event)) usageTracker.compacted();
       const mapped = mapSdkEvent(event, mapState);
       if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
@@ -2712,7 +2713,7 @@ function streamOpenAIResponse(
       });
 
       let finishReason: string | null = "stop";
-      const usageTracker = new TurnUsageTracker(bridge.reportedUsage);
+      const usageTracker = new TurnUsageTracker(bridge.seenCalls);
       const mapState: MapState = { messageId: null, configDir: bridge.configDir };
       let resultUsage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
@@ -2759,6 +2760,7 @@ function streamOpenAIResponse(
 
       try {
         for await (const event of events) {
+          if (isCompactBoundary(event)) usageTracker.compacted();
           const mapped = mapSdkEvent(event, mapState);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
@@ -3099,6 +3101,12 @@ function refusalNote(state: MapState): string | null {
   return REFUSAL_NOTE;
 }
 
+/** Claude Code compacted the conversation (auto-compact or /compact). */
+function isCompactBoundary(event: unknown): boolean {
+  const e = event as { type?: unknown; subtype?: unknown } | null;
+  return e?.type === "system" && e.subtype === "compact_boundary";
+}
+
 function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   if (!event || typeof event !== "object") return { kind: "ignore" };
   const e = event as Record<string, unknown>;
@@ -3145,7 +3153,7 @@ function mapSdkEvent(event: unknown, state?: MapState): MappedEvent {
   }
 
   // Auto-compact boundary — surface as a short reasoning note for the UI.
-  if (e.type === "system" && e.subtype === "compact_boundary") {
+  if (isCompactBoundary(e)) {
     return {
       kind: "reasoning",
       text: formatCompactNote(e.compact_metadata),
