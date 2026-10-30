@@ -45,7 +45,9 @@ OpenCode sends the plugin an ordinary chat request. The plugin turns it into an 
 
 Tools stay OpenCode's. Claude Code's built-in tools (its own Bash, Edit and so on) are switched off. OpenCode's tools are handed to Claude instead, so every file edit and shell command goes through OpenCode and its permissions. When Claude asks for several read-only tools at once, like reads, greps or subagents, they run in parallel.
 
-Each OpenCode chat maps to one Claude Code session and resumes it on every message. That keeps Anthropic's prompt cache warm, which is what makes long sessions affordable on a plan. The session and every message in it are named from OpenCode's own ids, so the plugin keeps no record of its own: on each message it reads the session's transcript, finds the last message OpenCode's history still has and resumes right after it. A revert or an edit branches the transcript the way Claude Code's `/rewind` does; a message another model answered reaches Claude as text. Needs Claude Code 2.1.300 or later.
+Each OpenCode chat maps to one Claude Code session and resumes it on every message. That keeps Anthropic's prompt cache warm, which is what makes long sessions affordable on a plan. The session and every message in it are named from OpenCode's own ids, so the plugin keeps no record of its own: on each message it reads the session's transcript, finds the last message OpenCode's history still has and resumes right after it. A revert or an edit copies the transcript up to the revert point into a new version, so nothing reverted is read again; a forked chat starts from a copy of its parent's transcript and reads the parent's prompt cache; a message another model answered reaches Claude as text. Needs Claude Code 2.1.300 or later.
+
+**Transcripts on disk.** The plugin writes Claude Code transcripts where the CLI keeps them (`~/.claude/projects/<folder>/`) and deletes none: a revert adds a copy of the chat up to the revert point, a fork's first turn adds the fork's copy, and a compaction starts a new file. They show up in `claude --resume` under ids unrelated to the chat. Old ones can be deleted by hand; a chat whose files are gone sends its history as text once.
 
 ## Install
 
@@ -172,6 +174,8 @@ bun run test
 ```
 
 `bun test/cli-contract-live.ts` checks the Claude Code behaviour the plugin relies on (session names, record ids, copies, records without a turn, mid-turn messages, error texts) against the installed `claude`, one check per property. It needs no sign-in and spends no plan limits: the model is a local stub. Run it after a Claude Code update; it is not part of `bun run test`.
+
+`bun run build && bun test/opencode-live.ts` drives the whole chain as a user does: a real `opencode serve` with the plugin from this checkout and the signed-in `claude` on Haiku 5.5. It checks by the plugin's journal and Claude's transcripts that a fork's first turn copies its parent's transcript and reads the history from the prompt cache, that a revert copies into a new version while a fork made before it keeps the old one, and that a turn stopped mid-answer is not resumed after the part the screen lacks. It spends about ten Haiku turns of your plan; `OPENCODE_BIN` points at the OpenCode to run (2.0.19 or later). Not part of `bun run test`.
 
 To try a local build, point `plugins` at the checkout folder: `{ "plugins": ["/path/to/opencode-claude"] }`.
 

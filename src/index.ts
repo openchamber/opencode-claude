@@ -50,6 +50,7 @@ import {
   rememberContextEvent,
   type ContextEvent,
 } from "./context-list.js";
+import { registerSessionReader } from "./session-fork.js";
 import {
   getClaudeProxyBaseUrl,
   acquireProxy,
@@ -377,6 +378,11 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       });
     });
 
+    // The proxy reads a fork's parent and messages through OpenCode (session-fork.ts).
+    const unregisterReader = registerSessionReader({
+      get: (input) => ctx.session.get(input as never),
+      context: (input) => ctx.session.context(input as never),
+    });
     const stopWatching = watchSessionInterrupts(ctx);
     // Claude Code's own updater never runs under the Agent SDK (see
     // cli-update.ts). Started even without a CLI: the install action may
@@ -406,6 +412,7 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       modelRefreshRuntime.providerReloads.delete(reloadProvider);
       stopCliAutoUpdate();
       stopWatching();
+      unregisterReader();
       await releaseProxy();
     };
   },

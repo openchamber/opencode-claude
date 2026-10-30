@@ -7,8 +7,8 @@
  * with `resumeSessionAt`: what the list holds after it is missed, and goes
  * ahead of the prompt as one record. That one rule covers a plain
  * continuation (the point is the end of the transcript), a revert or an edit
- * (the point is earlier, and the CLI branches the transcript there, as its
- * own /rewind does), turns another provider answered or that failed before
+ * (the point is earlier, and the turn copies the transcript up to it into a
+ * new version: cutsMessages, proxy.ts planChatTurn), turns another provider answered or that failed before
  * Claude wrote anything (missed), and a retry of the same message (its record is already in
  * the transcript: the point is the end of the turn before it, and the new
  * record gets the next attempt number). Every transcript starts with a
@@ -21,14 +21,19 @@
  * process finished later). The end of a turn follows the record's
  * descendants (`parentUuid`, or `logicalParentUuid` after a CLI compaction
  * boundary) up to the next prompt record, and never through a message
- * absorbed mid-turn that the list does not have.
+ * absorbed mid-turn that the list does not have (foreignAttachment).
  *
- * The CLI resumes at a record only along the leaf chain (the last record
- * written and its ancestors; probes 4, 8, 39). A point off it (a lost
- * process wrote its answer after the chat's own turns) moves to where its
- * branch leaves the leaf chain (leafChainAncestor): the turn is planned on
- * the records down to there, and what the list holds after goes as text, as
- * after a revert.
+ * A fork's copy of its parent's transcript is cut by the same ids, read down
+ * the fork's screen (planCopy): every screen message but an answer in words
+ * has an id that finds its record, a tool step by the id of its call, which
+ * the CLI gives and the proxy hands to OpenCode (probe 43).
+ *
+ * The CLI resumes and copies at a record only along the leaf chain (the last
+ * chain record written and its ancestors; probes 4, 8, 39). A point or a cut
+ * off it (a lost process wrote its answer after the chat's own turns) moves
+ * to where its branch leaves the leaf chain (leafChainAncestor): the turn or
+ * the copy is planned on the records down to there, and what the list holds
+ * after goes as missed, as after a revert.
  */
 import { readFile } from "node:fs/promises";
 import { startsTurn } from "./prompt.js";
@@ -383,6 +388,22 @@ export function nextAttempt(
   return attempt + 1;
 }
 
+/** Ids of the tool calls an assistant record makes (its `tool_use` blocks). */
+function toolUseIdsOfRecord(record: TranscriptRecord): string[] {
+  if (record.type !== "assistant" || !Array.isArray(record.message?.content)) return [];
+  return record.message.content
+    .filter((block): block is { type: "tool_use"; id: string } => (block as { type?: unknown } | null)?.type === "tool_use" && typeof (block as { id?: unknown }).id === "string")
+    .map((block) => block.id);
+}
+
+/** Ids of the tool calls a user record answers (its `tool_result` blocks). */
+function toolResultIdsOfRecord(record: TranscriptRecord): string[] {
+  if (record.type !== "user" || !Array.isArray(record.message?.content)) return [];
+  return record.message.content
+    .filter((block): block is { type: "tool_result"; tool_use_id: string } => (block as { type?: unknown } | null)?.type === "tool_result" && typeof (block as { tool_use_id?: unknown }).tool_use_id === "string")
+    .map((block) => block.tool_use_id);
+}
+
 /**
  * Whether a record is a message absorbed mid-turn (`attachment` with a
  * `source_uuid`) under a name the list does not have: it belongs to a turn
@@ -390,7 +411,9 @@ export function nextAttempt(
  * it. Tool records never stop the walk: a call the list lacks inside a turn
  * whose answer the list has is one the CLI handled by itself (a call its MCP
  * server rejected before the plugin saw it), and the answer is still the
- * list's.
+ * list's; a step the list lacks past the fork's boundary is never reached,
+ * because the walk only runs when the list shows the answer right after the
+ * record it starts from (planCopy).
  */
 /** What answers whether a name is one of the chain's: a ChainIndex, or a set of names. */
 type ChainNames = { has(name: string): boolean };
@@ -510,13 +533,16 @@ function holdsToolUse(record: TranscriptRecord): boolean {
  * at. It has them when the transcript went on after the result record: the
  * CLI's turn continued (an answer or a next call, a message absorbed
  * mid-turn as an `attachment` with a `source_uuid`), or a later question was
- * asked over it (the result is history Claude read). The CLI's own service
+ * asked over it (a fork's copy ends at a result, and the fork's first turn
+ * resumed there: the result is history Claude read). The CLI's own service
  * records (a prompt snapshot after a result, probe 42; the record of a stop)
  * are no continuation, and a point on one of them is read at the record they
  * trail. A point on an absorbed message means the results before it were
  * taken. A turn that ends at the call, or at a result with nothing but
  * service records after it (the rejection a stopped turn writes), still
- * waits for them, and the step is rebuilt.
+ * waits for them, and the step is rebuilt. For a fork's copy this is read in
+ * the parent's whole transcript, not in the copy, which ends at the point by
+ * definition.
  */
 export function stepDelivered(
   records: readonly TranscriptRecord[],
@@ -556,7 +582,7 @@ function isContinuation(record: TranscriptRecord): boolean {
   return record.type === "assistant" || (record.type === "attachment" && !!record.attachment?.source_uuid) || isPromptRecord(record);
 }
 
-/** A record the CLI writes on its own, with no id of the list: a service attachment, the record of a stop. */
+/** A record the CLI writes on its own, with no id of the screen: a service attachment, the record of a stop. */
 function isServiceRecord(record: TranscriptRecord): boolean {
   if (record.type === "attachment") return !record.attachment?.source_uuid;
   return isInterruptRecord(record);
@@ -832,6 +858,262 @@ export function leafChainAncestor(
     if (leafChain.has(chain[i]!)) return chain[i];
   }
   return undefined;
+}
+
+/**
+ * Whether resuming at `point` leaves real messages behind: a prompt record
+ * (or a message absorbed mid-turn) after the point that the list does not
+ * name, i.e. a message the user reverted or edited. Records the list names
+ * after the point are earlier attempts of a message sent again (a retry),
+ * not a revert.
+ */
+export function cutsMessages(
+  records: readonly TranscriptRecord[],
+  point: string,
+  messages: readonly ListMessage[],
+  chain: readonly ChainEntry[] = expectedChain(messages),
+  index: RecordIndex = indexRecords(records),
+): boolean {
+  const names = chainIndex(chain);
+  const children = index.children;
+  const queue = [point];
+  const seen = new Set<string>([point]);
+  while (queue.length > 0) {
+    for (const child of children.get(queue.shift()!) ?? []) {
+      if (!child.uuid || seen.has(child.uuid)) continue;
+      seen.add(child.uuid);
+      const name = ownName(child);
+      const message = isPromptRecord(child) || (child.type === "attachment" && !!child.attachment?.source_uuid);
+      if (message && name && !names.has(name)) return true;
+      queue.push(child.uuid);
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a record is on the transcript's leaf chain (leafChainAncestor):
+ * the CLI resumes and copies only there (probes P4, 39).
+ */
+export function onLeafChain(
+  records: readonly TranscriptRecord[],
+  uuid: string,
+  index: RecordIndex = indexRecords(records),
+): boolean {
+  return leafChainAncestor(records, uuid, index)?.uuid === uuid;
+}
+
+/**
+ * A fork's copy cut on the leaf chain, where the CLI copies: planCopy's cut,
+ * or, when it is off the leaf chain, the cut planned again on the records
+ * down to where its branch leaves it (as planResume moves a turn's point);
+ * `offLeafChain` then says where the cut stood. Null when there is no cut
+ * or the chains do not meet.
+ */
+export function planCopyOnLeafChain(
+  records: readonly TranscriptRecord[],
+  messages: readonly ListMessage[],
+  chain: readonly ChainEntry[] = expectedChain(messages),
+  index: RecordIndex = indexRecords(records),
+): { point: string; coveredIndex: number; offLeafChain?: { point: string; ancestor: string } } | null {
+  const cut = planCopy(records, messages, chain, index);
+  if (!cut) return null;
+  const ancestor = leafChainAncestor(records, cut.point, index);
+  if (!ancestor) return null;
+  if (ancestor.uuid === cut.point) return cut;
+  const kept = chainTo(records, ancestor.uuid!, index);
+  const moved = planCopy(kept, messages, chain, indexRecords(kept));
+  return moved ? { ...moved, offLeafChain: { point: cut.point, ancestor: ancestor.uuid! } } : null;
+}
+
+/**
+ * Where a fork's copy of its parent's transcript is cut (section 5 of the
+ * project): every message of the fork's screen but an answer in words has an
+ * id that finds its record in the transcript, and the copy ends at the record
+ * of the last screen message that has one. Down the screen from its end:
+ * - a user message (a question, a message sent during a turn, a checkpoint):
+ *   the record with its name, or the `attachment` the CLI absorbed it into;
+ * - a tool step: the record of a rebuilt step by name; else the result
+ *   record of its last call by the call's id; else the call record alone
+ *   (its results never reached the CLI: they go as a rebuilt step);
+ * - an answer in words: no id of its own; a missed record named after it
+ *   (another model's answer the transcript holds as text) counts, otherwise
+ *   the answer is reached from the record before it (answerRecords);
+ * - nothing found: the next message up.
+ * When the screen shows an answer right after the found message, the point
+ * moves down its records to the answer (answerRecords); otherwise only the
+ * CLI's own service records after it are taken, never an answer the screen
+ * lacks (a fork made while the parent was answering). Among several records
+ * of one message (retries) the last in file order wins, as everywhere in
+ * this file: a lost process may append its answer under an earlier attempt
+ * after the retry's records, which must not make that attempt the one.
+ * A cut off the leaf chain moves onto it in planCopyOnLeafChain.
+ * Null when the transcript holds no record of the screen. `chain`: the
+ * screen's expected chain when the caller has built it already (a fork
+ * reads several versions of its parent's transcript with one chain).
+ */
+export function planCopy(
+  records: readonly TranscriptRecord[],
+  messages: readonly ListMessage[],
+  chain: readonly ChainEntry[] = expectedChain(messages),
+  index: RecordIndex = indexRecords(records),
+): { point: string; coveredIndex: number } | null {
+  const names = chainIndex(chain);
+  // The last record in file order under each name, tool result id and tool use id.
+  const byName = new Map<string, TranscriptRecord>();
+  const byToolResult = new Map<string, TranscriptRecord>();
+  const byToolUse = new Map<string, TranscriptRecord>();
+  const last = (map: Map<string, TranscriptRecord>, key: string | undefined, record: TranscriptRecord) => {
+    if (!key) return;
+    const kept = map.get(key);
+    if (!kept || record.line > kept.line) map.set(key, record);
+  };
+  for (const record of records) {
+    last(byName, ownName(record), record);
+    for (const id of toolResultIdsOfRecord(record)) last(byToolResult, id, record);
+    for (const id of toolUseIdsOfRecord(record)) last(byToolUse, id, record);
+  }
+  /** The record for these keys: the last in file order. */
+  const pick = (map: Map<string, TranscriptRecord>, keys: readonly string[]): TranscriptRecord | undefined => {
+    let found: TranscriptRecord | undefined;
+    for (const key of keys) {
+      const record = map.get(key);
+      if (record && (!found || record.line > found.line)) found = record;
+    }
+    return found;
+  };
+  /** The chain's entries by list index, built once: the walk down the screen asks for each message. */
+  const entriesByIndex = new Map<number, ChainEntry[]>();
+  for (const entry of chain) {
+    const list = entriesByIndex.get(entry.index);
+    if (list) list.push(entry);
+    else entriesByIndex.set(entry.index, [entry]);
+  }
+  const entriesAt = (i: number) => entriesByIndex.get(i) ?? [];
+  /**
+   * Whether the screen's turn that message `i` is in ends with an answer in
+   * words: past tool steps and their results (a step not found by id:
+   * another model's) and past user messages that start no turn (a reminder
+   * OpenCode spliced in, as listAnswers and missedFrom skip them).
+   */
+  const answerAfter = (i: number): number => {
+    for (let j = i + 1; j < messages.length; j++) {
+      const next = messages[j]!;
+      if (next.role === "tool") continue;
+      if (next.role === "user") {
+        if (startsTurn(next)) return -1;
+        continue;
+      }
+      if (next.role === "assistant" && toolCallIdsOf(next).length === 0) return j;
+    }
+    return -1;
+  };
+  /**
+   * The copy's point for a found record, or undefined when the copy would
+   * end with a call whose result is not in it (Claude writes every call of
+   * one answer before the first result, and OpenCode shows them step by
+   * step: a fork between two such steps holds the first call's result and
+   * not the second's). The CLI cannot resume at a call left unanswered that
+   * way; the walk goes on to the message before.
+   */
+  /** The calls a rebuilt step's record answers (as text), by the record's name. */
+  const stepCalls = new Map<string, string[]>();
+  for (const entry of chain) {
+    if (entry.kind !== "step") continue;
+    for (const name of entry.names) stepCalls.set(name, entry.source.split(","));
+  }
+  /**
+   * The cut for a found record: with the screen's answer after it
+   * (`answer`, a list index) the copy runs down to that answer and covers
+   * it; else it covers the found message (or its tool results) only.
+   * `coveredIndex` is the last list message the copy holds: everything
+   * after it is missed (proxy.ts planChatTurn), a step of the same turn too.
+   */
+  const cut = (found: TranscriptRecord, answer: number, coveredIndex: number) => {
+    let point = answerRecords(records, found, names, answer >= 0, index);
+    // The screen holds the start of the answer only (a stopped turn, answerCutShort): the copy ends before the
+    // answer record, the screen's part goes as missed with the rest.
+    const short = answer >= 0 ? answerCutShort(pathBetween(found, point, index), textOfMessage(messages[answer]!)) : null;
+    if (short) {
+      point = short;
+      answer = -1;
+    }
+    if (dangling(chainTo(records, point.uuid!, index), point, stepCalls)) return undefined;
+    // The screen's answer is covered only when the copy holds Claude's answer
+    // (turnAnswered): another model's answer to a turn that failed is not in
+    // the transcript and goes as text.
+    const covered = answer >= 0 && turnAnswered(records, found, point, index) ? answer : coveredIndex;
+    return { point: point.uuid!, coveredIndex: covered };
+  };
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!;
+    if (message.role === "tool") continue;
+    if (message.role === "assistant") {
+      const calls = toolCallIdsOf(message);
+      const reply = entriesAt(i).find((entry) => entry.kind === "reply");
+      if (calls.length > 0) {
+        // A step: its rebuilt record by name; else its last result by the
+        // call's id (the id the CLI gave and the proxy handed to OpenCode,
+        // probe 43); else the call record alone, or the missed record named
+        // after it (another model's turn that ended on a step).
+        const step = entriesAt(i).find((entry) => entry.kind === "step");
+        const found = (step && pick(byName, step.names)) ?? pick(byToolResult, calls) ?? pick(byToolUse, calls);
+        if (found) {
+          // The step's results are covered when the copy holds them: a
+          // result record, or a rebuilt step's record. A copy that ends at
+          // the call alone leaves the results on the screen to go as missed.
+          let covered = i;
+          const holdsResults = (step !== undefined && step.names.includes(found.uuid!)) || toolResultIdsOfRecord(found).length > 0;
+          if (holdsResults) while (messages[covered + 1]?.role === "tool") covered++;
+          const result = cut(found, answerAfter(i), covered);
+          if (result) return result;
+          continue;
+        }
+      }
+      const missed = reply && pick(byName, reply.names);
+      if (missed) {
+        const result = cut(missed, -1, replyCoverage(messages, i));
+        if (result) return result;
+      }
+      continue;
+    }
+    if (message.role === "user") {
+      const entry = entriesAt(i).find((e) => e.kind === "message" || e.kind === "checkpoint");
+      const found = entry && pick(byName, entry.names);
+      if (found) {
+        const result = cut(found, answerAfter(i), i);
+        if (result) return result;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The records of the screen's answer after `found`, when the screen shows
+ * one: the deepest descendant up to the next prompt record (endOfTurn).
+ * Without an answer on the screen, only the CLI's service records right
+ * after `found` are taken: not an answer or a step the screen lacks.
+ */
+function answerRecords(
+  records: readonly TranscriptRecord[],
+  found: TranscriptRecord,
+  chainNames: ChainNames,
+  withAnswer: boolean,
+  index: RecordIndex = indexRecords(records),
+): TranscriptRecord {
+  if (withAnswer) return endOfTurn(records, found, chainNames, index);
+  return deepestDescendant(found, (record) => isServiceRecord(record), index);
+}
+
+/**
+ * Whether the chain holds a tool call without its result, other than at
+ * `point` itself (a point on a call means its results go as a rebuilt step).
+ * A rebuilt step's record (`stepCalls`, by its name) answers its calls as text.
+ */
+function dangling(chain: readonly TranscriptRecord[], point: TranscriptRecord, stepCalls: ReadonlyMap<string, string[]>): boolean {
+  const answered = new Set(chain.flatMap((record) => [...toolResultIdsOfRecord(record), ...(stepCalls.get(record.uuid!) ?? [])]));
+  return chain.some((record) => record !== point && toolUseIdsOfRecord(record).some((id) => !answered.has(id)));
 }
 
 /**

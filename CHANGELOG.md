@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Forks start from a copy of the parent's transcript**: a forked chat
+  used to send its whole history to Claude as text, writing the prompt cache
+  again; now its first turn copies the parent's Claude transcript (the
+  record uuids kept) up to the last message the fork shows, so the fork
+  reads the parent's cache and Claude sees exactly the fork's screen: a fork
+  through a tool step gets the step's result from the copy, a fork made
+  while the parent was answering gets the question only. A revert or an
+  edit no longer branches the transcript in place: the turn copies it up to
+  the revert point into the next version, and the old version keeps what was
+  reverted, so a fork made before the revert still finds its history. A
+  fork's first turn waits at most 10 s for OpenCode
+  (`OPENCODE_CLAUDE_OPENCODE_READ_MS`); a fork that could not copy its
+  parent, and an empty revert copy, start as text with a warning line in the
+  reasoning.
 - **Sessions resume by name, not by guessing**: the plugin kept a record of
   every chat (`sessions.json`) and matched OpenCode's history against it by
   text fingerprints, which went wrong on a reverted turn asked again, a chat
@@ -9,8 +23,8 @@
   OpenCode's own message ids name the Claude transcript of a chat and every
   record in it: the plugin reads the transcript, finds the last record the
   current history names and resumes right after its turn, so a revert
-  branches the transcript like Claude Code's own `/rewind`, a retry gets a
-  new record, and turns another model answered reach Claude as text. No
+  continues from the turn before the reverted one, a retry gets a new
+  record, and turns another model answered reach Claude as text. No
   record file is kept; an existing `sessions.json` is left alone and ignored,
   so the first turn of an existing chat after the update transfers its
   history once. Requires Claude Code 2.1.300 or later and OpenCode 2.0.19 or

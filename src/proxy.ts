@@ -66,22 +66,35 @@ import { hasPendingContextEvents, peekCompactionEvent, takeContextEvent, type Co
 import { OPENCODE_IMAGE_REMOVED } from "./removed-images.js";
 import { FIRST_EPOCH, MAX_ATTEMPTS, TRANSCRIPT_START_NAME, epochOfList, userRecordName, type ListMessage } from "./names.js";
 import {
+  chainTo,
+  cutsMessages,
   expectedChain,
   launchingEntry,
-  toolCallIdsOf,
   missedFrom,
   planResume,
   planSummaryResume,
   readTranscript,
   recordNames,
+  stepDelivered,
+  toolCallIdsOf,
+  type TranscriptRecord,
 } from "./turn-point.js";
 import { contentOfBody, contentOfEvent, toolsOfEvent, type BodyTool } from "./list-content.js";
 import {
-  currentTranscript,
+  chatTranscripts,
   markTranscriptUnusable,
-  nextTranscript,
+  refOf,
   rememberChatTranscript,
+  type TranscriptRef,
 } from "./transcripts.js";
+import {
+  boundedReader,
+  forkOf,
+  logForkedChat,
+  planForkCopy,
+  sessionReader,
+  type CopySource,
+} from "./session-fork.js";
 import { log } from "./log.js";
 import { checkSubscriptionAuth, cliTooOldMessage, cliVersionTooOld, probeCliVersion } from "./detect.js";
 import {
@@ -756,8 +769,8 @@ async function summaryResumePoint(
   while (first < promptIndex && messages[first]?.role === "system") first++;
   const summarized = summarizedPart(event.messages, messages.slice(first, promptIndex));
   if (!summarized) return null;
-  const transcript = currentTranscript(chatKey, epochOfList(event.messages), configDir);
-  if (!transcript.file) return null;
+  const transcript = (await chatTranscripts(chatKey, epochOfList(event.messages), { configDir })).usable;
+  if (!transcript) return null;
   // A turn still running (background compaction) may end its transcript on
   // an unanswered tool call, which no resume can cut at. The summary resumes
   // at the end of the turn before it: the part up to the message that
@@ -790,7 +803,7 @@ async function summaryResumePoint(
       }
     }
   }
-  const plan = planSummaryResume(await readTranscript(transcript.file), part);
+  const plan = planSummaryResume(transcript.records, part);
   if (!plan) return null;
   return {
     sessionId: transcript.name,
@@ -806,6 +819,8 @@ type ChatTurnPlan = {
   resume?: string;
   resumeSessionAt?: string;
   newSessionId?: string;
+  /** The turn copies `resume` into `newSessionId` (a fork's first turn, session-fork.ts). */
+  forkSession?: boolean;
   missedMessages: ConversationMessage[];
   /** List index of the first missed message (missedMessages start there). */
   missedStart?: number;
@@ -813,7 +828,7 @@ type ChatTurnPlan = {
   recordNames: Map<number, string>;
   /** The last message of the request the transcript holds, up to the resume point. */
   coveredIndex?: number;
-  /** The tool results of the request are in the transcript already: no rebuilt step. */
+  /** No rebuilt step: the tool results are in the transcript, or it never saw the step's turn. */
   stepDelivered?: boolean;
   promptUuid: string;
   epoch: string;
@@ -836,6 +851,10 @@ const TURN_NOTES = {
     "[claude-code warning] The chat's Claude session could not be continued (another process wrote to it, or it could not be loaded), so this turn started a new one with the history as text, without the prompt cache.",
   noRecordBefore:
     "[claude-code warning] The chat's Claude session holds nothing before this message, so this turn started a new one with the history as text, without the prompt cache.",
+  forkCopyFailed:
+    "[claude-code warning] This fork could not copy its parent's Claude session (OpenCode did not answer, or the parent's session no longer holds this history), so its history went as text, without the prompt cache.",
+  revertCopyEmpty:
+    "[claude-code warning] The copy of the chat's Claude session up to the revert held none of its messages, so this turn started a new one with the history as text, without the prompt cache.",
   unmatchedList:
     "[claude-code warning] OpenCode's message list did not match this request, so this turn ran outside the chat's Claude session: the history went as text, without the prompt cache. If this shows on every turn, update the plugin.",
   compacted: "[claude-code] The chat was compacted: this turn starts a new Claude session from the summary.",
@@ -868,6 +887,10 @@ function turnNotes(plan: ChatTurnPlan, hasHistory: boolean): string[] {
       return [TURN_NOTES.noSessionYet];
     case "the transcript holds no record before this message":
       return [TURN_NOTES.noRecordBefore];
+    case "the fork could not copy its parent's transcript":
+      return [TURN_NOTES.forkCopyFailed];
+    case "the copy for the revert holds none of the chat's messages":
+      return [TURN_NOTES.revertCopyEmpty];
     default:
       return [TURN_NOTES.sessionLost];
   }
@@ -882,8 +905,16 @@ async function* withTurnNotes(notes: readonly string[], events: AsyncIterable<un
 /**
  * Plan a chat turn from the context hook's list (turn-point.ts): the chat's
  * transcript in the list's epoch, the resume point in it, the messages the
- * transcript never saw, and the name of this turn's record. No transcript
- * yet, or none the list names: a new transcript with the history as text.
+ * transcript never saw, and the name of this turn's record. The turn
+ * continues the chat's usable transcript, or copies one into the free name
+ * as it runs (`resume` + `forkSession` + `sessionId`, probe 39):
+ * - a revert or an edit (the point leaves real messages behind): the chat's
+ *   own transcript up to the point, so the old version keeps them for a
+ *   fork made before the revert;
+ * - a fork's first turn: its parent's transcript (forkCopySource).
+ * A chat with nothing to continue or copy starts a new transcript with the
+ * history as text, as does one whose transcript holds none of the messages
+ * the list names.
  */
 async function planChatTurn(input: {
   sessionID: string;
@@ -906,9 +937,9 @@ async function planChatTurn(input: {
   if (!launching) {
     return refuseRequest("The request names no user message for Claude to answer.");
   }
-  const transcript = currentTranscript(sessionID, epoch, configDir);
-  const startNew = (why: string, from = transcript) => {
-    const fresh = from.file ? nextTranscript(from) : from;
+  const transcripts = await chatTranscripts(sessionID, epoch, { configDir });
+  const fresh = transcripts.free;
+  const startNew = (why: string) => {
     rememberChatTranscript(conversationKey, fresh);
     log.info("[opencode-claude] starting a new Claude transcript; transferring history", {
       conversationKey,
@@ -919,12 +950,26 @@ async function planChatTurn(input: {
     // A new transcript holds nothing yet: every record takes its first attempt.
     return { newSessionId: fresh.name, missedMessages: [], recordNames: recordNames([], list, chain), promptUuid: launching.names[0]!, epoch, startedBecause: why };
   };
-  if (!transcript.file) {
-    // A version past the first is there because the CLI refused the one before (markTranscriptUnusable).
-    return startNew(transcript.version > 1 ? "the chat's transcript can no longer be continued" : "no transcript of this chat in this epoch");
+  // What the turn is planned on: the usable transcript, or the chain a copy
+  // will hold (the copy has only the source's chain down to the point).
+  let records: TranscriptRecord[];
+  let copyFrom: { name: string; why: "revert" | "fork"; parent?: string } | undefined;
+  /** The parent's transcript a fork's first turn copies, whole: the copy's plan reads it where the copy itself is too short. */
+  let forkSource: CopySource | undefined;
+  if (transcripts.usable) {
+    records = transcripts.usable.records;
+  } else if (transcripts.withRecords.length > 0 || transcripts.refused) {
+    // Nothing usable, or the CLI refused this chat's copy: start over as text, no copy again.
+    return startNew("the chat's transcript can no longer be continued");
+  } else {
+    // No transcript of this chat in this epoch ever held a record: a fork's first turn copies its parent's.
+    const fromParent = await forkCopySource(sessionID, epoch, configDir);
+    forkSource = fromParent.source;
+    if (!forkSource) return startNew(fromParent.failed ? "the fork could not copy its parent's transcript" : "no transcript of this chat in this epoch");
+    records = chainTo(forkSource.records, forkSource.point);
+    copyFrom = { name: forkSource.transcript.name, why: "fork", parent: forkSource.chat };
   }
-  const records = await readTranscript(transcript.file);
-  const plan = planResume(records, list, chain);
+  let plan = planResume(records, list, chain);
   if (plan.kind === "exhausted") {
     log.warn("[opencode-claude] every attempt of the message is taken; refusing it", { conversationKey, attempts: MAX_ATTEMPTS });
     return refuseRequest(ATTEMPTS_EXHAUSTED, "claude_attempts_exhausted");
@@ -935,11 +980,70 @@ async function planChatTurn(input: {
     // version starts with it, and later retries resume there.
     return startNew("the transcript holds no record before this message");
   }
+  // A copy ends at its point by definition: whether the CLI took the tool
+  // results the point ends at shows in what the parent wrote after them. The
+  // copy covers the fork's screen down to the message the cut was made at
+  // (planCopy): everything after it is missed, a later step of the same
+  // turn too (the cut falls back to an earlier step when the parent wrote
+  // the next step's calls before their results), not only the next turn.
+  // The copy's cut is planCopy's, by the ids of the fork's screen: a tool
+  // step found by its call's id can lie past the last record the chain of
+  // names knows (a skill message between turns has a new id in the fork),
+  // and planResume, which only knows names, would put the point before it
+  // while the coverage said after; planResume gives the attempt.
+  if (forkSource && plan.kind === "resume") {
+    const point = forkSource.point;
+    const pointRecord = forkSource.records.find((record) => record.uuid === point);
+    plan = {
+      ...plan,
+      point,
+      coveredIndex: forkSource.coveredIndex,
+      answered: false,
+      ...(pointRecord ? { stepDelivered: stepDelivered(forkSource.records, pointRecord) } : {}),
+      // The copy's cut moved onto the parent's leaf chain (planCopyOnLeafChain).
+      ...(forkSource.offLeafChain ? { offLeafChain: forkSource.offLeafChain } : {}),
+    };
+  }
+  // A revert or an edit: the turn copies the transcript up to the point into
+  // a new version; the old one keeps the messages left behind. A point that
+  // planResume moved onto the leaf chain (another process wrote after the
+  // chat's turns, offLeafChain) is held to the same rule: a copy when the
+  // records past the new point hold a message the list does not name, else
+  // the same file, where the CLI branches at the point as on a retry (what
+  // it leaves behind is the list's own records and the other process's
+  // answer, no message of the user's).
+  if (!copyFrom && cutsMessages(records, plan.point, list, chain)) {
+    const usable = transcripts.usable!;
+    const whole = plan;
+    records = chainTo(usable.records, plan.point);
+    copyFrom = { name: usable.name, why: "revert" };
+    plan = planResume(records, list, chain);
+    if (plan.kind !== "resume") return startNew("the copy for the revert holds none of the chat's messages");
+    // Whether the CLI took the tool results the point ends at shows in what
+    // it wrote after them, which the copy leaves out: read it in the whole transcript.
+    plan = { ...plan, stepDelivered: whole.stepDelivered, ...(whole.offLeafChain ? { offLeafChain: whole.offLeafChain } : {}) };
+  }
+  // The transcript the turn runs on, as a reference: not with its records,
+  // which rememberChatTranscript would keep in memory until the chat's next turn.
+  const transcript: TranscriptRef = copyFrom ? fresh : refOf(transcripts.usable!);
   rememberChatTranscript(conversationKey, transcript);
+  if (copyFrom?.why === "fork") {
+    logForkedChat({
+      id: sessionID,
+      parent: copyFrom.parent!,
+      outcome: "forked",
+      epoch,
+      transcript: transcript.name,
+      version: transcript.version,
+      from: copyFrom.name,
+      point: plan.point,
+    });
+  }
   if (plan.offLeafChain) {
+    // `transcript`: the file the point was found in (a copy's source).
     log.info("[opencode-claude] the resume point is off the transcript's leaf chain; resuming where its branch leaves it", {
       conversationKey,
-      transcript: transcript.name,
+      transcript: copyFrom ? copyFrom.name : transcript.name,
       offPoint: plan.offLeafChain.point,
       ancestor: plan.offLeafChain.ancestor,
     });
@@ -948,10 +1052,10 @@ async function planChatTurn(input: {
   // transcript shows the CLI took them (the turn went on after them, and a
   // revert since cut what followed), or never saw the turn the step is in
   // (another model made the call after a message the transcript lacks: a
-  // batch whose first record was written and whose second was not), or the
-  // point moved onto the leaf chain before the step's call (no step can be
-  // rebuilt there): then the turn is a plain one, and the step goes with
-  // what was missed.
+  // batch whose first record was written and whose second was not; a
+  // fork's copy ends before that turn), or the point moved onto the leaf
+  // chain before the step's call (no step can be rebuilt there): then the
+  // turn is a plain one, and the step goes with what was missed.
   const rebuildStep =
     input.rebuiltStep && !plan.stepDelivered && !plan.offLeafChain && plan.coveredIndex >= stepTurnStart(list);
   // What the list holds after the covered message's turn is what the
@@ -965,12 +1069,15 @@ async function planChatTurn(input: {
     conversationKey,
     transcript: transcript.name,
     version: transcript.version,
+    ...(copyFrom ? { copiedFrom: copyFrom.name, copyFor: copyFrom.why } : {}),
     point: plan.point,
     attempt: plan.attempt,
     missed: missedMessages.length,
   });
   return {
-    resume: transcript.name,
+    ...(copyFrom
+      ? { resume: copyFrom.name, forkSession: true, newSessionId: transcript.name }
+      : { resume: transcript.name }),
     resumeSessionAt: plan.point,
     missedMessages,
     missedStart,
@@ -999,6 +1106,54 @@ function stepTurnStart(list: readonly ListMessage[]): number {
     if (startsTurn(list[i]!)) return i;
   }
   return -1;
+}
+
+/**
+ * A chat whose transcripts in this epoch never held a record: if it is a
+ * fork (`session.get`), the parent's transcript its first turn copies, and
+ * where (session-fork.ts). No source for a chat that is no fork and a fork
+ * with nothing to copy: those start a new transcript with the history as
+ * text. `failed`: there was something to copy, or OpenCode could not say,
+ * and the copy did not come about (the turn says so, TURN_NOTES); a fork
+ * whose parents never ran on Claude has no source and did not fail. (A copy
+ * the CLI refused marks its name unusable: the retry starts a new
+ * transcript, not another copy.)
+ */
+async function forkCopySource(sessionID: string, epoch: string, configDir?: string): Promise<{ source?: CopySource; failed?: boolean }> {
+  const registered = sessionReader();
+  if (!registered) return {};
+  // Every read is bounded in time: an OpenCode that does not answer sends the turn as text, not into a hang.
+  const reader = boundedReader(registered);
+  let fork: Awaited<ReturnType<typeof forkOf>>;
+  try {
+    fork = await forkOf(reader, sessionID);
+  } catch (err) {
+    log.warn("[opencode-claude] could not read the chat from OpenCode", {
+      sessionID,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return { failed: true };
+  }
+  if (!fork) return {};
+  const base = { id: sessionID, parent: fork.sessionID, type: fork.boundary?.type, messageID: fork.boundary?.messageID };
+  try {
+    const plan = await planForkCopy(reader, sessionID, fork.sessionID, configDir);
+    if (plan.kind === "nothing") {
+      logForkedChat({ ...base, outcome: plan.outcome, epoch: plan.epoch, why: plan.why });
+      // The parent has transcripts, but none holds the fork's history where the CLI can copy it.
+      return { failed: plan.outcome === "nothing-before" };
+    }
+    // The hook's list and session.context name the same epoch; if not (the
+    // fork changed between them), the copy would be of the wrong file.
+    if (plan.epoch !== epoch) {
+      logForkedChat({ ...base, outcome: "failed", epoch, why: "the fork's epoch changed while it was read" });
+      return { failed: true };
+    }
+    return { source: plan.source };
+  } catch (err) {
+    logForkedChat({ ...base, outcome: "failed", epoch, why: err instanceof Error ? err.message : String(err) });
+    return { failed: true };
+  }
 }
 
 /** Prompt contents joined into one: texts by a blank line; with attachments, as blocks in order. */
@@ -1495,10 +1650,10 @@ async function handleChatCompletions(
     // turn's open input: the CLI takes each as the user's own message ahead
     // of the results and absorbs it into the turn under the name of its
     // record (an `attachment` with the name as `source_uuid`, probe 7), so
-    // the next turn finds it by name (turn-point.ts). An input that is
-    // already closed belongs to a process that stopped reading (it is
-    // exiting): nothing reaches it, and the messages reach Claude on the
-    // next turn, as missed.
+    // the next turn and a fork's copy find it by name (turn-point.ts). An
+    // input that is already closed belongs to a process that stopped reading
+    // (it is exiting): nothing reaches it, and the messages reach Claude on
+    // the next turn, as missed.
     const forward = freshSteering.length > 0 && resolvable.length > 0;
     if (forward && existing.input && !existing.input.ended()) {
       for (const m of freshSteering) {
@@ -1850,6 +2005,8 @@ async function startNewTurn(input: {
   let resume: string | undefined = summaryResume?.sessionId;
   let resumeSessionAt: string | undefined = summaryResume?.leafUuid;
   let newSessionId: string | undefined;
+  // A fork's first turn copies `resume` into `newSessionId` (session-fork.ts).
+  let forkSession = false;
   // Turns after the resume point that the transcript never saw: the user
   // switched to another model for them, or they failed before Claude ran. A
   // resume alone would skip them, so they go ahead of the prompt, a record
@@ -1876,13 +2033,14 @@ async function startNewTurn(input: {
       configDir,
     });
     if (planned instanceof Response) return planned;
-    // The step's results are in the transcript, or its call is off the leaf
-    // chain the turn resumes on: a plain turn on the user messages after them.
+    // The step's results are in the transcript, the transcript never saw the
+    // step's turn, or the step's call is off the leaf chain the turn resumes
+    // on: a plain turn on the user messages after them.
     if (planned.stepDelivered) {
       log.info(
         planned.offLeafChain
           ? "[opencode-claude] the tool step's call is off the transcript's leaf chain; sending the step as text"
-          : "[opencode-claude] the transcript holds the tool step's results; not rebuilding it",
+          : "[opencode-claude] not rebuilding the tool step: the transcript holds its results or never saw its turn",
         { conversationKey },
       );
       answeredStep = null;
@@ -1892,6 +2050,7 @@ async function startNewTurn(input: {
     resume = planned.resume;
     resumeSessionAt = planned.resumeSessionAt;
     newSessionId = planned.newSessionId;
+    forkSession = planned.forkSession === true;
     missedMessages = planned.missedMessages;
     promptUuid = planned.promptUuid;
     epoch = planned.epoch;
@@ -2130,8 +2289,9 @@ async function startNewTurn(input: {
   const droppedPlanning = droppedBeforeStart(req, conversationKey, true);
   if (droppedPlanning) return droppedPlanning;
   // A new transcript starts with a record of its own, before the turn's; a
+  // copy (`resume` + `forkSession` into `sessionId`) has its source's. A
   // chat turn's records go to the CLI one by one, so each keeps its name.
-  const chatPrompt = !isMetaRequest && newSessionId ? withTranscriptStart(queryPrompt, TRANSCRIPT_START_NAME) : queryPrompt;
+  const chatPrompt = !isMetaRequest && newSessionId && !resume ? withTranscriptStart(queryPrompt, TRANSCRIPT_START_NAME) : queryPrompt;
   const oneByOne = !isMetaRequest && typeof chatPrompt !== "string" ? recordsOneByOne(chatPrompt) : undefined;
   handle = withGracefulStop(await queryStarter(
     summaryResume
@@ -2174,6 +2334,7 @@ async function startNewTurn(input: {
     resume: isMetaRequest ? undefined : resume,
     resumeSessionAt: isMetaRequest ? undefined : resumeSessionAt,
     sessionId: isMetaRequest ? undefined : newSessionId,
+    forkSession: !isMetaRequest && forkSession ? true : undefined,
     effort: isMetaRequest ? undefined : selection.effort,
     fastMode,
     env,
@@ -2751,8 +2912,9 @@ export async function buildOpenCodeMcpServer(
           async (args: Record<string, unknown>, extra?: unknown) => {
             // The id Claude gave the call, which the CLI passes along (probe
             // 43): OpenCode then shows the step under the same id the
-            // transcript's call and result records carry. An id already held
-            // for a parked call (the CLI never repeats one) gets an id of the
+            // transcript's call and result records carry, and a fork's copy
+            // finds the step by it (turn-point.ts). An id already held for a
+            // parked call (the CLI never repeats one) gets an id of the
             // plugin's own.
             const given = toolUseIdOf(extra);
             const id = pendingTools.has(given) ? `call_${randomUUID().replace(/-/g, "").slice(0, 24)}` : given;

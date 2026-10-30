@@ -2,18 +2,26 @@
  * Which Claude Code transcript a chat continues in.
  *
  * A chat's transcript is named from the chat id, its epoch (names.ts) and a
- * version: 1 as a rule, the next number whenever the current transcript can
- * no longer be continued (the resume point is not on the CLI's leaf chain
- * any more, the transcript has no record to resume at, the CLI cannot load
- * the file). The current transcript is the highest version that exists
- * on disk; a version marked unusable in this process is skipped. No record of
- * this is kept anywhere: it is recomputed from the file names, with a cache
- * per process that is checked against the disk on every lookup.
+ * version, 1 first. A new version is written when the chat is reverted (the
+ * turn copies the transcript up to the revert into it, so the old version
+ * keeps what a fork made before the revert can still copy; a revert to the
+ * chat's start copies the record every transcript starts with), and when the
+ * transcript cannot be continued at all (the CLI refused it: another process
+ * wrote a branch into it; it holds no record to resume at).
+ *
+ * Two names matter for a turn: the usable transcript, the highest version
+ * that holds records and was not marked unusable in this process; and the
+ * free name, the version after every one on disk. A file without records
+ * (a copy whose process was killed) is not usable, and its name is taken:
+ * the CLI writes into no existing file. No record of this is kept anywhere:
+ * it is read from the files, with a cache per process of how far the
+ * versions go.
  */
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { claudeConfigDir } from "./config-dir.js";
 import { transcriptName } from "./names.js";
+import { readTranscript, type TranscriptRecord } from "./turn-point.js";
 
 /**
  * Locate the Claude Code transcript for a session id. A missing file means
@@ -64,7 +72,7 @@ export type TranscriptRef = {
 };
 
 type TranscriptsRuntime = {
-  /** Highest version known per chat and epoch. */
+  /** Highest version seen on disk per chat and epoch: a lookup goes past a deleted one. */
   versions: Map<string, number>;
   /** Highest version that can no longer be continued, per chat and epoch. */
   unusable: Map<string, number>;
@@ -98,41 +106,109 @@ function remember<T>(map: Map<string, T>, k: string, value: T): void {
   map.set(k, value);
 }
 
-/**
- * The transcript a chat continues in this epoch: the highest version on
- * disk above the versions marked unusable. `file` is null when no transcript
- * of that version exists yet: the turn creates it (`sessionId`). `configDir`
- * is the Claude account of the chat's project (`configDirs`).
- */
-export function currentTranscript(sessionID: string, epoch: string, configDir?: string): TranscriptRef {
-  const k = key(sessionID, epoch);
-  let version = Math.max(runtime.versions.get(k) ?? 1, (runtime.unusable.get(k) ?? 0) + 1);
-  // The project folders are listed once: every version's name is looked for in them.
-  const folders = projectFolders(configDir);
-  let file = fileIn(folders, transcriptName(sessionID, epoch, version));
-  // Another process, or a fallback of an earlier turn, may have gone further.
-  for (;;) {
-    const next = fileIn(folders, transcriptName(sessionID, epoch, version + 1));
-    if (!next) break;
-    version += 1;
-    file = next;
-  }
-  remember(runtime.versions, k, version);
-  return { sessionID, epoch, version, name: transcriptName(sessionID, epoch, version), file };
+/** A transcript on disk and its records. */
+export type TranscriptFile = TranscriptRef & { file: string; records: TranscriptRecord[] };
+
+/** The reference of a transcript file: the same without its records, for what is kept beyond the turn. */
+export function refOf(transcript: TranscriptFile): TranscriptRef {
+  return { sessionID: transcript.sessionID, epoch: transcript.epoch, version: transcript.version, name: transcript.name, file: transcript.file };
 }
 
-/** The transcript after the current one: a name no file has yet, for a turn that starts over. */
-export function nextTranscript(current: TranscriptRef): TranscriptRef {
-  const version = current.version + 1;
-  remember(runtime.versions, key(current.sessionID, current.epoch), version);
-  return {
-    sessionID: current.sessionID,
-    epoch: current.epoch,
+/** A chat's transcripts in an epoch: the one a turn continues, and the name a new one gets. */
+export type ChatTranscripts = {
+  /** The highest version with records, not marked unusable; null when there is none. */
+  usable: TranscriptFile | null;
+  /**
+   * Versions with records, highest first, down to the usable one (none at
+   * or below a version the CLI refused, which are not read); with
+   * `all`, every one, or down to where `enough` stopped (a fork looks for its
+   * history in each, until one holds all of it).
+   */
+  withRecords: TranscriptFile[];
+  /** The version after every one on disk or marked unusable: a new transcript is written under it. */
+  free: TranscriptRef;
+  /**
+   * A transcript of this chat and epoch was marked unusable in this process
+   * (the CLI refused to continue or to copy it): a turn with nothing usable
+   * then starts over as text rather than copying again.
+   */
+  refused: boolean;
+};
+
+/**
+ * Missing version numbers a lookup steps over before it stops: a name the
+ * CLI refused before it wrote the file leaves a gap, and the versions after
+ * it must still be found, in this process or after a restart.
+ */
+const MAX_VERSION_GAP = 3;
+
+/**
+ * The transcripts of a chat in an epoch, read from disk (see the head of this
+ * file). `configDir` is the Claude account of the chat's project
+ * (`configDirs`), whose folder holds them.
+ */
+export async function chatTranscripts(
+  sessionID: string,
+  epoch: string,
+  options: {
+    all?: boolean;
+    configDir?: string;
+    /**
+     * With `all`: called with each version as it is read, highest first; true
+     * when those read suffice, and the older ones are not read (`usable` is
+     * then null if none of them could be continued).
+     */
+    enough?: (transcript: TranscriptFile) => boolean;
+  } = {},
+): Promise<ChatTranscripts> {
+  const k = key(sessionID, epoch);
+  const ref = (version: number): TranscriptRef => ({
+    sessionID,
+    epoch,
     version,
-    name: transcriptName(current.sessionID, current.epoch, version),
+    name: transcriptName(sessionID, epoch, version),
     file: null,
-  };
+  });
+  const unusableUpTo = runtime.unusable.get(k) ?? 0;
+  const known = Math.max(runtime.versions.get(k) ?? 0, unusableUpTo);
+  const files: Array<TranscriptRef & { file: string }> = [];
+  // The project folders are listed once: every version's name is looked for in them.
+  const folders = projectFolders(options.configDir);
+  for (let version = 1, gap = 0; ; version++) {
+    const file = fileIn(folders, transcriptName(sessionID, epoch, version));
+    if (file) {
+      files.push({ ...ref(version), file });
+      gap = 0;
+      continue;
+    }
+    gap += 1;
+    if (version > known && gap > MAX_VERSION_GAP) break;
+  }
+  const lastFile = files.at(-1)?.version ?? 0;
+  remember(runtime.versions, k, Math.max(runtime.versions.get(k) ?? 0, lastFile));
+  // A name whose turn wrote nothing (the process never started) is free again;
+  // one the CLI refused is not.
+  const highest = Math.max(lastFile, unusableUpTo);
+  // A turn reads from the highest version down to the usable one; a fork reads all.
+  const withRecords: TranscriptFile[] = [];
+  let usable: TranscriptFile | null = null;
+  for (const file of [...files].reverse()) {
+    // A turn has no use for a version the CLI refused or one older: none can
+    // be continued, and the turn starts over (refused). Only a fork reads them.
+    if (!options.all && file.version <= unusableUpTo) break;
+    const records = await readTranscript(file.file);
+    if (records.length === 0) continue;
+    const transcript = { ...file, records };
+    withRecords.push(transcript);
+    if (!usable && file.version > unusableUpTo) {
+      usable = transcript;
+      if (!options.all) break;
+    }
+    if (options.all && options.enough?.(transcript)) break;
+  }
+  return { usable, withRecords, free: ref(highest + 1), refused: unusableUpTo > 0 };
 }
+
 
 /** Which transcript a chat's turn used, so a failure of that turn can mark it. */
 export function rememberChatTranscript(conversationKey: string, transcript: TranscriptRef): void {
