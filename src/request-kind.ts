@@ -1,6 +1,8 @@
 /**
- * Detect OpenCode meta-requests (session title, compaction/summary) that must
- * not run as a full Claude Code agent turn.
+ * OpenCode meta-requests (session title, compaction/summary, generation) that
+ * must not run as a full Claude Code agent turn, and what the plugin reads
+ * from OpenCode's system prompt. The kind comes from the plugin's
+ * `model.request` hook (proxy.ts resolveMetaKind), never from the text.
  */
 import { extractTextContent } from "./prompt.js";
 
@@ -15,62 +17,15 @@ type MessageLike = {
   content?: unknown;
 };
 
+/**
+ * OpenCode's system prompt: the request's first message. OpenCode 2.0.19 and
+ * later join the system parts into that one message (@opencode/ai
+ * protocols/openai-chat.ts lowerMessages) and send a system update
+ * mid-conversation as user text.
+ */
 export function metaSystemPrompt(messages: MessageLike[]): string {
-  return messages
-    .filter((m) => m.role === "system")
-    .map((m) => extractTextContent(m.content))
-    .join("\n");
-}
-
-function userText(messages: MessageLike[]): string {
-  return messages
-    .filter((m) => m.role === "user")
-    .map((m) => extractTextContent(m.content))
-    .join("\n");
-}
-
-export function isTitleGenerationRequest(messages: MessageLike[]): boolean {
-  const system = metaSystemPrompt(messages).toLowerCase();
-  return (
-    system.includes("title generator") ||
-    system.includes("generate a short title") ||
-    system.includes("generate a brief title") ||
-    system.includes("output only a thread title")
-  );
-}
-
-export function isSummaryGenerationRequest(messages: MessageLike[]): boolean {
-  const system = metaSystemPrompt(messages).toLowerCase();
-  if (
-    system.includes("anchored context summarization") ||
-    system.includes("summarizing, compacting, or merging context") ||
-    system.includes("tasked with summarizing conversations") ||
-    system.includes("write like a pull request description") ||
-    system.includes("summarize what was done in this conversation")
-  ) {
-    return true;
-  }
-
-  const user = userText(messages).toLowerCase();
-  return (
-    user.includes(
-      "this summary will be the only context available when the conversation continues",
-    ) ||
-    user.includes(
-      "create a detailed summary for continuing this coding session",
-    ) ||
-    user.includes("anchored summary from the conversation history") ||
-    user.includes("anchored summary below using the conversation history") ||
-    user.includes("<previous-summary>")
-  );
-}
-
-export function detectMetaRequestKind(
-  messages: MessageLike[],
-): MetaRequestKind {
-  if (isTitleGenerationRequest(messages)) return "title";
-  if (isSummaryGenerationRequest(messages)) return "summary";
-  return null;
+  const first = messages[0];
+  return first?.role === "system" ? extractTextContent(first.content) : "";
 }
 
 /** Namespace so meta requests never collide with live agent session state. */
@@ -90,24 +45,25 @@ export function requestKeyNamespace(kind: MetaRequestKind): string {
  */
 export function codeModeCatalog(messages: MessageLike[]): string {
   const system = metaSystemPrompt(messages);
-  const heading = /^# Code Mode[\t ]*\r?$/m.exec(system);
+  const heading = /^# Code Mode[\t ]*$/m.exec(system);
   if (!heading) return "";
   const rest = system.slice(heading.index);
   // "## Code Mode tools (call only inside `execute`)" from OpenCode 2.2.1.
-  const toolsHeading = /^## (?:Available tools|Code Mode tools\b[^\r\n]*)[\t ]*\r?$/m.exec(rest);
+  const toolsHeading = /^## (?:Available tools|Code Mode tools\b[^\r\n]*)[\t ]*$/m.exec(rest);
   if (!toolsHeading) return "";
 
   // OpenCode renders namespace/tool listings as one block, separated from
   // subsequent instructions by a blank line. A level-one heading alone is
   // not a boundary: date, environment, and skills need not have headings.
+  // The date and the environment always follow the catalog (OpenCode 2.0.19
+  // and later, session/context.ts), so a boundary is always there.
   const afterHeading = toolsHeading.index + toolsHeading[0].length;
-  const leadingWhitespace = /^(?:[\t ]*\r?\n)+/.exec(rest.slice(afterHeading));
+  const leadingWhitespace = /^(?:[\t ]*\n)+/.exec(rest.slice(afterHeading));
   const catalogStart = afterHeading + (leadingWhitespace?.[0].length ?? 0);
   const catalog = rest.slice(catalogStart);
-  if (!/^- /m.test(catalog.split(/\r?\n/, 1)[0])) return "";
-  const boundary = /\r?\n[\t ]*\r?\n|\r?\n#{1,6} /.exec(catalog);
-  const end = catalogStart + (boundary ? boundary.index : catalog.length);
-  return rest.slice(0, end).trim();
+  if (!/^- /m.test(catalog.split("\n", 1)[0])) return "";
+  const boundary = /\n[\t ]*\n|\n#{1,6} /.exec(catalog)!;
+  return rest.slice(0, catalogStart + boundary.index).trim();
 }
 
 const SKILLS_INTRO = "Skills provide specialized instructions and workflows for specific tasks.";
@@ -116,8 +72,9 @@ const SKILLS_INTRO = "Skills provide specialized instructions and workflows for 
  * OpenCode lists its skills only in the system prompt, which the plugin
  * otherwise doesn't forward. Without the list Claude has the skill tool but
  * no ids to pass it. Returns the skills block as OpenCode rendered it
- * (skill/instructions.ts): its intro through `</available_skills>`, or
- * through the "no skills" line.
+ * (skill/instructions.ts): its intro through `</available_skills>`. With no
+ * skill OpenCode 2.0.19 and later leave the block out (its section reads as
+ * removed), never render the "no skills" line in the system prompt.
  */
 export function skillsCatalog(messages: MessageLike[]): string {
   const system = metaSystemPrompt(messages);
@@ -126,13 +83,16 @@ export function skillsCatalog(messages: MessageLike[]): string {
   const rest = system.slice(start);
   const listEnd = rest.indexOf("</available_skills>");
   if (listEnd >= 0) return rest.slice(0, listEnd + "</available_skills>".length).trim();
-  const none = rest.indexOf("No skills are currently available.");
-  if (none >= 0) return rest.slice(0, none + "No skills are currently available.".length).trim();
   return "";
 }
 
-/** How OpenCode's own system prompts open (session/runner/prompt, plugin/system-prompt). */
-const STOCK_AGENT_PROMPT = /^\s*You are (?:an AI agent running in OpenCode|OpenCode|opencode)\b/;
+/**
+ * How OpenCode's own system prompt opens for a Claude model (session/runner/
+ * prompt, 2.0.19 and later). Its other stock prompts ("You are OpenCode",
+ * "You are opencode", plugin/optimize.ts) go only to models whose id names
+ * kimi, trinity or muse, never to the plugin's.
+ */
+const STOCK_AGENT_PROMPT = /^\s*You are an AI agent running in OpenCode\b/;
 const MODEL_IDENTITY_HEADING = /^# Your Model[\t ]*\r?$/m;
 
 /**

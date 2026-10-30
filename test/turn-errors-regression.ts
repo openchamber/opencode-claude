@@ -1,168 +1,232 @@
 /**
  * Regression: failed turns report what actually went wrong.
- * - Error results carry `errors` and `terminal_reason`, not `result`; the
- *   text comes from `errors` without the CLI's "[ede_diagnostic]" entries,
- *   else from the terminal reason.
  * - A context overflow is a 400 context_length_exceeded that OpenCode
- *   compacts on; an image error is a non-retryable 400.
- * - A meta request that hits its one-step limit says so plainly.
- * - Lost-session detection and dedupe with the SDK's iterator error keep
- *   working on the new text.
+ *   compacts on; an image error is a non-retryable 400; an account decision
+ *   (billing) is a 402 OpenCode does not retry.
+ * - A lost session is noticed and the history goes to a new one.
+ * - Two cases fail by a finding and live in files of their own until it is
+ *   fixed: an error the SDK reports twice (result event and iterator throw)
+ *   shows once — turn-error-noted-twice-regression.ts; a meta request that
+ *   hits its one-step limit says so plainly —
+ *   turn-errors-title-max-turns-regression.ts.
+ * - A CLI that did not start is a retryable 500 and drops the memoized CLI
+ *   path, so OpenCode's retry looks for the CLI again.
  *
- * Run: bun test/turn-errors-regression.ts
+ * main's behaviour and the series' steps before chain/turn-by-names (the
+ * session file the plugin records, the journal's words for a lost one); the
+ * series' own, with transcripts by name, is turn-errors-regression.ts. The
+ * launch failure is feat/cli-auto-update's.
+ *
+ * On the simulators (test/simulators/): each failure as Claude Code 2.1.312
+ * reports it (`state.failures`, `summaryFailures`; BEHAVIOR.md "Failures of a
+ * model call"): a synthetic error record, a `success` result with
+ * `is_error`, then the SDK's throw. The lost session: its transcript file is
+ * gone from Claude's profile. The CLI's "[ede_diagnostic]"
+ * lines come with the error result of an interrupted turn: the user stops a
+ * turn while it streams. The old cases of an overflow reported as
+ * `error_during_execution` with only diagnostics are gone: CLI 2.1.312
+ * reports it as `success` + `is_error`. The launch failure: the texts the
+ * Agent SDK and Bun give are checked by the plugin's own
+ * `isClaudeLaunchFailure`; the turn goes through the plugin's real query
+ * starter and the real SDK (`turnThroughRealSdk`) after the launcher the
+ * plugin memoized is gone, so the SDK itself names the missing executable
+ * (the official installer's binary, memoized at setup); OpenCode's retry
+ * should find the CLI where it is then. On Windows also npm's older
+ * `cli.js`, which the SDK runs through node: node itself reports the missing
+ * module.
+ *
+ * The image error is the API's 400 "image exceeds 5 MB maximum", which CLI
+ * 2.1.312 reports as "Image was too large. Try resizing the image or using a
+ * different approach." (`terminal_reason: "image_error"`, probe case "400
+ * image too large"): a 400 on every tree. The 413 "Request too large (max
+ * 32MB)…" is a different failure, the request's size, not an image's:
+ * request-too-large-regression.ts.
+ *
+ * Run: bun test/turn-errors-main-regression.ts
  */
-import {
-  classifyClaudeFailure,
-  failureStatusFor,
-  resultErrorText,
-  thrownErrorText,
-} from "../src/failure.ts";
-import { assert, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 
-const DIAG = "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use";
-
-/** OpenCode 2.x context overflow check (packages/ai/src/provider-error.ts), abridged. */
-function openCodeSeesOverflow(body: any): boolean {
-  return (
-    body?.error?.code === "context_length_exceeded" ||
-    /prompt is too long|exceeds the context window/i.test(String(body?.error?.message))
-  );
-}
+import { testCases } from "./simulators/cases.ts";
+import type { ClaudeFailure } from "./simulators/claude-code.ts";
+import { createWorld, pluginModule } from "./simulators/world.ts";
 
 async function main() {
-  // Text sources.
-  assert.equal(
-    resultErrorText({ type: "result", subtype: "error_during_execution", is_error: true, errors: [DIAG], terminal_reason: "prompt_too_long" }),
-    "Prompt is too long: the conversation exceeds the context window.",
-  );
-  assert.equal(
-    resultErrorText({ type: "result", subtype: "error_during_execution", is_error: true, errors: [DIAG, "API Error: 500 boom"] }),
-    "API Error: 500 boom",
-  );
-  assert.equal(
-    resultErrorText({ type: "result", subtype: "success", is_error: true, result: "Prompt is too long" }),
-    "Prompt is too long",
-  );
-  assert.match(resultErrorText({ type: "result", subtype: "error_max_turns", is_error: true, errors: [] }), /turn limit/);
-  assert.equal(resultErrorText({ type: "result", subtype: "error_during_execution", is_error: true, errors: [] }), "Claude turn failed");
-  assert.equal(thrownErrorText(new Error(`Claude Code returned an error result: ${DIAG}`)), null);
-  assert.equal(
-    thrownErrorText(new Error(`Claude Code returned an error result: No conversation found; ${DIAG}`)),
-    "Claude Code returned an error result: No conversation found",
-  );
-  assert.equal(thrownErrorText(new Error("spawn failed")), "spawn failed");
-  assert.equal(classifyClaudeFailure("Prompt is too long"), "context_overflow");
-  // Anthropic moving third-party usage off the plan is an account decision:
-  // 402, which OpenCode doesn't retry, never a retryable 500.
-  assert.equal(classifyClaudeFailure("API Error: 400 Third-party apps now draw from extra usage, not plan limits"), "billing");
-  assert.equal(failureStatusFor("billing"), 402);
-  assert.equal(classifyClaudeFailure('API Error: 400 {"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}'), "context_overflow");
-  assert.equal(classifyClaudeFailure("API Error: 400 messages.0.content.1.image.source.base64: image exceeds 5 MB maximum"), "image");
-  assert.equal(classifyClaudeFailure("Could not process image"), "image");
-  assert.equal(classifyClaudeFailure("API Error: 500 boom"), "unknown");
-
-  const { post, port, proxy } = await startMockedProxy("turn-errors");
-  const { setForeignSessionId, getForeignSessionId } = await import("../src/session-store.ts");
-  const failWith = (events: unknown[], thrown?: string) =>
-    proxy.setClaudeQueryStarter(async () =>
-      mockHandle(
-        (async function* () {
-          yield* events;
-          if (thrown) throw new Error(thrown);
-        })(),
-      ),
-    );
+  const world = await createWorld("turn-errors");
+  const { opencode, claude } = world;
+  const cases = testCases();
   try {
-    // Context overflow before any output → 400 OpenCode compacts on, both modes.
-    for (const stream of [true, false]) {
-      failWith(
-        [{ type: "result", subtype: "error_during_execution", is_error: true, errors: [DIAG], terminal_reason: "prompt_too_long" }],
-        `Claude Code returned an error result: ${DIAG}`,
+    // The official installer's binary in the world's bin, found first on PATH
+    // (Windows tries .exe before npm's .cmd; elsewhere it replaces npm's
+    // shim): the launcher the plugin memoizes at setup, gone in the launch
+    // failure at the end.
+    claude.installCli(join(world.tmp, "bin"), { layout: "local-bin" });
+    await opencode.startPlugin();
+    /** A chat with one answered turn and a second question; Claude's next query fails as `failure`. */
+    const failedTurn = async (failure: ClaudeFailure) => {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "one");
+      assert.ok((await opencode.turn(chat)).ok);
+      await opencode.say(chat, "two");
+      claude.state.failures = [failure];
+      const queries = claude.queries.length;
+      const retries = opencode.retries.length;
+      let turn: Awaited<ReturnType<typeof opencode.turn>>;
+      try {
+        turn = await opencode.turn(chat);
+      } finally {
+        claude.state.failures = [];
+      }
+      const first = turn.requests[0]!;
+      const error = first.reply?.raw ? JSON.parse(first.reply.raw).error : undefined;
+      return { chat, turn, first, error, queries: claude.queries.length - queries, retries: opencode.retries.length - retries };
+    };
+
+    await cases.run("a context overflow before any output is a 400 OpenCode compacts on, then the step answers", async () => {
+      const { chat, turn, first, error } = await failedTurn("promptTooLong");
+      assert.equal(first.status, 400, first.reply?.raw);
+      assert.equal(error.type, "invalid_request_error");
+      assert.equal(error.code, "context_length_exceeded");
+      assert.equal(turn.compactions?.[0]?.status, "completed", "OpenCode compacted after the overflow");
+      assert.ok(turn.ok, "the step sent again after the compaction answers");
+      assert.ok(opencode.session(chat).messages.some((m) => m.type === "compaction"));
+    });
+
+    await cases.run("Anthropic refusing to bill this usage is a 402 OpenCode does not send again", async () => {
+      const { turn, first, error, retries } = await failedTurn("creditBalance");
+      assert.equal(first.status, 402, first.reply?.raw);
+      assert.equal(error.type, "billing_error");
+      assert.ok(!turn.ok);
+      assert.equal(retries, 0, "not sent again");
+    });
+
+    await cases.run("the chat's Claude session file is gone: the plugin notices and the history goes to a new session", async () => {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "LOST-ONE");
+      assert.ok((await opencode.turn(chat)).ok);
+      const lost = claude.queries.at(-1)!.name;
+      rmSync(claude.fileOf(lost));
+      await opencode.say(chat, "LOST-TWO");
+      const turn = await opencode.turn(chat);
+      assert.ok(turn.ok, "the turn answers");
+      assert.equal(turn.requests.length, 1, "in one request");
+      const query = claude.queries.at(-1)!;
+      assert.notEqual(query.params.resume, lost, "the lost session is not resumed");
+      assert.match(query.view, /<conversation_history>[\s\S]*LOST-ONE[\s\S]*Latest user message:\nLOST-TWO/, "the history reaches the new session");
+      assert.ok(world.journal().some((line) => /stored Claude session file missing/.test(line)), "the journal names the lost session");
+    });
+
+    await cases.run("the user stops a turn while it streams: the CLI's diagnostics reach neither OpenCode nor the journal", async () => {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "STOP-ME");
+      let release!: () => void;
+      claude.state.holdMidAnswer = new Promise<void>((resolve) => (release = resolve));
+      const stop = new AbortController();
+      const stopping = opencode.turn(chat, { stop: stop.signal });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      stop.abort();
+      const stopped = await stopping;
+      assert.ok(stopped.stopped, "the turn was stopped");
+      // The plugin stops the process while the answer still streams.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const interrupted = claude.queries.at(-1)!;
+      assert.equal(interrupted.outcome, "stopped");
+      assert.ok(
+        claude.records(interrupted.name).some((r) => r.type === "user" && /\[Request interrupted by user\]/.test(JSON.stringify(r.message?.content))),
+        "Claude Code ended the turn as interrupted (its error result carries the diagnostics)",
       );
-      const res = await post(`overflow-${stream}`, { stream, messages: [{ role: "user", content: "hi" }] });
-      assert.equal(res.status, 400);
-      const body = (await res.json()) as any;
-      assert.equal(body.error.type, "invalid_request_error");
-      assert.equal(body.error.code, "context_length_exceeded");
-      assert.ok(openCodeSeesOverflow(body));
-      assert.doesNotMatch(body.error.message, /ede_diagnostic/);
-    }
+      await opencode.say(chat, "AFTER-STOP");
+      const next = await opencode.turn(chat);
+      assert.ok(next.ok);
+      assert.doesNotMatch(JSON.stringify(next.requests.map((r) => r.reply)), /ede_diagnostic/);
+      assert.ok(!world.journal().some((line) => /ede_diagnostic/.test(line)), "no diagnostics in the journal");
+    });
 
-    // Buffered: overflow after partial text still returns the 400.
-    failWith([textDelta("partial"), { type: "result", subtype: "success", is_error: true, result: "Prompt is too long" }]);
-    {
-      const res = await post("overflow-late", { stream: false, messages: [{ role: "user", content: "hi" }] });
-      assert.equal(res.status, 400);
-      assert.ok(openCodeSeesOverflow(await res.json()));
-    }
+    await cases.run("an image error is a 400 OpenCode does not send again", async () => {
+      const { turn, first, error, queries, retries } = await failedTurn("imageTooLarge");
+      assert.ok(!turn.ok);
+      assert.equal(retries, 0, "not sent again");
+      assert.equal(queries, 1);
+      assert.equal(first.status, 400, `an image error is a 400: ${first.reply?.raw}`);
+      assert.equal(error.type, "invalid_request_error");
+      assert.equal(error.code, "claude_image_error");
+    });
 
-    // Image errors → non-retryable 400.
-    failWith([
-      {
-        type: "result",
-        subtype: "error_during_execution",
-        is_error: true,
-        errors: [DIAG, "API Error: 400 messages.0.content.1.image.source.base64: image exceeds 5 MB maximum"],
-      },
-    ]);
-    {
-      const res = await post("image", { stream: true, messages: [{ role: "user", content: "hi" }] });
-      assert.equal(res.status, 400);
-      const body = (await res.json()) as any;
-      assert.equal(body.error.type, "invalid_request_error");
-      assert.equal(body.error.code, "claude_image_error");
-      assert.match(body.error.message, /image exceeds 5 MB/);
-    }
+    await cases.run("the texts of a failed launch (Agent SDK 0.3.x, Bun) are told from other failures", async () => {
+      // The CLI did not start (launcher swapped by `claude update`, layout changed by an install). Wordings of
+      // sdk.mjs: a missing executable, a failed spawn.
+      const { isClaudeLaunchFailure } = await pluginModule("failure");
+      assert.equal(typeof isClaudeLaunchFailure, "function", "failure.ts tells a failed launch from other failures");
+      assert.ok(isClaudeLaunchFailure("Claude Code native binary not found at C:\\Users\\me\\.local\\bin\\claude.exe. Please ensure Claude Code is installed via native installer or specify a valid path with options.pathToClaudeCodeExecutable."));
+      assert.ok(isClaudeLaunchFailure("Claude Code executable not found at /opt/claude. Is options.pathToClaudeCodeExecutable set?"));
+      assert.ok(isClaudeLaunchFailure("Claude Code executable at /opt/claude exists but failed to launch."));
+      assert.ok(isClaudeLaunchFailure("Failed to spawn Claude Code process: spawn EBUSY"));
+      // Bun throws other spawn errors at query(), naming the system call:
+      // Windows (launcher held open by another program), then POSIX.
+      assert.ok(isClaudeLaunchFailure("EBUSY: resource busy or locked, uv_spawn"));
+      assert.ok(isClaudeLaunchFailure("ETXTBSY: text file busy, posix_spawn"));
+      assert.ok(isClaudeLaunchFailure("Claude Code executable path is not spawnable (ENOTDIR)."));
+      assert.ok(!isClaudeLaunchFailure("API Error: 500 boom"));
+    });
 
-    // A title request that ran out of its single step.
-    failWith([{ type: "result", subtype: "error_max_turns", is_error: true, errors: [], terminal_reason: "max_turns" }]);
-    {
-      const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-opencode-claude-session": "title-chat",
-          "x-opencode-claude-kind": "title",
-        },
-        body: JSON.stringify({ model: "sonnet", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    // A turn through the plugin's real query starter and the real SDK whose
+    // memoized launcher is gone (an install moved the CLI): the plugin
+    // answers 500, and OpenCode's retry, which looks again, finds the CLI
+    // where it is now and starts it (then the user stops it).
+    const { resolveClaudeCli } = await pluginModule("executable-path");
+    const failedLaunch = async (label: string, back: ReturnType<typeof claude.installCli>) => {
+      const launcher = (await resolveClaudeCli(process.env)) as string | null;
+      assert.ok(launcher, `${label}: the plugin finds the world's CLI`);
+      rmSync(launcher);
+      assert.equal(await resolveClaudeCli(process.env), launcher, `${label}: memoized until a launch fails`);
+      const chat = opencode.newChat();
+      await opencode.say(chat, `launch ${label}`);
+      const { turn, starts } = await world.turnThroughRealSdk(chat, { cli: back });
+      const first = turn.requests[0]!;
+      assert.equal(first.status, 500, `${label}: a server error OpenCode retries: ${first.reply?.raw}`);
+      assert.ok(opencode.retries.some((retry) => retry.chat === chat), `${label}: OpenCode sent the turn again`);
+      // The retry looked again: it started the CLI found anew, not the memoized path.
+      assert.equal(starts.length, 1, `${label}: the retry started the CLI found anew (${turn.requests.length} requests, the last ${turn.requests.at(-1)?.reply?.raw})`);
+      assert.ok(turn.stopped, `${label}: the user stopped the retried turn`);
+      assert.notEqual(await resolveClaudeCli(process.env), launcher, `${label}: the failed launch dropped the memoized path`);
+      return JSON.parse(first.reply!.raw!).error as { type: string; message: string };
+    };
+
+    await cases.run("the official installer's binary gone from PATH: a 500 in the SDK's words, and OpenCode's retry finds the CLI again", async () => {
+      // The plugin memoized it at setup: the SDK reports it missing. Found again: on Windows npm's shim beside it
+      // (cli.js), elsewhere — where npm's shim was replaced — the install in ~/.local/bin.
+      const back = process.platform === "win32" ? claude.cli : claude.installCli(join(world.tmp, "home", ".local", "bin"), { layout: "local-bin" });
+      const error = await failedLaunch("native binary", back as ReturnType<typeof claude.installCli>);
+      assert.equal(error.type, "server_error");
+      assert.match(error.message, /Claude Code (native binary|executable) not found at /, "the SDK's own text");
+      assert.ok(world.journal().some((line) => /turn failed fast|chat completions error/.test(line) && /not found at/.test(line)), "the journal names the failed launch");
+    });
+
+    if (process.platform === "win32") {
+      await cases.run("npm's older cli.js gone on Windows: node's missing module, and OpenCode's retry finds the native install", async () => {
+        // The plugin hands the SDK cli.js to run through node, and the SDK's spawn of node succeeds; node then exits
+        // with code 1, "Cannot find module '…cli.js'". Still a launcher that is gone; the native install in
+        // ~/.local/bin is found then.
+        await failedLaunch("npm's cli.js", claude.installCli(join(world.tmp, "home", ".local", "bin"), { layout: "local-bin" }));
       });
-      const body = (await res.json()) as any;
-      assert.equal(res.status, 500);
-      assert.match(body.error.message, /could not write the session title in the single step/);
     }
 
-    // A lost session reported through errors[] still clears the binding.
-    setForeignSessionId("lost-chat", "sess-gone");
-    failWith(
-      [{ type: "result", subtype: "error_during_execution", is_error: true, errors: ["No conversation found with session ID: sess-gone"] }],
-      "Claude Code returned an error result: No conversation found with session ID: sess-gone",
-    );
-    {
-      const res = await post("lost-chat", { stream: true, messages: [{ role: "user", content: "hi" }] });
-      assert.equal(res.status, 500);
-      assert.equal(getForeignSessionId("lost-chat"), undefined);
-    }
-
-    // Mid-stream: the error shows once, without diagnostics.
-    failWith(
-      [textDelta("partial answer"), { type: "result", subtype: "error_during_execution", is_error: true, errors: [DIAG, "API Error: 500 boom"] }],
-      `Claude Code returned an error result: ${DIAG}; API Error: 500 boom`,
-    );
-    {
-      const res = await post("mid-stream", { stream: true, messages: [{ role: "user", content: "hi" }] });
-      assert.equal(res.status, 200);
-      const text = await res.text();
-      assert.doesNotMatch(text, /ede_diagnostic/);
-      assert.equal(text.match(/API Error: 500 boom/g)?.length, 1);
-    }
+    await cases.run("no error in the plugin's journal", () => {
+      assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+    });
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
-  console.log("ok — turn errors regression passed");
+  cases.done();
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(process.exitCode ?? 0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

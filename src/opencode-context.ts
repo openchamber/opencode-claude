@@ -166,13 +166,6 @@ export function mcpInstructions(messages: MessageLike[]): string {
 
 const CONTEXT_BLOCK = /<context key="[^"\n]+">\n[\s\S]*?\n<\/context>/g;
 
-/** Index of the first message after OpenCode's leading system prompt. */
-function leadingSystemEnd(messages: MessageLike[]): number {
-  let i = 0;
-  while (i < messages.length && messages[i]?.role === "system") i++;
-  return i;
-}
-
 /**
  * Session context entries a host attached through OpenCode's session
  * instructions API (OpenChamber's guidance, pinned notes, memory, checkout),
@@ -182,6 +175,6 @@ function leadingSystemEnd(messages: MessageLike[]): number {
  * which Claude already gets with the next prompt.
  */
 export function sessionContextBlocks(messages: MessageLike[]): string {
-  const system = metaSystemPrompt(messages.slice(0, leadingSystemEnd(messages)));
+  const system = metaSystemPrompt(messages);
   return [...system.matchAll(CONTEXT_BLOCK)].map((m) => m[0]).join("\n\n");
 }

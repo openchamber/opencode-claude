@@ -22,6 +22,7 @@ import {
   PROVIDER_ID,
 } from "./constants.js";
 import { detectClaudeCode } from "./detect.js";
+import { ORIGINAL_ID_KEY } from "./names.js";
 import { installClaudeCli } from "./cli-install.js";
 import { startClaudeCliAutoUpdate } from "./cli-update.js";
 import {
@@ -43,6 +44,12 @@ import {
 } from "./models.js";
 import { listClaudeSupportedModels } from "./model-discovery.js";
 import { closeSessionBridges } from "./bridge-pool.js";
+import {
+  clearCompactionEvent,
+  rememberCompactionEvent,
+  rememberContextEvent,
+  type ContextEvent,
+} from "./context-list.js";
 import {
   getClaudeProxyBaseUrl,
   acquireProxy,
@@ -208,6 +215,13 @@ function watchSessionInterrupts(ctx: Plugin.Context): () => void {
     try {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         const e = event as { type?: string; data?: { sessionID?: string } };
+        // The compaction is over: its hook's list is no longer needed.
+        if (
+          (e.type === "session.compaction.ended" || e.type === "session.compaction.failed") &&
+          e.data?.sessionID
+        ) {
+          clearCompactionEvent(e.data.sessionID);
+        }
         if (
           (e.type === "session.execution.interrupted" || e.type === "session.execution.failed") &&
           e.data?.sessionID
@@ -273,22 +287,40 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
         err instanceof Error ? err.message : err,
       );
     }
-    // The provider and its hook go in before anything slow: until then the
-    // models are missing from OpenCode's catalog, and a session stepping
-    // during a plugin reload fails with "Model unavailable".
-    await ctx.provider.transform((providers) => {
-      providers.add({
-        info: buildProviderInfo(currentProxyBaseUrl()),
-        models: buildClaudeProviderModels(
-          getClaudeModels(),
-          (ctx.options as { compactAt?: unknown } | undefined)?.compactAt,
-        ),
-      });
+    // Every subscription in one block, before anything slow: until the
+    // provider is in, its models are missing from OpenCode's catalog, and a
+    // session stepping during a plugin reload fails with "Model unavailable".
+    // Inside the block nothing else is awaited, and the order makes each
+    // request whole: the hooks that keep a request's messages first, the one
+    // that marks a request as Claude's turn last, then the provider itself —
+    // its models appear only once every hook is in.
+    //
+    // Every message keeps its original id in its metadata: OpenCode copies
+    // the metadata into a fork together with the message (the copy gets a
+    // new id), so the fork's records are named after the originals. For
+    // every model, so a chat that comes back to Claude has them too. The key
+    // is the plugin's id (names.ts ORIGINAL_ID_KEY): metadata is shared by
+    // every plugin and goes into every chat.
+    await ctx.session.hook("prompt", async (prompt) => {
+      prompt.metadata = { ...(prompt.metadata ?? {}), [ORIGINAL_ID_KEY]: prompt.messageID };
     });
-    // A refresh from any folder reloads this one too (reloadProviderEverywhere).
-    const reloadProvider = () => ctx.provider.reload();
-    modelRefreshRuntime.providerReloads.add(reloadProvider);
-
+    // The list of messages of every request to Claude, kept by reference
+    // for the proxy (context-list.ts): the ids in it name the transcript's
+    // records (turn-point.ts).
+    await ctx.session.hook(
+      "context",
+      async (event) => {
+        rememberContextEvent(event as unknown as ContextEvent);
+      },
+      { providerID: PROVIDER_ID },
+    );
+    await ctx.session.hook(
+      "compaction",
+      async (event) => {
+        rememberCompactionEvent(event as unknown as ContextEvent);
+      },
+      { providerID: PROVIDER_ID },
+    );
     await ctx.session.hook(
       "model.request",
       async (request) => {
@@ -315,6 +347,18 @@ export const ClaudeCodePlugin: Plugin.Plugin = {
       },
       { providerID: PROVIDER_ID },
     );
+    await ctx.provider.transform((providers) => {
+      providers.add({
+        info: buildProviderInfo(currentProxyBaseUrl()),
+        models: buildClaudeProviderModels(
+          getClaudeModels(),
+          (ctx.options as { compactAt?: unknown } | undefined)?.compactAt,
+        ),
+      });
+    });
+    // A refresh from any folder reloads this one too (reloadProviderEverywhere).
+    const reloadProvider = () => ctx.provider.reload();
+    modelRefreshRuntime.providerReloads.add(reloadProvider);
 
     const cliPresent = await probeCliPresence();
     // Refresh the catalog from the CLI in the background; the cached or

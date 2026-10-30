@@ -114,7 +114,6 @@ import {
   type SdkUserPrompt,
 } from "./prompt.js";
 import {
-  detectMetaRequestKind,
   metaSystemPrompt,
   codeModeCatalog,
   skillsCatalog,
@@ -441,22 +440,20 @@ export async function stopProxy(): Promise<void> {
   stopServer();
 }
 
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost"]);
 
 /**
  * Binding to 127.0.0.1 keeps other machines out, but a web page open in the
  * user's browser can still reach loopback: a no-preflight POST (CSRF) or a
  * DNS-rebound hostname would spend the user's Claude subscription. OpenCode
  * calls the proxy server-side, so it never sends Origin and always uses a
- * loopback Host; anything else is refused.
+ * loopback Host; anything else is refused. The proxy listens on 127.0.0.1
+ * only, so no request reaches it by the IPv6 loopback [::1].
  */
 export function isTrustedLocalRequest(req: Request): boolean {
   if (req.headers.get("origin") !== null) return false;
   const host = (req.headers.get("host") ?? "").toLowerCase();
-  const name = host.startsWith("[")
-    ? host.slice(0, host.indexOf("]") + 1)
-    : host.split(":")[0];
-  return LOOPBACK_HOSTS.has(name ?? "");
+  return LOOPBACK_HOSTS.has(host.split(":")[0] ?? "");
 }
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -813,7 +810,9 @@ function rememberGateCheck(key: string): void {
  * OpenCode v2 names the request kind through the plugin's model.request hook.
  * Stateless generation (/api/experimental/generate) bypasses session hooks,
  * so a request with neither the kind nor the session header is one of those.
- * Text detection stays as the fallback for hooked requests.
+ * Every hooked request has the kind: OpenCode 2.0.19 and later fire
+ * `model.request` with it for a chat turn, a compaction, a generation and a
+ * title alike (session/model-request.ts prepare).
  */
 export function metaKindFromHeaders(
   kind: string | null,
@@ -829,12 +828,9 @@ export function metaKindFromHeaders(
 export function resolveMetaKind(
   kind: string | null,
   session: string | null,
-  messages: Parameters<typeof detectMetaRequestKind>[0],
 ): MetaRequestKind {
   const fromHeader = metaKindFromHeaders(kind, session);
   if (fromHeader !== undefined) return fromHeader;
-  const detected = detectMetaRequestKind(messages);
-  if (detected) return detected;
   return kind === null && !session ? "generate" : null;
 }
 
@@ -853,7 +849,6 @@ async function handleChatCompletions(
   const metaKind = resolveMetaKind(
     req.headers.get(KIND_HEADER),
     sessionHeader,
-    messages,
   );
   // A title or generate call without a session belongs to no chat: keyed
   // by its prompt, concurrent calls sharing a preamble stopped each other.
