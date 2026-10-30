@@ -31,7 +31,7 @@
  * after a revert.
  */
 import { readFile } from "node:fs/promises";
-import { userTextIdentity } from "./prompt.js";
+import { startsTurn } from "./prompt.js";
 import {
   MAX_ATTEMPTS,
   ORIGINAL_ID_KEY,
@@ -613,7 +613,7 @@ function pointIn(
 function listAnswers(messages: readonly ListMessage[], index: number): boolean {
   for (let i = index + 1; i < messages.length; i++) {
     if (messages[i]!.role === "assistant") return true;
-    if (isCountedUserMessage(messages[i]!)) return false;
+    if (startsTurn(messages[i]!)) return false;
   }
   return false;
 }
@@ -658,7 +658,7 @@ export function listAnswerText(messages: readonly ListMessage[], index: number):
   let text = "";
   for (let i = index + 1; i < messages.length; i++) {
     const message = messages[i]!;
-    if (isCountedUserMessage(message)) break;
+    if (startsTurn(message)) break;
     if (message.role === "assistant" && toolCallIdsOf(message).length === 0) text = textOfMessage(message);
   }
   return text;
@@ -781,49 +781,16 @@ export function leafChainAncestor(
 }
 
 /**
- * Whether a list message counts as a user message of the history, the way
- * the proxy counts the request body's (prompt.ts, userHistoryFingerprints):
- * a message of <system-reminder> blocks alone, with nothing attached, does
- * not. The list and the body hold the same messages in the same order, so
- * counting them alike maps a position in one onto the other.
+ * The messages of a history the transcript never saw: after the turn of the
+ * message at `coveredIndex` (its answers and tool steps are in the
+ * transcript), from the next message that starts a turn on; when the
+ * transcript has no answer to that message, everything after it. Empty when
+ * nothing follows.
  */
-export function isCountedUserMessage(message: ListMessage): boolean {
-  if (message.role !== "user") return false;
-  if (userTextIdentity(textOfMessage(message))) return true;
-  return Array.isArray(message.content) && message.content.some((part) => {
-    const type = (part as { type?: unknown } | null)?.type;
-    return type === "media" || type === "file";
-  });
-}
-
-/** How many counted user messages of the list come up to and including `index`. */
-export function countedUserThrough(messages: readonly ListMessage[], index: number): number {
-  let count = 0;
-  for (let i = 0; i <= index && i < messages.length; i++) {
-    if (isCountedUserMessage(messages[i]!)) count++;
+export function missedAfter<T extends ListMessage>(history: readonly T[], coveredIndex: number, answered: boolean): T[] {
+  if (!answered) return history.slice(coveredIndex + 1);
+  for (let i = coveredIndex + 1; i < history.length; i++) {
+    if (startsTurn(history[i]!)) return history.slice(i);
   }
-  return count;
-}
-
-/**
- * The OpenCode ids of the messages the user sent while the turn ran: the
- * counted user messages after the last tool result in the list, in order.
- * (OpenCode delivers them in the request that carries the tool results.)
- */
-export function steeringMessageIds(messages: readonly ListMessage[]): string[] {
-  let lastToolResult = -1;
-  messages.forEach((message, index) => {
-    const parts = Array.isArray(message.content) ? message.content : [];
-    if (message.role === "tool" || parts.some((part) => (part as { type?: unknown } | null)?.type === "tool-result")) {
-      lastToolResult = index;
-    }
-  });
-  const ids: string[] = [];
-  for (let i = lastToolResult + 1; i < messages.length; i++) {
-    const message = messages[i]!;
-    if (!isCountedUserMessage(message)) continue;
-    const id = messageIdOf(message);
-    if (id) ids.push(id);
-  }
-  return ids;
+  return [];
 }

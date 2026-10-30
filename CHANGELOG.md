@@ -29,6 +29,13 @@
   the session could not be continued), `[claude-code]` for an expected
   step (messages Claude had not seen went as text, the first turn after a
   compaction, a rebuilt tool step).
+- **A chat turn reads OpenCode's message list**: the prompt, the turns the
+  transcript missed, tool results, messages sent while a tool ran, the system
+  prompt and the tools now come from the list OpenCode's `context` hook hands
+  the plugin, the same list whose ids name the transcript's records, instead
+  of the HTTP body matched against that list by counting user messages. A
+  tool's images and PDFs stay with its result. A summary, a title and a
+  generate request still read their HTTP body, which is what OpenCode asks.
 - **Only OpenCode compacts the chat**: Claude Code's own auto-compaction was
   meant to be off for summaries and on for chat turns, but the plugin set it
   through an option the Agent SDK does not have, so the CLI compacted on its

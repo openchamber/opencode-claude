@@ -1,9 +1,26 @@
 /**
- * Build Claude Agent SDK prompts from OpenAI-compatible chat messages,
- * including text, images, and PDF/document attachments.
+ * Build Claude Agent SDK prompts from a request's messages, including text,
+ * images, and PDF/document attachments.
+ *
+ * Every builder reads the messages in the form of OpenCode's message list
+ * (LLM.Message: `text`, `media`, `tool-call`, `tool-result` parts), the
+ * form the `context` hook hands the plugin. A chat
+ * turn's messages are that list; a summary, title or generate request is
+ * read from its OpenAI body, put into the same form first (list-content.ts).
  */
-import { createHash } from "node:crypto";
 import { currentHost } from "./host.js";
+import { ORIGINAL_ID_KEY } from "./names.js";
+
+/** A content part of a list message: `text`, `media`, `tool-call`, `tool-result`, `reasoning`. */
+export type ListPart = { type: string } & Record<string, any>;
+
+/** A message in the form of OpenCode's list (LLM.Message), the form every builder reads. */
+export type ConversationMessage = {
+  id?: string;
+  role: string;
+  content: ListPart[];
+  metadata?: Record<string, unknown>;
+};
 
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
@@ -45,9 +62,8 @@ function parseDataUrl(url: string): {
   mediaType: string;
   data: string;
 } | null {
-  // Allow extra parameters between media type and base64
-  // (e.g. data:image/png;name=photo.png;base64,...).
-  const match = /^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/i.exec(url.trim());
+  // OpenCode 2.0.32 writes `data:<mime>;base64,...` and no other parameter.
+  const match = /^data:([^;,]+)?;base64,(.+)$/i.exec(url.trim());
   if (!match) return null;
   return {
     mediaType: (match[1] || "application/octet-stream").toLowerCase(),
@@ -167,7 +183,7 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
     return;
   }
 
-  // AI SDK / Anthropic-shaped image parts (not OpenAI image_url).
+  // Anthropic-shaped image parts (not OpenAI image_url).
   // contentHasAttachments treats these as attachments — must convert or
   // the image is detected then silently dropped.
   if (type === "image") {
@@ -198,33 +214,6 @@ function convertPart(part: unknown, blocks: AnthropicContentBlock[]): void {
         if (pushDataUrl(blocks, s.url)) return;
         if (isHttpUrl(s.url)) pushRemoteUrl(blocks, s.url, mediaType);
         return;
-      }
-    }
-    const image = p.image;
-    if (typeof image === "string") {
-      if (pushDataUrl(blocks, image)) return;
-      if (isHttpUrl(image)) {
-        pushRemoteUrl(blocks, image, mediaType);
-        return;
-      }
-      // Bare base64 payload
-      blocks.push({
-        type: "image",
-        source: { type: "base64", media_type: mediaType, data: image },
-      });
-      return;
-    }
-    if (image instanceof URL) {
-      const href = image.toString();
-      if (pushDataUrl(blocks, href)) return;
-      if (isHttpUrl(href)) pushRemoteUrl(blocks, href, mediaType);
-      return;
-    }
-    if (image && typeof image === "object" && "url" in image) {
-      const url = (image as { url?: unknown }).url;
-      if (typeof url === "string") {
-        if (pushDataUrl(blocks, url)) return;
-        if (isHttpUrl(url)) pushRemoteUrl(blocks, url, mediaType);
       }
     }
     return;
@@ -425,71 +414,21 @@ const SYSTEM_UPDATE_BLOCK = /<system-update>[\s\S]*?<\/system-update>/g;
 /**
  * The user's own text of a message: without <system-reminder> blocks and
  * the <system-update> blocks OpenCode appends, with collapsed whitespace.
- * Empty for a message made of reminders or updates alone, which is not
- * counted as a user message of the history (see userHistoryFingerprints).
+ * Empty for a message made of reminders or updates alone.
  */
 export function userTextIdentity(text: string): string {
   return text.replace(SYSTEM_REMINDER_BLOCK, " ").replace(SYSTEM_UPDATE_BLOCK, " ").replace(/\s+/g, " ").trim();
 }
 
 /**
- * One short hash per user message of a conversation, in order: the
- * conversation's shape as far as revert/edit detection needs it.
- *
- * Only user messages count. OpenCode may re-serialize assistant output
- * (steps split per tool call, reasoning dropped), but a user message is
- * sent the same way every time. Two kinds are skipped, because they are
- * not stable across requests: OpenCode's promoted tool media, and
- * <system-reminder> messages. Plan mode splices its reminder in before the
- * user's prompt when sending, but stores it after, so its position moves
- * between requests. Reminder blocks inside other messages are dropped too.
- * Attachments count by presence only; their encoding may change.
+ * Whether a user message starts a turn of its own: it has the user's own
+ * text or an attachment. A message of <system-reminder> blocks alone (Plan
+ * mode stores its reminder after the prompt it was sent before) belongs to
+ * the turn it sits in.
  */
-export function userHistoryFingerprints(
-  messages: Array<{ role?: string; content?: unknown }>,
-): string[] {
-  return fingerprintedUserMessages(messages).map((entry) => entry.print);
-}
-
-/**
- * The part of a history after its first `count` fingerprinted user
- * messages, starting at the next one: what came after a turn boundary of
- * `count` user messages. Empty when the history holds no more than that.
- */
-export function historyAfterUserCount<T extends { role?: string; content?: unknown }>(
-  messages: T[],
-  count: number,
-): T[] {
-  const next = fingerprintedUserMessages(messages)[count];
-  return next ? messages.slice(next.index) : [];
-}
-
-/**
- * The part of a history after its `count`-th fingerprinted user message:
- * everything that came after that message, answers included. Empty when the
- * history holds fewer (the message is in the latest user turn).
- */
-export function historyAfterUserMessage<T extends { role?: string; content?: unknown }>(
-  messages: T[],
-  count: number,
-): T[] {
-  const entry = fingerprintedUserMessages(messages)[count - 1];
-  return entry ? messages.slice(entry.index + 1) : [];
-}
-
-function fingerprintedUserMessages(
-  messages: Array<{ role?: string; content?: unknown }>,
-): Array<{ index: number; print: string }> {
-  const entries: Array<{ index: number; print: string }> = [];
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
-    const text = userTextIdentity(extractTextContent(msg.content));
-    const identity = text || (contentHasAttachments(msg.content) ? "\u0000attachments" : "");
-    if (!identity) continue;
-    entries.push({ index: i, print: createHash("sha1").update(identity).digest("hex").slice(0, 16) });
-  }
-  return entries;
+export function startsTurn(message: { role?: string; content?: unknown }): boolean {
+  if (message?.role !== "user") return false;
+  return !!userTextIdentity(extractTextContent(message.content)) || contentHasAttachments(message.content);
 }
 
 export function contentHasAttachments(content: unknown): boolean {
@@ -498,6 +437,7 @@ export function contentHasAttachments(content: unknown): boolean {
     if (!part || typeof part !== "object") return false;
     const type = (part as { type?: unknown }).type;
     return (
+      type === "media" ||
       type === "image_url" ||
       type === "input_image" ||
       type === "file" ||
@@ -530,19 +470,111 @@ export type McpToolResultContent =
     };
 
 /**
- * Convert OpenAI-compatible tool result content into MCP result blocks.
- * OpenCode's read tool returns images and PDFs as file attachments on the
- * tool result; those must stay attached when the parked Claude SDK tool call
- * resumes. Base64 documents travel as MCP embedded `resource` blobs (Claude
- * Code saves them to disk and hands the model the path); URL-sourced media
- * cannot ride in an MCP result, so the model gets the URL as text instead of
- * a silent drop.
+ * Media of a list part (OpenCode's Media.Asset: `source` base64, bytes or
+ * url, and `mediaType`) as a content block. Text files never get here: the
+ * list carries them as text parts.
  */
-export function openaiToolResultToMcpContent(
-  content: unknown,
-): McpToolResultContent[] {
+function pushMedia(blocks: AnthropicContentBlock[], media: unknown): void {
+  if (!media || typeof media !== "object") return;
+  const m = media as { source?: Record<string, unknown>; mediaType?: unknown };
+  const source = m.source ?? {};
+  const mediaType = String(m.mediaType ?? source.mediaType ?? "application/octet-stream").toLowerCase();
+  if (source.type === "base64" && typeof source.data === "string") {
+    pushDataUrl(blocks, `data:${mediaType};base64,${source.data}`);
+    return;
+  }
+  if (source.type === "bytes" && source.data instanceof Uint8Array) {
+    pushDataUrl(blocks, `data:${mediaType};base64,${Buffer.from(source.data).toString("base64")}`);
+    return;
+  }
+  if (source.type === "url" && typeof source.url === "string") {
+    if (pushDataUrl(blocks, source.url)) return;
+    if (isHttpUrl(source.url)) pushRemoteUrl(blocks, source.url, mediaType);
+  }
+}
+
+/** A file a tool returned (Tool.FileContent): a data URL, an http(s) URL, or bare base64 in `uri`. */
+function pushToolFile(blocks: AnthropicContentBlock[], file: Record<string, unknown>): void {
+  const uri = typeof file.uri === "string" ? file.uri : "";
+  const mime = typeof file.mime === "string" ? file.mime : "application/octet-stream";
+  if (!uri) return;
+  if (/^data:/i.test(uri)) {
+    const parsed = parseDataUrl(uri);
+    if (parsed) pushDataUrl(blocks, `data:${mime};base64,${parsed.data}`);
+    return;
+  }
+  if (isHttpUrl(uri)) {
+    pushRemoteUrl(blocks, uri, mime);
+    return;
+  }
+  pushDataUrl(blocks, `data:${mime};base64,${uri}`);
+}
+
+/** The content of a list message as Claude content blocks: its text and its media. */
+export function listContentToBlocks(content: unknown): AnthropicContentBlock[] {
+  if (typeof content === "string") {
+    const text = content.trim();
+    return text ? [{ type: "text", text }] : [];
+  }
+  if (!Array.isArray(content)) return [];
+  const blocks: AnthropicContentBlock[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as ListPart;
+    if (p.type === "text" && typeof p.text === "string") pushText(blocks, p.text);
+    else if (p.type === "media") pushMedia(blocks, p.media);
+  }
+  return blocks;
+}
+
+/** The text of a tool result the way OpenCode sends it (protocols/shared.ts toolResultText). */
+function toolResultText(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const r = result as { type?: unknown; value?: unknown };
+  if (r.type === "text") return String(r.value ?? "");
+  if (r.type === "content" && Array.isArray(r.value)) {
+    return r.value
+      .filter((item) => (item as { type?: unknown } | null)?.type === "text")
+      .map((item) => String((item as { text?: unknown }).text ?? ""))
+      .join("\n");
+  }
+  if (typeof r.value === "string") return r.value;
+  try {
+    return JSON.stringify(r.value) ?? String(r.value);
+  } catch {
+    return String(r.value);
+  }
+}
+
+/** A tool result part (`tool-result`) as content blocks: its text, then the files it returned. */
+export function toolResultToBlocks(part: ListPart): AnthropicContentBlock[] {
+  const blocks: AnthropicContentBlock[] = [];
+  pushText(blocks, toolResultText(part.result));
+  const result = part.result as { type?: unknown; value?: unknown } | undefined;
+  if (result?.type === "content" && Array.isArray(result.value)) {
+    for (const item of result.value) {
+      if ((item as { type?: unknown } | null)?.type === "file") pushToolFile(blocks, item as Record<string, unknown>);
+    }
+  }
+  return blocks;
+}
+
+/** A tool result part as the content of the parked MCP call it answers. */
+export function toolResultToMcpContent(part: ListPart): McpToolResultContent[] {
+  return blocksToMcpContent(toolResultToBlocks(part));
+}
+
+/**
+ * Content blocks as MCP result blocks. OpenCode's read tool returns images
+ * and PDFs as files on the tool result; those must stay attached when the
+ * parked Claude SDK tool call resumes. Base64 documents travel as MCP
+ * embedded `resource` blobs (Claude Code saves them to disk and hands the
+ * model the path); URL-sourced media cannot ride in an MCP result, so the
+ * model gets the URL as text instead of a silent drop.
+ */
+export function blocksToMcpContent(blocks: AnthropicContentBlock[]): McpToolResultContent[] {
   const result: McpToolResultContent[] = [];
-  for (const block of openaiContentToAnthropicBlocks(content)) {
+  for (const block of blocks) {
     if (block.type === "text") {
       result.push(block);
       continue;
@@ -626,30 +658,23 @@ const UNRELAYABLE_USER_MESSAGE =
   "[The user's latest message contained an attachment that could not be relayed to Claude (unsupported format or location). Tell the user it could not be read.]";
 
 /**
- * Indices of the latest user turn: every real user message after the last
+ * Indices of the latest user turn: every user message after the last
  * assistant message, in order. OpenCode queues messages the user sends while
  * no turn runs for them; they arrive together and all await one answer.
- * OpenCode's synthetic "Attached media from tool result:" messages are tool
- * output, not user turns, and are skipped. When the step after the last
- * assistant message holds only tool output, the newest real user message
- * stands in — never an older one, which would make Claude redo an answered
- * request. Empty without any real user message.
+ * When the step after the last assistant message holds only tool output,
+ * the newest user message stands in — never an older one, which would make
+ * Claude redo an answered request. Empty without any user message.
  */
-function latestUserTurn(
-  messages: Array<{ role?: string; content?: unknown }>,
-): number[] {
+export function latestUserTurn(messages: readonly ConversationMessage[]): number[] {
   const turn: number[] = [];
-  // An assistant message was passed before any real user message.
+  // An assistant message was passed before any user message.
   let toolStep = false;
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role === "assistant") {
       if (turn.length > 0) break;
       toolStep = true;
-    } else if (
-      msg?.role === "user" &&
-      !isSyntheticToolMediaMessage(msg, messages[i - 1])
-    ) {
+    } else if (msg?.role === "user") {
       turn.unshift(i);
       if (toolStep) break;
     }
@@ -665,7 +690,7 @@ function latestUserTurn(
  */
 function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
   const blocks = contentHasAttachments(content)
-    ? openaiContentToAnthropicBlocks(content)
+    ? listContentToBlocks(content)
     : [];
   if (blocks.length > 0) return blocks;
   const text = extractTextContent(content).trim();
@@ -685,12 +710,15 @@ function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
 /**
  * Latest user turn (see `latestUserTurn`) as a Claude Agent SDK prompt,
  * string when text-only. Queued messages are combined in order: texts are
- * separated by a blank line, attachments keep their position.
+ * separated by a blank line, attachments keep their position. `after`: the
+ * messages up to that index are in the transcript already and are left out.
  */
 export function latestUserPrompt(
-  messages: Array<{ role?: string; content?: unknown }>,
+  messages: readonly ConversationMessage[],
+  after = -1,
 ): string | SdkUserPrompt {
   const parts = latestUserTurn(messages)
+    .filter((i) => i > after)
     .map((i) => userMessagePrompt(messages[i]!.content))
     .filter((part) => part.length > 0);
   if (parts.every((part) => typeof part === "string")) {
@@ -715,68 +743,78 @@ export function latestUserPrompt(
  * OpenCode then treats them as answered). Returns the content of the real
  * user messages after the last tool result; empty when there are none.
  */
-export function collectSteering(
-  messages: Array<{ role?: string; content?: unknown }>,
-): McpToolResultContent[] {
+export function collectSteering(messages: readonly ConversationMessage[]): McpToolResultContent[] {
   return collectSteeringMessages(messages).flatMap((m) => m.blocks);
 }
 
 /**
- * Steering messages one by one, each with a `key` that identifies it across
- * resume requests: its content plus how many earlier user messages carry the
- * same content. A raw index would not do, because tool results of a split
- * park get inserted before the queued message in later requests.
+ * Steering messages one by one. `id` is the OpenCode id the message is
+ * named after (the original's, kept in its metadata, for a fork's copy);
+ * `key` tells the message apart across resume requests: its id, or, for a
+ * message without one, its content plus how many earlier user messages
+ * carry the same content.
  */
-export function collectSteeringMessages(
-  messages: Array<{ role?: string; content?: unknown }>,
-): Array<{ key: string; blocks: McpToolResultContent[]; prompt: string | AnthropicContentBlock[] }> {
+export function collectSteeringMessages(messages: readonly ConversationMessage[]): Array<{
+  key: string;
+  id?: string;
+  blocks: McpToolResultContent[];
+  prompt: string | AnthropicContentBlock[];
+}> {
   let lastTool = -1;
   for (let i = 0; i < messages.length; i++) {
     if (messages[i]?.role === "tool") lastTool = i;
   }
   if (lastTool < 0) return [];
-  const out: Array<{ key: string; blocks: McpToolResultContent[]; prompt: string | AnthropicContentBlock[] }> = [];
+  const out: ReturnType<typeof collectSteeringMessages> = [];
   const occurrences = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg?.role !== "user" || isSyntheticToolMediaMessage(msg, messages[i - 1])) continue;
+    const msg = messages[i]!;
+    if (msg.role !== "user") continue;
     const identity = JSON.stringify(msg.content ?? null);
     const nth = occurrences.get(identity) ?? 0;
     occurrences.set(identity, nth + 1);
     if (i <= lastTool) continue;
-    const content = openaiToolResultToMcpContent(msg.content);
+    const content = blocksToMcpContent(listContentToBlocks(msg.content));
     const hasText = content.some((b) => b.type === "text" && b.text.trim());
-    if (hasText || content.some((b) => b.type !== "text")) {
-      out.push({ key: `${nth}:${identity}`, blocks: content, prompt: userMessagePrompt(msg.content) });
-    }
+    if (!hasText && !content.some((b) => b.type !== "text")) continue;
+    const original = msg.metadata?.[ORIGINAL_ID_KEY];
+    const id = typeof original === "string" && original ? original : msg.id;
+    out.push({ key: id ? `id:${id}` : `${nth}:${identity}`, id, blocks: content, prompt: userMessagePrompt(msg.content) });
   }
   return out;
 }
 
-type ToolStepMessage = {
-  role?: string;
-  content?: unknown;
-  tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>;
-  tool_call_id?: string;
-  name?: string;
-};
+/** The parts of a message of one type. */
+function partsOf(message: ConversationMessage | undefined, type: string): ListPart[] {
+  return Array.isArray(message?.content) ? message.content.filter((part) => part?.type === type) : [];
+}
+
+/** The tool results of a request: tool call id → the results as MCP content. */
+export function collectToolResults(messages: readonly ConversationMessage[]): Map<string, McpToolResultContent[]> {
+  const results = new Map<string, McpToolResultContent[]>();
+  for (const message of messages) {
+    if (message.role !== "tool") continue;
+    for (const part of partsOf(message, "tool-result")) {
+      if (typeof part.id === "string") results.set(part.id, toolResultToMcpContent(part));
+    }
+  }
+  return results;
+}
 
 /**
  * Index of the last assistant message when it called tools and at least one
  * of those calls has its result after it: a tool step OpenCode answered.
  * Null when the last assistant message is a plain reply (a normal new turn).
  */
-export function answeredToolStepIndex(messages: ToolStepMessage[]): number | null {
+export function answeredToolStepIndex(messages: readonly ConversationMessage[]): number | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
-    const ids = new Set(
-      (msg.tool_calls ?? []).map((call) => call?.id).filter(Boolean),
-    );
+    const ids = new Set(partsOf(msg, "tool-call").map((call) => call.id).filter(Boolean));
     if (ids.size === 0) return null;
     const answered = messages
       .slice(i + 1)
-      .some((m) => m?.role === "tool" && !!m.tool_call_id && ids.has(m.tool_call_id));
+      .some((m) => m.role === "tool" && partsOf(m, "tool-result").some((part) => ids.has(part.id)));
     return answered ? i : null;
   }
   return null;
@@ -790,7 +828,7 @@ export function answeredToolStepIndex(messages: ToolStepMessage[]): number | nul
  * results with media, and any user messages sent after them.
  */
 export function answeredToolStepPrompt(
-  messages: ToolStepMessage[],
+  messages: readonly ConversationMessage[],
   assistantIndex: number,
   options: { otherModel?: boolean } = {},
 ): SdkUserPrompt {
@@ -829,7 +867,7 @@ const HOST_STOP_NOTE =
  * result and media. User messages sent after the calls come separately.
  */
 function toolStepBlocks(
-  messages: ToolStepMessage[],
+  messages: readonly ConversationMessage[],
   assistantIndex: number,
 ): { blocks: AnthropicContentBlock[]; userBlocks: AnthropicContentBlock[] } {
   const assistant = messages[assistantIndex]!;
@@ -838,31 +876,23 @@ function toolStepBlocks(
   if (stepText) {
     blocks.push({ type: "text", text: `Your message in that step:\n${stepText}` });
   }
-  const calls = new Map(
-    (assistant.tool_calls ?? []).map((call) => [call?.id, call?.function]),
-  );
+  const calls = new Map(partsOf(assistant, "tool-call").map((call) => [call.id, call]));
   const userBlocks: AnthropicContentBlock[] = [];
-  const stepMessages = messages.slice(assistantIndex + 1);
-  for (const [index, msg] of stepMessages.entries()) {
-    if (msg?.role === "tool" && msg.tool_call_id) {
-      const call = calls.get(msg.tool_call_id);
-      const result = openaiContentToAnthropicBlocks(decodeToolMessageContent(msg.content));
-      blocks.push(
-        {
-          type: "text",
-          text: `Result of ${call?.name ?? msg.name ?? "tool"} ${call?.arguments ?? ""} (${msg.tool_call_id}):`,
-        },
-        ...(result.length > 0 ? result : [{ type: "text" as const, text: "(no output)" }]),
-      );
-    } else if (msg && isSyntheticToolMediaMessage(msg, stepMessages[index - 1] ?? messages[assistantIndex])) {
-      blocks.push(
-        { type: "text", text: "Media attached to these tool results:" },
-        ...openaiContentToAnthropicBlocks(msg.content).filter(
-          (b) => !(b.type === "text" && b.text.trim() === SYNTHETIC_TOOL_MEDIA_PROMPT),
-        ),
-      );
-    } else if (msg?.role === "user") {
-      userBlocks.push(...openaiContentToAnthropicBlocks(msg.content));
+  for (const msg of messages.slice(assistantIndex + 1)) {
+    if (msg.role === "tool") {
+      for (const part of partsOf(msg, "tool-result")) {
+        const call = calls.get(part.id);
+        const result = toolResultToBlocks(part);
+        blocks.push(
+          {
+            type: "text",
+            text: `Result of ${call?.name ?? part.name ?? "tool"} ${JSON.stringify(call?.input ?? {})} (${part.id}):`,
+          },
+          ...(result.length > 0 ? result : [{ type: "text" as const, text: "(no output)" }]),
+        );
+      }
+    } else if (msg.role === "user") {
+      userBlocks.push(...listContentToBlocks(msg.content));
     }
   }
   return { blocks, userBlocks };
@@ -892,18 +922,6 @@ export async function* promptAsStream(
  * so Claude still sees the whole chat.
  */
 
-export type ConversationHistoryMessage = {
-  role?: string;
-  content?: unknown;
-  tool_calls?: Array<{
-    id?: string;
-    type?: string;
-    function?: { name?: string; arguments?: string };
-  }>;
-  tool_call_id?: string;
-  name?: string;
-};
-
 /**
  * The history as Claude gets it: text, or text with the images and
  * documents of the chat in their places. It goes whole: OpenCode already
@@ -919,11 +937,7 @@ const UNRELAYABLE_ATTACHMENT = "[an attachment that could not be passed on]";
 /** One message of the history: its text lines, and its files as blocks where they stand. */
 type HistoryPiece = string | AnthropicContentBlock;
 
-function serializeHistoryMessage(
-  msg: ConversationHistoryMessage,
-  toolNames: ReadonlyMap<string, string>,
-  previous: ConversationHistoryMessage | undefined,
-): HistoryPiece[] | null {
+function serializeHistoryMessage(msg: ConversationMessage): HistoryPiece[] | null {
   if (!msg || typeof msg !== "object") return null;
   const role = msg.role;
   // System prompts are OpenCode-internal and huge; the Claude Code preset
@@ -931,18 +945,11 @@ function serializeHistoryMessage(
   if (role === "system") return null;
 
   if (role === "user") {
-    // OpenCode puts the files of a step's tool results into one user message
-    // after them, without saying which result each came from: they go as
-    // one group after the results.
-    if (isSyntheticToolMediaMessage(msg, previous)) {
-      const files = openaiContentToAnthropicBlocks(msg.content).filter((block) => block.type !== "text");
-      return files.length > 0 ? ["Files the tools above returned:", ...files] : null;
-    }
     const text = extractTextContent(msg.content).trim();
     const hasAttach = contentHasAttachments(msg.content);
     if (!text && !hasAttach) return null;
     if (!hasAttach) return [`User:\n${text}`];
-    const blocks = openaiContentToAnthropicBlocks(msg.content);
+    const blocks = listContentToBlocks(msg.content);
     const pieces: HistoryPiece[] = ["User:"];
     for (const block of blocks) pieces.push(block.type === "text" ? block.text : block);
     if (!blocks.some((block) => block.type !== "text")) pieces.push(UNRELAYABLE_ATTACHMENT);
@@ -953,25 +960,26 @@ function serializeHistoryMessage(
     const parts: string[] = [];
     const text = extractTextContent(msg.content).trim();
     if (text) parts.push(text);
-    for (const call of msg.tool_calls ?? []) {
-      const name = call?.function?.name;
-      if (name) parts.push(`[called tool: ${name}]`);
+    for (const call of partsOf(msg, "tool-call")) {
+      if (typeof call.name === "string" && call.name) parts.push(`[called tool: ${call.name}]`);
     }
     if (parts.length === 0) return null;
     return [`Assistant:\n${parts.join("\n")}`];
   }
 
   if (role === "tool") {
-    const text = extractTextContent(decodeToolMessageContent(msg.content)).trim();
-    if (!text) return null;
-    // OpenAI-style tool messages carry only tool_call_id; the name is on the
-    // assistant's call.
-    const label =
-      (typeof msg.name === "string" && msg.name) ||
-      (typeof msg.tool_call_id === "string" &&
-        (toolNames.get(msg.tool_call_id) || msg.tool_call_id)) ||
-      "tool";
-    return [`Tool result (${label}):\n${text}`];
+    // Each result with its own text, whole, and the files it returned: the
+    // list keeps them on the result they belong to.
+    const pieces: HistoryPiece[] = [];
+    for (const part of partsOf(msg, "tool-result")) {
+      const text = toolResultText(part.result).trim();
+      const files = toolResultToBlocks(part).filter((block) => block.type !== "text");
+      if (!text && files.length === 0) continue;
+      const label = (typeof part.name === "string" && part.name) || part.id || "tool";
+      // Results apart by a blank line, as messages are.
+      pieces.push(`${pieces.length > 0 ? "\n" : ""}Tool result (${label}):${text ? `\n${text}` : ""}`, ...files);
+    }
+    return pieces.length > 0 ? pieces : null;
   }
 
   return null;
@@ -987,9 +995,7 @@ function serializeHistoryMessage(
  * in neither transcript nor prompt. The prompt only repeats the user message,
  * so the transcript keeps everything in order, that message included.
  */
-export function priorMessagesOf(
-  messages: ConversationHistoryMessage[],
-): ConversationHistoryMessage[] {
+export function priorMessagesOf(messages: readonly ConversationMessage[]): ConversationMessage[] {
   const start = latestUserTurn(messages)[0] ?? 0;
   const answeredAfter = messages
     .slice(start + 1)
@@ -1003,20 +1009,14 @@ export function priorMessagesOf(
  * Text only while the history has no files.
  */
 export function buildConversationTranscript(
-  messages: ConversationHistoryMessage[],
+  messages: readonly ConversationMessage[],
 ): ConversationTranscript {
-  const toolNames = new Map<string, string>();
-  for (const msg of messages) {
-    for (const call of msg?.tool_calls ?? []) {
-      if (call?.id && call.function?.name) toolNames.set(call.id, call.function.name);
-    }
-  }
   const blocks: AnthropicContentBlock[] = [];
   let text = "";
   // Whether the next line goes after a blank line (a new message) or a newline.
   let separator = "";
-  messages.forEach((msg, index) => {
-    const pieces = serializeHistoryMessage(msg, toolNames, messages[index - 1]);
+  messages.forEach((msg) => {
+    const pieces = serializeHistoryMessage(msg);
     if (!pieces) return;
     if (blocks.length > 0 || text) separator = "\n\n";
     for (const piece of pieces) {
