@@ -148,7 +148,6 @@ Most people won't need these. Set them in the environment of the OpenCode server
 | `OPENCODE_CLAUDE_DEBUG=1` | Same as the `debug` option above |
 | `OPENCODE_CLAUDE_PROXY_PORT` | Fixed port for the local proxy (default: any free port) |
 | `OPENCODE_CLAUDE_CWD` | Working directory for Claude Code, if you need to override the project folder |
-| `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` | How much history to replay when a Claude session can't be resumed (default 400000, `0` turns it off) |
 | `OPENCODE_CLAUDE_TURN_STALL_MS` | End a turn when Claude Code goes silent this long (default 10 minutes) |
 | `OPENCODE_CLAUDE_PARKED_TURN_TTL_MS` | Close a turn waiting on tool results after this long (default 1 hour, `0` never) |
 | `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` | Always send turns to Claude, even when a limit is known to be active |

@@ -98,6 +98,8 @@ import {
   historyAfterUserCount,
   promptAsStream,
   createTurnInput,
+  transcriptFiles,
+  transcriptText,
   userHistoryFingerprints,
   withConversationContext,
   withLeadingText,
@@ -636,15 +638,6 @@ type SummaryResumePoint = {
    */
   liveTurn?: OpenAIMessage[];
 };
-
-/**
- * Text budget for a summary that reads the history as text: about three
- * characters per token of the chat model's window. OpenCode already sized
- * the request to that window, so this only guards against a runaway one.
- */
-function summaryHistoryMaxChars(model: string): number {
-  return (/\[1m\]$/i.test(model) ? 1_000_000 : 200_000) * 3;
-}
 
 const SUMMARY_NUDGE_MARKER = "did not fill in the required summary template";
 
@@ -1426,23 +1419,20 @@ async function startNewTurn(input: {
 
   // No resumable Claude session (first claude-code turn of this chat, model
   // switch mid-conversation, lost store): serialize the prior OpenCode
-  // messages into the prompt so Claude sees the whole conversation.
-  // A summary that can't resume gets the history sized to the chat model's
-  // window: OpenCode already fit the request to it.
+  // messages into the prompt so Claude sees the whole conversation, with
+  // its images and documents. A summary that can't resume gets it the same
+  // way: OpenCode already fit the request to the model.
   // A resumed session gets only the turns it missed, if any.
-  const transcript = resume
-    ? buildConversationTranscript(missedMessages)
-    : metaKind === "summary"
-      ? buildConversationTranscript(priorMessages, summaryHistoryMaxChars(model))
-      : buildConversationTranscript(priorMessages);
-  if (transcript) {
+  const transcript = buildConversationTranscript(resume ? missedMessages : priorMessages);
+  if (transcript.length > 0) {
     log.info(
       resume
         ? "[opencode-claude] injecting turns the resumed Claude session missed"
         : "[opencode-claude] injecting transferred conversation history",
       {
         conversationKey,
-        transcriptChars: transcript.length,
+        transcriptChars: transcriptText(transcript).length,
+        transcriptFiles: transcriptFiles(transcript),
         historyMessages: resume ? missedMessages.length : priorMessages.length,
       },
     );
