@@ -95,6 +95,7 @@ import {
   sessionReader,
   type CopySource,
 } from "./session-fork.js";
+import { legacyCopySource, type LegacySource } from "./migration.js";
 import { log } from "./log.js";
 import { checkSubscriptionAuth, cliTooOldMessage, cliVersionTooOld, probeCliVersion } from "./detect.js";
 import {
@@ -834,6 +835,8 @@ type ChatTurnPlan = {
   epoch: string;
   /** Why the turn starts a new transcript (the plan's journal line says the same); see turnNotes. */
   startedBecause?: string;
+  /** The turn copies the transcript an older release kept for the chat (migration.ts). */
+  migrated?: boolean;
   /** The point moved onto the transcript's leaf chain (turn-point.ts offLeafChain); see turnNotes. */
   offLeafChain?: boolean;
 };
@@ -866,6 +869,10 @@ const TURN_NOTES = {
     `[claude-code] Another Claude Code process wrote to the chat's session file after this chat's turns, so this turn continued from before them and ${count === 1 ? "a message" : `${count} messages`} went to Claude as text, once.`,
   rebuiltStep:
     "[claude-code] The turn that waited for these tool results was gone (the plugin restarted, or the wait ran out), so the results went to Claude as text.",
+  migrated:
+    "[claude-code] This chat continues from the Claude session an earlier version of the plugin kept for it, copied once under the chat's new name.",
+  migrationFailed:
+    "[claude-code warning] The Claude session an earlier version of the plugin kept for this chat no longer matches it, so its history went as text, without the prompt cache.",
 };
 
 /**
@@ -875,6 +882,7 @@ const TURN_NOTES = {
  * the question, not as history) is the chat so far.
  */
 function turnNotes(plan: ChatTurnPlan, hasHistory: boolean): string[] {
+  if (plan.migrated) return [TURN_NOTES.migrated];
   if (plan.resume && plan.missedMessages.length > 0) {
     const count = plan.missedMessages.length;
     return [plan.offLeafChain ? TURN_NOTES.offLeafChain(count) : TURN_NOTES.missed(count)];
@@ -891,6 +899,8 @@ function turnNotes(plan: ChatTurnPlan, hasHistory: boolean): string[] {
       return [TURN_NOTES.forkCopyFailed];
     case "the copy for the revert holds none of the chat's messages":
       return [TURN_NOTES.revertCopyEmpty];
+    case "the old transcript of this chat does not match it":
+      return [TURN_NOTES.migrationFailed];
     default:
       return [TURN_NOTES.sessionLost];
   }
@@ -927,6 +937,8 @@ async function planChatTurn(input: {
   rebuiltStep: boolean;
   /** The Claude account of the chat's project (`configDirs`): where its transcripts are. */
   configDir?: string;
+  /** The request's body (OpenAI form): an older release fingerprinted it (migration.ts). */
+  requestBody?: ReadonlyArray<{ role?: string; content?: unknown }>;
 }): Promise<ChatTurnPlan | Response> {
   const { sessionID, conversationKey, event, priorMessages, configDir } = input;
   if (!event) return refuseRequest(NO_CONTEXT_EVENT);
@@ -953,9 +965,11 @@ async function planChatTurn(input: {
   // What the turn is planned on: the usable transcript, or the chain a copy
   // will hold (the copy has only the source's chain down to the point).
   let records: TranscriptRecord[];
-  let copyFrom: { name: string; why: "revert" | "fork"; parent?: string } | undefined;
+  let copyFrom: { name: string; why: "revert" | "fork" | "migration"; parent?: string } | undefined;
   /** The parent's transcript a fork's first turn copies, whole: the copy's plan reads it where the copy itself is too short. */
   let forkSource: CopySource | undefined;
+  /** The transcript an older release kept for this chat, which its first turn copies (migration.ts). */
+  let legacySource: LegacySource | undefined;
   if (transcripts.usable) {
     records = transcripts.usable.records;
   } else if (transcripts.withRecords.length > 0 || transcripts.refused) {
@@ -965,14 +979,45 @@ async function planChatTurn(input: {
     // No transcript of this chat in this epoch ever held a record: a fork's first turn copies its parent's.
     const fromParent = await forkCopySource(sessionID, epoch, configDir);
     forkSource = fromParent.source;
-    if (!forkSource) return startNew(fromParent.failed ? "the fork could not copy its parent's transcript" : "no transcript of this chat in this epoch");
-    records = chainTo(forkSource.records, forkSource.point);
-    copyFrom = { name: forkSource.transcript.name, why: "fork", parent: forkSource.chat };
+    if (!forkSource && fromParent.failed) return startNew("the fork could not copy its parent's transcript");
+    if (forkSource) {
+      records = chainTo(forkSource.records, forkSource.point);
+      copyFrom = { name: forkSource.transcript.name, why: "fork", parent: forkSource.chat };
+    } else {
+      // No fork: a chat an older release served copies the transcript it kept, before any compaction.
+      const legacy = epoch === FIRST_EPOCH && input.requestBody ? await legacyCopySource(sessionID, input.requestBody, list, configDir) : {};
+      if (legacy.failed) {
+        log.warn("[opencode-claude] the transcript an older plugin version kept for this chat does not match it; transferring history", { conversationKey, why: legacy.failed });
+        return startNew("the old transcript of this chat does not match it");
+      }
+      if (!legacy.source) return startNew("no transcript of this chat in this epoch");
+      legacySource = legacy.source;
+      records = chainTo(legacySource.records, legacySource.point);
+      copyFrom = { name: legacySource.name, why: "migration" };
+    }
   }
   let plan = planResume(records, list, chain);
   if (plan.kind === "exhausted") {
     log.warn("[opencode-claude] every attempt of the message is taken; refusing it", { conversationKey, attempts: MAX_ATTEMPTS });
     return refuseRequest(ATTEMPTS_EXHAUSTED, "claude_attempts_exhausted");
+  }
+  // The old transcript's records carry no names: the turn continues at the
+  // end of the last turn the old record knows, the user message of that
+  // turn the last one the copy holds.
+  if (legacySource) {
+    plan = {
+      kind: "resume",
+      point: legacySource.point,
+      coveredIndex: legacySource.coveredIndex,
+      attempt: 1,
+      stepDelivered: legacySource.stepDelivered,
+      answered: legacySource.answered,
+    };
+    log.info("[opencode-claude] continuing a chat an older plugin version served from the transcript it kept", {
+      conversationKey,
+      from: legacySource.name,
+      point: legacySource.point,
+    });
   }
   if (plan.kind === "none") {
     // Nothing before the message to resume at: a transcript without the
@@ -1086,6 +1131,7 @@ async function planChatTurn(input: {
     stepDelivered: input.rebuiltStep && !rebuildStep,
     promptUuid: launching.names[plan.attempt - 1]!,
     epoch,
+    ...(copyFrom?.why === "migration" ? { migrated: true } : {}),
     ...(plan.offLeafChain ? { offLeafChain: true } : {}),
   };
 }
@@ -2031,6 +2077,7 @@ async function startNewTurn(input: {
       messages,
       rebuiltStep: answeredStep !== null,
       configDir,
+      requestBody: Array.isArray(body.messages) ? body.messages : [],
     });
     if (planned instanceof Response) return planned;
     // The step's results are in the transcript, the transcript never saw the

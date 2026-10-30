@@ -25,10 +25,21 @@
   current history names and resumes right after its turn, so a revert
   continues from the turn before the reverted one, a retry gets a new
   record, and turns another model answered reach Claude as text. No
-  record file is kept; an existing `sessions.json` is left alone and ignored,
-  so the first turn of an existing chat after the update transfers its
-  history once. Requires Claude Code 2.1.300 or later and OpenCode 2.0.19 or
-  later.
+  record file is kept; an existing `sessions.json` is read once per chat
+  and never changed. Requires Claude Code 2.1.300 or later and OpenCode
+  2.0.19 or later.
+- **Chats from earlier releases keep their Claude session**: the first
+  turn of a chat 1.7.0 or earlier served copies the transcript that release
+  kept for it under the chat's new name, when its record in
+  `sessions.json` still matches the chat, and continues from there;
+  otherwise the history goes as text once. Neither `sessions.json` nor the
+  old transcript is changed, so going back to an earlier release finds
+  both: the chat continues its old transcript there, and the turns made
+  since reach Claude as text once (so do that release's turns on the way
+  forward again). A chat on an old `…[1m]` id of 1.6.0 (Fable 5, Opus 5
+  and later) asks for its model once, as on 1.7.0. After going back to
+  1.6.0 such a chat shows "Model unavailable" until its model is picked
+  again: 1.6.0 names them with `[1m]`; going back to 1.7.0 needs nothing.
 - **Breaking: requests the plugin cannot name are refused**: a request
   without OpenCode's session id (the plugin no longer keys a chat by its
   messages), a chat request that did not pass the `context` hook, and a
