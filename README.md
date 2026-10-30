@@ -3,6 +3,9 @@
 [![npm](https://img.shields.io/npm/v/%40openchamber%2Fopencode-claude?style=flat&labelColor=100F0F&color=24837B)](https://www.npmjs.com/package/@openchamber/opencode-claude)
 [![GitHub release](https://img.shields.io/github/v/release/openchamber/opencode-claude?style=flat&labelColor=100F0F&color=205EA6)](https://github.com/openchamber/opencode-claude/releases/latest)
 [![Discord](https://img.shields.io/badge/Discord-join.svg?style=flat&labelColor=100F0F&color=8B7EC8&logo=discord&logoColor=FFFCF0)](https://discord.gg/ZYRSdnwwKA)
+
+> [!IMPORTANT]
+> **This plugin is no longer needed.** OpenCode 2.2.3 and later support Claude Code natively. Switch to the built-in provider and remove `@openchamber/opencode-claude` from your config. The repository is archived; the npm package stays available for a transition period.
 [![License](https://img.shields.io/badge/license-MIT-black?style=flat&labelColor=100F0F&color=EC8B49)](LICENSE)
 
 Use your Claude Pro or Max plan in [OpenCode](https://opencode.ai) and [OpenChamber](https://github.com/openchamber/openchamber).
