@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { claudeConfigDir } from "./config-dir.js";
 
 export type ClaudeSessionBinding = {
   conversationKey: string;
@@ -520,11 +521,11 @@ export function conversationKeyFromMessages(
  */
 export function findClaudeSessionFile(
   foreignSessionId: string,
+  configDir?: string,
 ): string | null {
   const id = foreignSessionId.trim();
   if (!id) return null;
-  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-  const projectsDir = join(configDir, "projects");
+  const projectsDir = join(claudeConfigDir(configDir), "projects");
   let projectDirs: string[];
   try {
     projectDirs = readdirSync(projectsDir);

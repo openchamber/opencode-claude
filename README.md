@@ -79,7 +79,9 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 
 ## Using it
 
-**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. Opus, Fable and some Sonnet models come in 1M-context versions. Context limits and effort levels show up in OpenCode's model details.
+**Models.** The list comes from your own `claude` CLI, so you see what your account can use and it updates when Claude Code does. Most current models run with a 1M context; Opus 4.6 also comes as a separate 1M version. Context limits and effort levels show up in OpenCode's model details. Configs and agents have to name a listed id, like `claude-code/claude-opus-5-5`: aliases such as `opus` and ids the picker doesn't show aren't models here.
+
+**Fast mode.** Models your CLI runs in [fast mode](https://code.claude.com/docs/en/fast-mode) get a second entry, like "Opus 5.5 Fast". Fast turns draw your plan limits faster. If your account can't use fast mode, the turn runs at normal speed and the log says why.
 
 **Keeping the CLI current.** Claude Code only updates itself from its interactive screen, so a CLI used from OpenCode alone would stay on the version it was installed with, and new models would never appear. The plugin runs `claude update` for you, in the background, about once an hour; a new version is picked up by the next chat turn, and its models the next time the plugin reads the model list: when OpenCode loads the plugin (for example after a restart), at most once every ten minutes. Several OpenCode servers on one machine share the schedule: the one that starts the update marks it `running` in `~/.local/share/opencode-claude/cli-update.json`, and the others skip. Every run ends with `claude --version`, and an update the CLI reports but did not put in place is recorded as a failure. A chat turn that starts while the CLI cannot be launched (the update is replacing it, or another program holds the file) fails with a server error, which OpenCode retries on its own a few seconds later, up to ten times; the plugin looks for the CLI again before each retry. The file holds the outcome of the last run, and `cli-update.log` next to it keeps one line per update and per failure. To turn it off, pass `cliAutoUpdate: false` in the plugin options (`{ "package": "@openchamber/opencode-claude", "options": { "cliAutoUpdate": false } }`); Claude Code's own `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` in the server's environment are honoured too. Installs owned by winget, Homebrew or a Linux package manager are left to them.
 
@@ -92,6 +94,22 @@ You need [OpenCode](https://opencode.ai) 2.x and the [Claude Code CLI](https://w
 **Skills and agents.** OpenCode's skills (from `.claude`, `.agents` and `.opencode`) are listed for Claude and load through OpenCode's skill tool. A custom agent's own prompt, like a `writer` subagent's, is passed on as that agent's role.
 
 **Titles and summaries.** Session titles run as small one-off requests on Haiku, so they barely touch your limits. Compaction summaries are written by the chat's own model from its Claude session, so they cover the whole conversation with full tool results; most of it comes from the prompt cache. The session itself isn't changed.
+
+**Several Claude accounts.** Claude Code keeps one login per config directory. To run some projects on another account (say, a work plan), sign that account in with its own directory, then map project folders to it in the plugin options; the deepest matching folder wins and everything else stays on your default login:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-work claude auth login --claudeai
+```
+
+```json
+{ "plugins": [{ "package": "@openchamber/opencode-claude", "options": { "configDirs": { "~/work": "~/.claude-work" } } }] }
+```
+
+**Compacting earlier.** On 1M models OpenCode compacts a chat near 850K tokens, and every step of a long chat re-reads all of it. To compact sooner, set `compactAt` in the plugin options; Claude still has its full window for a turn that runs over:
+
+```json
+{ "plugins": [{ "package": "@openchamber/opencode-claude", "options": { "compactAt": 400000 } }] }
+```
 
 **Model fallback.** If Claude Code declines a request on one model and retries on another (for example Fable to Opus), you'll see a note in the reasoning, and the session switches to the model that's actually answering.
 

@@ -19,7 +19,15 @@ export type ClaudeModel = {
   resolvedId?: string;
   /** Effort levels the model accepts; defaults to all when reasoning. */
   efforts?: ClaudeEffort[];
+  /** Runs in Claude Code's fast mode; `resolvedId` is the plain model. */
+  fast?: boolean;
 };
+
+/**
+ * Suffix of a fast-mode entry's id. OpenCode has no speed setting, so fast
+ * mode is a model of its own in the picker ("Opus 5.5 Fast").
+ */
+export const FAST_MODEL_SUFFIX = ":fast";
 
 const LIMIT_1M = { context: 1_000_000, output: 128_000 } as const;
 const LIMIT_200K = { context: 200_000, output: 64_000 } as const;
@@ -49,12 +57,10 @@ function model(
  * (`opus[1m]`, `sonnet`) asks the user to pick a model once.
  */
 const FALLBACK_MODELS: ClaudeModel[] = [
-  model("claude-opus-5-5[1m]", "Opus 5.5", LIMIT_1M),
-  model("claude-fable-5-1[1m]", "Fable 5.1", LIMIT_1M),
-  model("claude-sonnet-5-5", "Sonnet 5.5", LIMIT_200K),
-  model("claude-sonnet-5-5[1m]", "Sonnet 5.5 (1M)", LIMIT_1M),
-  model("claude-sonnet-5", "Sonnet 5", LIMIT_200K),
-  model("claude-sonnet-5[1m]", "Sonnet 5 (1M)", LIMIT_1M),
+  model("claude-opus-5-5", "Opus 5.5", LIMIT_1M),
+  model("claude-fable-5-1", "Fable 5.1", LIMIT_1M),
+  model("claude-sonnet-5-5", "Sonnet 5.5", LIMIT_1M),
+  model("claude-sonnet-5", "Sonnet 5", LIMIT_1M),
   model("claude-haiku-5-5", "Haiku 5.5", LIMIT_1M),
   model("claude-haiku-4-5", "Haiku 4.5", LIMIT_200K, undefined, []),
   model("claude-opus-4-8", "Opus 4.8", LIMIT_1M),
@@ -66,21 +72,25 @@ export type SdkModelRow = {
   displayName?: string;
   resolvedModel?: string;
   supportedEffortLevels?: string[];
+  supportsFastMode?: boolean;
 };
 
 /**
- * 1M context rules per model family (same table t3code ships). Claude Code
- * selects 1M through a `[1m]` suffix on the model id.
+ * 1M context rules per model family, from the window the CLI reports for
+ * each plain id (Claude Code 2.1.312, a subscription plan). Claude Code
+ * selects 1M through a `[1m]` suffix where the plain id runs at 200K.
  * - default: offered only as the 1M variant
  * - optional: offered as both the plain model and a 1M variant
  * - fixed: the plain id already runs at 1M
+ * Anything else is 200K. Sonnet 4.6's 1M needs usage credits, so it isn't
+ * offered.
  */
 const ONE_M_FAMILIES: Array<{ match: RegExp; mode: "default" | "optional" | "fixed" }> = [
-  { match: /^claude-fable-5/, mode: "default" },
-  { match: /^claude-opus-5/, mode: "default" },
-  { match: /^claude-opus-4-6/, mode: "default" },
+  { match: /^claude-fable-5/, mode: "fixed" },
+  { match: /^claude-opus-5/, mode: "fixed" },
   { match: /^claude-opus-4-[78]/, mode: "fixed" },
-  { match: /^claude-sonnet-(5|4-6)/, mode: "optional" },
+  { match: /^claude-opus-4-6/, mode: "optional" },
+  { match: /^claude-sonnet-5/, mode: "fixed" },
   { match: /^claude-haiku-5/, mode: "fixed" },
 ];
 
@@ -132,7 +142,19 @@ export function modelsFromSdk(rows: SdkModelRow[]): ClaudeModel[] {
   }
   // An alias row and its concrete row resolve to the same model.
   const seen = new Set<string>();
-  return out.filter((m) => !seen.has(m.id) && seen.add(m.id));
+  const unique = out.filter((m) => !seen.has(m.id) && seen.add(m.id));
+  // Fast mode where the CLI says the model supports it, next to its model.
+  const fastFamilies = new Set(
+    rows
+      .filter((row) => row?.supportsFastMode === true)
+      .map((row) => (row.resolvedModel || row.value || "").trim().replace(/\[1m\]$/i, ""))
+      .filter((id) => id && id !== "default"),
+  );
+  return unique.flatMap((m) =>
+    fastFamilies.has(m.id.replace(/\[1m\]$/i, ""))
+      ? [m, { ...m, id: `${m.id}${FAST_MODEL_SUFFIX}`, name: `${m.name} Fast`, resolvedId: m.id, fast: true }]
+      : [m],
+  );
 }
 
 let discovered: ClaudeModel[] | null = readCachedModels();
@@ -176,6 +198,11 @@ function writeCachedModels(models: ClaudeModel[]): void {
   } catch {
     // The cache only speeds up the next start.
   }
+}
+
+/** Whether the picked catalog entry runs in fast mode. */
+export function isFastModelId(modelId: string): boolean {
+  return getClaudeModels().find((m) => m.id === modelId)?.fast === true;
 }
 
 export function resolveClaudeModelId(modelId: string): string {

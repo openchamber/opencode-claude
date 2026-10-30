@@ -43,12 +43,14 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSy
 import { createServer, connect, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { sleep } from "./helpers.ts";
 
-const { readCliUpdateRecord, startClaudeCliAutoUpdate, updateClaudeCli } = await import(
-  "../src/cli-update.ts"
-);
-const { resolveClaudeCli } = await import("../src/executable-path.ts");
+import { pluginModule } from "./simulators/world.ts";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The plugin's modules of the tree under test (OPENCODE_CLAUDE_PLUGIN_DIR, else this checkout).
+const { readCliUpdateRecord, startClaudeCliAutoUpdate, updateClaudeCli } = await pluginModule("cli-update");
+const { resolveClaudeCli } = await pluginModule("executable-path");
 
 type Outcome = Awaited<ReturnType<typeof updateClaudeCli>>;
 

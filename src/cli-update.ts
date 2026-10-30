@@ -373,6 +373,12 @@ async function probeCliVersion(binaryPath: string, env: Env): Promise<string | n
  * An outcome that names the version the CLI should now be on must agree
  * with `claude --version`. `claude update` reports success when it kept the
  * old launcher (see the top of this file); the version check is what tells.
+ * The cause the message names follows what `--version` answered: the old
+ * version (the launcher was not replaced: held open, not the installer's
+ * own, not writable), no version (the program in its place does not run or
+ * is not Claude Code: an npm update can leave the package's placeholder,
+ * anthropics/claude-code#96265), or another version (another program or
+ * another install in its place: the Bun runtime, anthropics/claude-code#80933).
  */
 function withInstalledVersion(
   outcome: ClaudeCliUpdateOutcome,
@@ -388,9 +394,17 @@ function withInstalledVersion(
     claim = `claude update reported ${outcome.version} as up to date`;
   }
   if (expected !== null && installed !== expected) {
+    let cause: string;
+    if (installed === null) {
+      cause = "the program in its place does not run or is not Claude Code (an npm update can leave the package's placeholder there)";
+    } else if (outcome.kind === "updated" && installed === outcome.from) {
+      cause = "the launcher was not replaced (held open by another program, not the installer's own, or not writable)";
+    } else {
+      cause = "what runs there is another program or another install";
+    }
     return {
       kind: "failed",
-      message: `${claim}, but \`claude --version\` reports ${installed ?? "no version"}; the launcher was not replaced (held open by another program, not the installer's own, or not writable)`,
+      message: `${claim}, but \`claude --version\` reports ${installed ?? "no version"}; ${cause}`,
       installed,
     };
   }

@@ -82,13 +82,14 @@ export function classifyClaudeFailure(text: string): ClaudeFailureKind {
  * spawn Claude Code process: …"); Bun throws other spawn errors right away,
  * naming the system call ("EBUSY: resource busy or locked, uv_spawn" on
  * Windows, "ETXTBSY: text file busy, posix_spawn" elsewhere), and query.ts
- * wraps Node's ENOTDIR.
+ * wraps Node's ENOTDIR. An npm install's `cli.js` that is gone starts node
+ * fine, and node exits 1 with "Cannot find module '…claude-code…cli.js'".
  * Seen when `claude update` swaps the launcher under a starting turn, or an
  * install changed the layout. The memoized CLI path is dropped so the next
  * attempt looks again; the turn itself stays a 500, which OpenCode retries.
  */
 const LAUNCH_FAILURE_PATTERN =
-  /Claude Code (?:native binary|executable) not found at|Claude Code (?:native binary|executable) at .* exists but failed to launch|Failed to spawn Claude Code process|\b(?:uv|posix)_spawn\b|Claude Code executable path is not spawnable/;
+  /Claude Code (?:native binary|executable) not found at|Claude Code (?:native binary|executable) at .* exists but failed to launch|Failed to spawn Claude Code process|\b(?:uv|posix)_spawn\b|Claude Code executable path is not spawnable|Cannot find module '[^']*[\\/]claude-code[\\/]cli\.js'/;
 
 export function isClaudeLaunchFailure(text: string): boolean {
   return LAUNCH_FAILURE_PATTERN.test(text);
