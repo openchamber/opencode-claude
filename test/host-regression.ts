@@ -4,7 +4,10 @@
  * the user started does not.
  */
 import assert from "node:assert/strict";
-import { currentHost, mcpToolName, openCodeToolName } from "../src/host.ts";
+import { pluginModule } from "./simulators/world.ts";
+
+// The plugin of the tree under test (OPENCODE_CLAUDE_PLUGIN_DIR), as every test reads it.
+const { currentHost, mcpToolName, openCodeToolName } = await pluginModule("host");
 
 const chamber = currentHost({ OPENCHAMBER_RUNTIME: "desktop" });
 assert.deepEqual(chamber, { name: "OpenChamber", mcpServer: "openchamber" });
@@ -21,7 +24,7 @@ assert.equal(openCodeToolName("mcp__opencode__edit"), "edit");
 
 // The runtime note names the host this process runs under.
 delete process.env.OPENCHAMBER_RUNTIME;
-const { buildRuntimeInstructions } = await import("../src/prompt.ts");
+const { buildRuntimeInstructions } = await pluginModule("prompt");
 assert.match(buildRuntimeInstructions({}), /running in OpenCode through the Claude Code harness/);
 process.env.OPENCHAMBER_RUNTIME = "web";
 assert.match(buildRuntimeInstructions({}), /running in OpenChamber through the Claude Code harness/);

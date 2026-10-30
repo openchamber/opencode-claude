@@ -3,62 +3,79 @@
  * route, so the turn parked on the old history must be stopped by the next
  * request instead of re-emitting its calls.
  *
+ * On the simulators (test/simulators/): Claude calls a tool; while OpenCode
+ * runs it the context reaches the ceiling, and OpenCode's compaction agent,
+ * on another provider's model (`opencode.state.compactionElsewhere`), compacts
+ * before the step's next request: that request carries only the checkpoint,
+ * the old call is text in its recent part. Claude then calls a tool on the
+ * new history and the step goes on.
+ *
  * Run: bun test/cross-provider-compaction-regression.ts
  */
-import { assert, bashTool, callTool, interruptibleTurn, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
+
+import { createWorld } from "./simulators/world.ts";
 
 async function main() {
-  const keepAlive = setInterval(() => {}, 1000);
-  const { post, proxy } = await startMockedProxy("cross-provider-compaction");
-  const log: string[] = [];
-  let spawns = 0;
+  const world = await createWorld("cross-provider-compaction");
+  const { opencode, claude } = world;
   try {
-    proxy.setClaudeQueryStarter(async (params) => {
-      const turn = ++spawns;
-      if (turn > 1) {
-        assert.equal(params.resume, undefined, "compacted history must not resume the old Claude session");
-      }
-      return interruptibleTurn(log, `turn-${turn}`, async function* () {
-        yield { type: "system", subtype: "init", session_id: `claude-${turn}` };
-        await callTool(params, "bash", { command: turn === 1 ? "old-work" : "new-work" });
-        yield textDelta("continued from current history");
-        yield { type: "result", is_error: false, usage: { input_tokens: 1000, output_tokens: 10 } };
-      });
+    await opencode.startPlugin();
+    opencode.state.compactionElsewhere = true;
+    const chat = opencode.newChat();
+    await opencode.say(chat, "original long conversation");
+    // The first answer measures a context near the window: OpenCode compacts before the step's next request.
+    const window = (opencode.instances[0]!.provider.models as any[]).find((m) => /sonnet/.test(m.id))!.limit.context as number;
+    claude.state.usage = { input_tokens: Math.ceil(window * 0.95) };
+    claude.state.toolTurn = true;
+    const summariesBefore = claude.queries.filter((q) => q.kind === "summary").length;
+    let runs = 0;
+    const turn = await opencode.turn(chat, {
+      toolOutput: () => {
+        runs += 1;
+        if (runs > 1) return "new-work finished";
+        // Claude calls a tool again on the compacted history, with a small context this time.
+        claude.state.usage = {};
+        claude.state.toolTurn = true;
+        return "old-work finished";
+      },
     });
-    const first = await post("cross-provider", {
-      tools: [bashTool], messages: [{ role: "user", content: "original long conversation" }],
-    });
-    const old = (await first.json()) as any;
-    assert.equal(old.choices[0].finish_reason, "tool_calls");
+    assert.ok(turn.ok, `the turn answered: ${turn.requests.map((r) => r.status).join(",")}`);
+    const [old, fresh, continued] = turn.requests;
+    assert.equal(turn.requests.length, 3, "the call, the call on the new history, the answer");
+    assert.equal(old!.reply!.finish, "tool_calls");
 
-    // Another provider has completed the compaction. OpenCode's next request contains only its
-    // checkpoint; the pending old call now exists as text in recent-context.
-    const checkpoint = [{ role: "user", content: "<conversation-checkpoint>\n<summary>Continue current work</summary>\n<recent-context>old-work finished</recent-context>\n</conversation-checkpoint>" }];
-    const after = await post("cross-provider", { tools: [bashTool], messages: checkpoint });
-    const fresh = (await after.json()) as any;
-    assert.equal(spawns, 2, "cross-provider checkpoint must replace the parked turn, not re-emit its old call");
-    assert.ok(log.includes("turn-1:interrupt"), "old process stopped before replacing its binding");
-    const call = fresh.choices[0].message.tool_calls[0];
-    assert.notEqual(call.id, old.choices[0].message.tool_calls[0].id);
-    assert.equal(JSON.parse(call.function.arguments).command, "new-work");
+    // Another provider compacted: no summary reached the plugin, the next request holds only the checkpoint.
+    assert.equal(claude.queries.filter((q) => q.kind === "summary").length, summariesBefore, "the compaction never reached the plugin");
+    assert.ok(opencode.session(chat).messages.some((m) => m.type === "compaction"), "OpenCode compacted the chat");
+    assert.match(JSON.stringify(fresh!.list[0]?.content ?? ""), /another model's summary/, "the request after the compaction starts with the checkpoint");
 
-    // Retrying an unchanged checkpoint must reuse the new park, not reset again.
-    const retry = await post("cross-provider", { tools: [bashTool], messages: checkpoint });
-    assert.equal(((await retry.json()) as any).choices[0].message.tool_calls[0].id, call.id);
-    assert.equal(spawns, 2);
-    const continued = await post("cross-provider", {
-      tools: [bashTool], messages: [
-        ...checkpoint,
-        { role: "assistant", content: null, tool_calls: [call] },
-        { role: "tool", tool_call_id: call.id, content: "done" },
-      ],
-    });
-    assert.equal(((await continued.json()) as any).choices[0].finish_reason, "stop");
-    assert.equal(spawns, 2, "normal post-checkpoint tool continuation stays on the same turn");
-    console.log("cross-provider-compaction regression ok: stale park replaced; unchanged checkpoint reused");
+    const [first, second] = claude.queries.filter((q) => q.kind === "chat");
+    assert.equal(claude.queries.filter((q) => q.kind === "chat").length, 2, "the checkpoint replaced the parked turn with one new turn");
+    assert.equal(first!.outcome, "stopped", "the old process was stopped");
+    assert.notEqual(second!.params.resume, first!.name, "compacted history must not resume the old Claude session");
+    assert.match(second!.view, /another model's summary/, "Claude got the checkpoint");
+    assert.equal(fresh!.reply!.finish, "tool_calls");
+    const call = fresh!.reply!.toolCalls[0]!;
+    assert.notEqual(call.id, old!.reply!.toolCalls[0]!.id, "a new call, not the parked one re-emitted");
+
+    // The usual continuation after the checkpoint stays on the same turn.
+    assert.equal(continued!.reply!.finish, "stop");
+    assert.equal(continued!.counted[1] - continued!.counted[0], 0, "the tool result continues the new turn");
+    const results = claude.records(second!.name).filter((r) => r.toolUseResult).map((r) => JSON.stringify(r.toolUseResult));
+    assert.ok(results.some((r) => r.includes("new-work finished")), `the new turn got its tool's result: ${results}`);
+
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+    console.log("cross-provider-compaction regression ok: stale park replaced; the new turn continues");
   } finally {
-    clearInterval(keepAlive);
-    await proxy.stopProxy?.();
+    await world.dispose();
   }
 }
-main().then(() => process.exit(0), (error) => { console.error(error); process.exit(1); });
+
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

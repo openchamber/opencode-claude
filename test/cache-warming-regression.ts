@@ -1,74 +1,74 @@
 /**
- * Regression: OpenCode's cache warming pings an idle chat with a generate
- * request every few minutes. Through Claude Code the ping warms nothing the
- * chat's turns reuse, and each one re-read the whole history from the plan's
- * limits. It is answered without starting Claude; other generate requests
- * still run.
+ * Regression (1.6.1): OpenCode's cache warming pings an idle chat with a
+ * generate request every few minutes. Through Claude Code the ping warms
+ * nothing the chat's turns reuse, and each one re-read the whole history from
+ * the plan's limits. It is answered without starting Claude; other generate
+ * requests still run.
+ *
+ * On the simulators (test/simulators/): OpenCode's `warming` setting
+ * (`opencode.state.warming`, a short interval here; BEHAVIOR.md "Cache
+ * warming"): after a chat's turn OpenCode pings the idle chat with its
+ * keep-alive prompt as a generation of the whole chat, streamed as every
+ * request of OpenCode's is (`opencode.warming.pings`; one ping now:
+ * `opencode.warming.ping`). Another generation is `opencode.generate`. What
+ * Claude Code started: `claude.queries`.
  *
  * Run: bun test/cache-warming-regression.ts
  */
-import { assert, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-const WARMING_PROMPT =
-  "This is a keep-alive request. Do not perform any work or use tools. Reply with exactly: OK";
+import { WARMING_DEFAULTS } from "./simulators/opencode.ts";
+import { createWorld } from "./simulators/world.ts";
 
 async function main() {
-  const { port, proxy } = await startMockedProxy("cache-warming");
-  let starts = 0;
-  proxy.setClaudeQueryStarter(async () => {
-    starts += 1;
-    return mockHandle(
-      (async function* () {
-        yield textDelta("generated");
-        yield { type: "result", is_error: false, usage: {} };
-      })(),
-    );
-  });
-  const generate = (prompt: string, stream: boolean) =>
-    fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-opencode-claude-session": "ses_warm",
-        "x-opencode-claude-kind": "generate",
-      },
-      body: JSON.stringify({
-        model: "sonnet",
-        stream,
-        messages: [
-          { role: "user", content: "long chat history" },
-          { role: "assistant", content: "answer" },
-          { role: "user", content: prompt },
-        ],
-      }),
-    });
-
+  const world = await createWorld("cache-warming");
+  const { opencode, claude } = world;
   try {
-    const plain = await generate(WARMING_PROMPT, false);
-    assert.equal(plain.status, 200);
-    const json = (await plain.json()) as any;
-    assert.equal(json.choices[0].message.content, "OK");
-    assert.equal(json.usage.total_tokens, 0);
+    await opencode.startPlugin();
+    opencode.state.warming = { interval: 50, duration: 3_000 };
+    const chat = opencode.newChat();
+    await opencode.say(chat, "a long chat history");
+    assert.ok((await opencode.turn(chat)).ok, "the chat's turn answered");
+    const asked = claude.queries.length;
 
-    const streamed = await generate(WARMING_PROMPT, true);
-    assert.equal(streamed.status, 200);
-    const sse = await streamed.text();
-    assert.match(sse, /"content":"OK"/);
-    assert.match(sse, /"finish_reason":"stop"/);
-    assert.match(sse, /data: \[DONE\]/);
-    assert.equal(starts, 0, "a warming ping never starts Claude");
+    // OpenCode's own ping, once the chat is idle.
+    const deadline = Date.now() + 5_000;
+    while (!opencode.warming.pings.some((p) => p.chat === chat) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    const ping = opencode.warming.pings.find((p) => p.chat === chat);
+    assert.ok(ping, "OpenCode pinged the idle chat");
+    assert.equal(ping.failure, undefined, `the ping did not fail: ${JSON.stringify(ping.failure)}`);
+    assert.equal(ping.text, "OK", "the ping answered with OpenCode's expected reply");
+    opencode.state.warming = undefined;
+    opencode.stopBackground();
 
-    const real = await generate("Summarize the open questions.", false);
-    assert.equal(((await real.json()) as any).choices[0].message.content, "generated");
-    assert.equal(starts, 1, "other generate requests still run");
+    // The same request as OpenCode sends it, its reply read whole.
+    const direct = await opencode.generate(chat, WARMING_DEFAULTS.prompt);
+    assert.equal(direct.reply?.status, 200);
+    assert.equal(direct.text, "OK");
+    assert.equal(direct.reply?.finish, "stop");
+    assert.ok(!direct.reply?.streamError, "the stream ended with [DONE]");
+    assert.equal(claude.queries.length, asked, "a warming ping never starts Claude");
+
+    // Another generation still runs on Claude.
+    claude.state.summaryReplies = ["generated"];
+    const real = await opencode.generate(chat, "Summarize the open questions.");
+    assert.equal(real.text, "generated");
+    assert.equal(claude.queries.length, asked + 1, "other generate requests still run");
+
+    const journal = world.journal();
+    assert.ok(journal.some((line) => line.includes("answered a cache warming ping without Claude")), "the journal names the ping");
+    assert.deepEqual(journal.filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    opencode.state.warming = undefined;
+    await world.dispose();
   }
   console.log("ok — cache warming regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

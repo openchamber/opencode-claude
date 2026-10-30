@@ -4,17 +4,25 @@
  * The parts must reach Claude as MCP text / image / resource blocks, not as
  * one text block of JSON with the image's base64 inside it.
  *
+ * The author's test (1.6.1) on hand-laid inputs, kept as he wrote it: OpenCode
+ * 2.0.32 and 2.2.0 send no such tool message on the plugin's route (their
+ * native openai-compatible provider puts a tool result's text parts in the
+ * tool message and its files in a user message after it), so no turn of the
+ * simulators reaches this form. The plugin's module through the world, so the
+ * file runs on any tree that has the author's functions (where.md).
+ *
  * Run: bun test/tool-json-content-regression.ts
  */
-import { assert } from "./helpers.ts";
+import assert from "node:assert/strict";
+
+import { createWorld, pluginModule } from "./simulators/world.ts";
 
 const png = "iVBORw0KGgo=";
 const pdf = "JVBERi0xLjQK";
 
 async function main() {
-  const { decodeToolMessageContent, openaiToolResultToMcpContent } = await import(
-    "../src/prompt.ts"
-  );
+  const world = await createWorld("tool-json-content");
+  const { decodeToolMessageContent, openaiToolResultToMcpContent } = await pluginModule("prompt");
   const relay = (content: unknown) =>
     openaiToolResultToMcpContent(decodeToolMessageContent(content));
 
@@ -97,10 +105,14 @@ async function main() {
   const plainPart = [{ type: "text", text: "just output" }];
   assert(decodeToolMessageContent(plainPart) === plainPart, "a plain text part stays as is");
 
+  await world.dispose();
   console.log("tool-json-content-regression: ok");
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (error) => {
+    console.error(error);
+    process.exit(1);
+  },
+);

@@ -1,88 +1,62 @@
 /**
  * Regression: finish_reason follows Claude's stop_reason.
- * - max_tokens → "length", refusal → "content_filter" plus a short note that
- *   Claude declined; anything else → "stop".
- * - Only the main conversation counts: a subagent's stop_reason does not.
+ * - A plain answer → "stop".
  * - A parked turn still ends its response with "tool_calls".
+ * - max_tokens → "length", refusal → "content_filter" plus a short note that
+ *   Claude declined: these fail by a finding (both reach OpenCode as "stop")
+ *   and live in finish-reason-length-and-refusal-regression.ts until it is
+ *   fixed.
+ *
+ * On the simulators (test/simulators/): a turn of a new chat
+ * (test/simulators/turns.ts `answerTurn`); a tool step: `state.toolTurn`. The
+ * old case of a subagent's stop_reason is gone: the plugin starts Claude Code
+ * without its built-in tools (`tools: []`), so no Claude Code subagent streams
+ * in a turn. Independent cases (test/simulators/cases.ts).
  *
  * Run: bun test/finish-reason-regression.ts
  */
-import { assert, bashTool, callTool, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-const messageDelta = (stop_reason: string, parent_tool_use_id: string | null = null) => ({
-  type: "stream_event",
-  parent_tool_use_id,
-  event: { type: "message_delta", delta: { stop_reason }, usage: { output_tokens: 1 } },
-});
-
-function finishOf(sse: string): { finish: string | null; reasoning: string } {
-  let finish: string | null = null;
-  let reasoning = "";
-  for (const line of sse.split("\n")) {
-    if (!line.startsWith("data: {")) continue;
-    const chunk = JSON.parse(line.slice(6));
-    const choice = chunk.choices?.[0];
-    if (choice?.finish_reason) finish = choice.finish_reason;
-    if (choice?.delta?.reasoning_content) reasoning += choice.delta.reasoning_content;
-  }
-  return { finish, reasoning };
-}
+import { testCases } from "./simulators/cases.ts";
+import { answerTurn } from "./simulators/turns.ts";
+import { createWorld } from "./simulators/world.ts";
 
 async function main() {
-  const { post, proxy } = await startMockedProxy("finish-reason");
-  const turn = (events: unknown[]) =>
-    proxy.setClaudeQueryStarter(async () =>
-      mockHandle(
-        (async function* () {
-          yield* events;
-        })(),
-      ),
-    );
-  const ask = async (session: string, stream: boolean) => {
-    const res = await post(session, { stream, messages: [{ role: "user", content: "hi" }] });
-    assert.equal(res.status, 200);
-    if (stream) return finishOf(await res.text());
-    const json = (await res.json()) as any;
-    return {
-      finish: json.choices[0].finish_reason as string,
-      reasoning: String(json.choices[0].message.reasoning_content ?? ""),
-    };
-  };
+  const world = await createWorld("finish-reason");
+  const { opencode, claude } = world;
+  const cases = testCases();
   try {
-    for (const stream of [true, false]) {
-      turn([textDelta("long answer"), messageDelta("max_tokens"), { type: "result", is_error: false, stop_reason: "max_tokens", usage: {} }]);
-      assert.equal((await ask(`length-${stream}`, stream)).finish, "length");
+    await opencode.startPlugin();
 
-      turn([textDelta("I can't"), messageDelta("refusal"), { type: "result", is_error: false, stop_reason: "refusal", usage: {} }]);
-      const refused = await ask(`refusal-${stream}`, stream);
-      assert.equal(refused.finish, "content_filter");
-      assert.match(refused.reasoning, /Claude declined to answer/);
+    await cases.run("a plain answer: stop", async () => {
+      const plain = await answerTurn(world);
+      assert.ok(plain.turn.ok);
+      assert.equal(plain.reply.finish, "stop");
+      assert.doesNotMatch(plain.reply.reasoning, /declined/);
+    });
 
-      // The main turn's stop_reason, not a subagent's, and result wins.
-      turn([textDelta("done"), messageDelta("max_tokens", "toolu_sub"), messageDelta("end_turn"), { type: "result", is_error: false, stop_reason: "end_turn", usage: {} }]);
-      assert.equal((await ask(`stop-${stream}`, stream)).finish, "stop");
-    }
+    await cases.run("parked tool calls are still tool_calls, the step after the tool ends with stop", async () => {
+      claude.state.toolTurn = true;
+      const parked = await answerTurn(world);
+      assert.ok(parked.turn.ok);
+      assert.equal(parked.reply.finish, "tool_calls");
+      assert.equal(parked.turn.requests.at(-1)!.reply!.finish, "stop", "the step after the tool ends with stop");
+    });
 
-    // Parked tool calls are still "tool_calls".
-    proxy.setClaudeQueryStarter(async (params) =>
-      mockHandle(
-        (async function* () {
-          yield messageDelta("tool_use");
-          callTool(params, "bash", { command: "ls" }).catch(() => {});
-          await new Promise(() => {});
-        })(),
-      ),
-    );
-    const res = await post("parked", { stream: true, tools: [bashTool], messages: [{ role: "user", content: "hi" }] });
-    assert.equal(finishOf(await res.text()).finish, "tool_calls");
+    await cases.run("no error in the plugin's journal", () => {
+      assert.equal(opencode.retries.length, 0, "OpenCode sent nothing again");
+      assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+    });
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
-  console.log("ok — finish reason regression passed");
+  cases.done();
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(process.exitCode ?? 0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

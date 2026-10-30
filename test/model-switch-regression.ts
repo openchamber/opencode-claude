@@ -4,137 +4,79 @@
  * they must reach Claude with the new prompt — only those, not the turns
  * the session already holds — and the turn after must resume plainly.
  *
- * Run: bun test/model-switch-regression.ts
+ * On the simulators (test/simulators/): two turns Claude answers, two turns
+ * another model answers (`otherModelAnswer`: the prompt hook saw the
+ * questions, the plugin never served the answers), then back to Claude; what
+ * the plugin gave Claude Code is the query's `resume` and its input. The
+ * missed turns go as `<conversation_history>` text in the prompt, ahead of
+ * "Latest user message:" (main's form; one record without a turn in
+ * OpenCode's serialized form: model-switch-regression.ts). Another model's
+ * turns that end in its tool step (#74): model-switch-tool-step-main-regression.ts.
+ *
+ * Run: bun test/model-switch-main-regression.ts
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { StartClaudeQueryParams } from "../src/query.ts";
-import { assert, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-const SESSION_ID = "sess-model-switch";
-
-async function promptText(prompt: StartClaudeQueryParams["prompt"]): Promise<string> {
-  if (typeof prompt === "string") return prompt;
-  let text = "";
-  for await (const part of prompt) {
-    const content = (part as { message?: { content?: unknown } }).message?.content;
-    text += typeof content === "string" ? content : JSON.stringify(content);
-    // A chat turn's input stays open while the turn runs: only the first
-    // message is the prompt.
-    break;
-  }
-  return text;
-}
+import { contentText } from "./simulators/claude-code.ts";
+import { createWorld } from "./simulators/world.ts";
 
 async function main() {
-  // Resume requires the Claude transcript on disk.
-  const claudeConfig = mkdtempSync(join(tmpdir(), "opencode-claude-switch-cfg-"));
-  mkdirSync(join(claudeConfig, "projects", "proj"), { recursive: true });
-  writeFileSync(join(claudeConfig, "projects", "proj", `${SESSION_ID}.jsonl`), "");
-  process.env.CLAUDE_CONFIG_DIR = claudeConfig;
-
-  const user = (content: string) => ({ role: "user", content });
-  const assistant = (content: string) => ({ role: "assistant", content });
-
-  const { post, proxy } = await startMockedProxy("model-switch");
-
-  const calls: Array<{ resume?: string; prompt: string }> = [];
-  proxy.setClaudeQueryStarter(async (params) => {
-    calls.push({ resume: params.resume, prompt: await promptText(params.prompt) });
-    return mockHandle(
-      (async function* () {
-        yield { type: "system", subtype: "init", session_id: SESSION_ID };
-        yield { ...textDelta("ok"), session_id: SESSION_ID };
-        yield { type: "result", is_error: false, usage: {}, session_id: SESSION_ID };
-      })(),
-    );
-  });
-
-  const turn = async (messages: unknown[]) => {
-    const res = await post("switch", { messages });
-    assert.equal(res.status, 200, await res.clone().text());
-    return calls.at(-1)!;
-  };
-
+  const world = await createWorld("model-switch");
+  const { opencode, claude } = world;
   try {
-    const claudeTurns = [
-      user("CLAUDE-ASK-ONE"),
-      assistant("CLAUDE-ANSWER-ONE"),
-      user("CLAUDE-ASK-TWO"),
-    ];
-    await turn(claudeTurns.slice(0, 1));
-    const second = await turn(claudeTurns);
-    assert.equal(second.resume, SESSION_ID);
+    await opencode.startPlugin();
+    const chat = opencode.newChat();
+    /** A Claude turn: the query it started and the text of its prompt. */
+    const claudeTurn = async (text: string) => {
+      await opencode.say(chat, text);
+      const turn = await opencode.turn(chat);
+      assert.ok(turn.ok, `${text}: the turn answered (${turn.requests.at(-1)?.status})`);
+      const query = claude.queries.at(-1)!;
+      return { query, prompt: query.input.filter((m) => !m.noTurn).map((m) => contentText(m.content)).join("\n") };
+    };
+
+    const first = await claudeTurn("CLAUDE-ASK-ONE");
+    const second = await claudeTurn("CLAUDE-ASK-TWO");
+    assert.equal(second.query.params.resume, first.query.name, "the second turn resumes the chat's Claude session");
     assert.equal(second.prompt, "CLAUDE-ASK-TWO", "a plain follow-up carries no history");
 
     // Two turns answered by another model, then back to Claude.
-    const otherModel = [
-      ...claudeTurns,
-      assistant("CLAUDE-ANSWER-TWO"),
-      user("OTHER-ASK-ONE"),
-      assistant("OTHER-ANSWER-ONE"),
-      user("OTHER-ASK-TWO"),
-      assistant("OTHER-ANSWER-TWO"),
-      user("BACK-TO-CLAUDE"),
-    ];
-    const back = await turn(otherModel);
-    assert.equal(back.resume, SESSION_ID, "the Claude session still resumes");
+    for (const n of ["ONE", "TWO"]) {
+      await opencode.say(chat, `OTHER-ASK-${n}`);
+      opencode.otherModelAnswer(chat, `OTHER-ANSWER-${n}`);
+    }
+    const back = await claudeTurn("BACK-TO-CLAUDE");
+    assert.equal(back.query.params.resume, first.query.name, "the Claude session still resumes");
     const [missed, request] = back.prompt.split("</conversation_history>");
+    assert.ok(request !== undefined, `the other model's turns come as history: ${back.prompt.slice(0, 300)}`);
     assert.match(missed!, /after your last turn/);
     assert.match(
       missed!,
       /OTHER-ASK-ONE[\s\S]*OTHER-ANSWER-ONE[\s\S]*OTHER-ASK-TWO[\s\S]*OTHER-ANSWER-TWO/,
       "the other model's turns reach Claude in order",
     );
-    assert.doesNotMatch(missed!, /CLAUDE-/, "turns the session holds are not repeated");
+    assert.doesNotMatch(missed!, /CLAUDE-|answer L\d/, "turns the session holds are not repeated");
     assert.match(request!, /Latest user message:\nBACK-TO-CLAUDE$/);
+    // What the model saw: the session's own turns once, then the missed ones.
+    assert.equal(back.query.view.match(/CLAUDE-ASK-ONE/g)?.length, 1, "Claude saw its own first turn once");
 
-    const next = await turn([...otherModel, assistant("CLAUDE-ANSWER-THREE"), user("NEXT")]);
-    assert.equal(next.resume, SESSION_ID);
+    const next = await claudeTurn("NEXT");
+    assert.equal(next.query.params.resume, first.query.name);
     assert.equal(next.prompt, "NEXT", "the turn after carries no history again");
 
-    // Claude's own answered tool step (#74 control): nothing missed, so the
-    // step is relayed as Claude's own, with no history.
-    const call = (id: string) => ({
-      role: "assistant",
-      content: "",
-      tool_calls: [{ id, type: "function", function: { name: "read", arguments: "{}" } }],
-    });
-    const afterNext = [...otherModel, assistant("CLAUDE-ANSWER-THREE"), user("NEXT")];
-    const own = await turn([...afterNext, call("call_own"), { role: "tool", tool_call_id: "call_own", content: "OWN-RESULT" }]);
-    assert.equal(own.resume, SESSION_ID);
-    assert.match(own.prompt, /Your previous step called the tools below/);
-    assert.match(own.prompt, /OWN-RESULT/);
-    assert.doesNotMatch(own.prompt, /conversation_history/, "Claude's own step carries no history");
-
-    // Another model's turns end in its answered tool step (#74): the turns
-    // before the step are handed over, and the step is not called Claude's.
-    const switchedStep = await turn([
-      ...afterNext,
-      assistant("CLAUDE-ANSWER-FOUR"),
-      user("OTHER-ASK-THREE"),
-      assistant("OTHER-ANSWER-THREE"),
-      user("OTHER-ASK-FOUR"),
-      call("call_other"),
-      { role: "tool", tool_call_id: "call_other", content: "OTHER-RESULT" },
-      user("KEEP-GOING"),
-    ]);
-    assert.equal(switchedStep.resume, SESSION_ID);
-    const [handover, step] = switchedStep.prompt.split("</conversation_history>");
-    assert.match(handover!, /OTHER-ASK-THREE[\s\S]*OTHER-ANSWER-THREE[\s\S]*OTHER-ASK-FOUR/);
-    assert.doesNotMatch(handover!, /CLAUDE-|OTHER-RESULT/, "seen turns and the step itself are not in the handover");
-    assert.match(step!, /The model that handled the turns above called the tools below/);
-    assert.doesNotMatch(step!, /Your previous step/);
-    assert.match(step!, /OTHER-RESULT[\s\S]*KEEP-GOING/);
+    const journal = world.journal();
+    assert.equal(journal.filter((line) => /injecting turns the resumed Claude session missed/.test(line)).length, 1, "the journal names the injection");
+    assert.deepEqual(journal.filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
   console.log("ok — model switch regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

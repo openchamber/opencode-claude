@@ -7,98 +7,110 @@
  * - High-priority notifications and warning-level informational messages
  *   become notes, once per key; lower levels stay hidden.
  *
+ * On the simulators (test/simulators/): a refusal as Claude Code 2.1.312
+ * handles it (`state.failures` `refusal`; BEHAVIOR.md "Failures of a model
+ * call"): the refused answer, a notice (level "notice"), one more call, then
+ * `model_refusal_no_fallback` and a synthetic error. What the API said about
+ * the refusal and whether the refused call wrote any text:
+ * `state.refusalDetails` (the API's `stop_details`, as the CLI passes them on
+ * in `model_refusal_no_fallback`). The CLI's notifications and informational
+ * messages in a turn: `state.notices`, by the schemas in the CLI's own code
+ * (emitted before the query's first model call; their real moments were not
+ * probed).
+ *
  * Run: bun test/refusal-notices-regression.ts
  */
-import { assert, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-const refusal = {
-  type: "system",
-  subtype: "model_refusal_no_fallback",
-  original_model: "claude-opus-5",
-  request_id: "req_1",
-  api_refusal_category: "cyber",
-  api_refusal_explanation: "This looks like malware development.",
-  content: "Claude Code is unable to respond to this request.",
-};
-
-function reasoningOf(sse: string): { reasoning: string; finish: string | null } {
-  let reasoning = "";
-  let finish: string | null = null;
-  for (const line of sse.split("\n")) {
-    if (!line.startsWith("data: {")) continue;
-    const choice = JSON.parse(line.slice(6)).choices?.[0];
-    if (choice?.delta?.reasoning_content) reasoning += choice.delta.reasoning_content;
-    if (choice?.finish_reason) finish = choice.finish_reason;
-  }
-  return { reasoning, finish };
-}
+import { createWorld } from "./simulators/world.ts";
 
 async function main() {
-  const { post, proxy } = await startMockedProxy("refusal-notices");
-  const turn = (events: unknown[]) =>
-    proxy.setClaudeQueryStarter(async () =>
-      mockHandle(
-        (async function* () {
-          yield* events;
-        })(),
-      ),
-    );
+  const world = await createWorld("refusal-notices");
+  const { opencode, claude } = world;
   try {
-    // Refusal ending the turn normally: explanation note, content_filter, no generic note.
-    turn([refusal, { type: "result", subtype: "success", is_error: false, stop_reason: "refusal", result: "", usage: {} }]);
+    await opencode.startPlugin();
+    /** One turn of a new chat; Claude's query fails as `failures` says. */
+    const turnOf = async (failures: typeof claude.state.failures = []) => {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "x");
+      claude.state.failures = failures;
+      const queries = claude.queries.length;
+      const retries = opencode.retries.length;
+      const turn = await opencode.turn(chat);
+      claude.state.failures = [];
+      return { turn, first: turn.requests[0]!, queries: claude.queries.length - queries, retries: opencode.retries.length - retries };
+    };
+
+    // The refused answer streamed: the user sees that Claude declined, once; OpenCode sends nothing again.
     {
-      const res = await post("refused", { stream: true, messages: [{ role: "user", content: "x" }] });
-      assert.equal(res.status, 200);
-      const { reasoning, finish } = reasoningOf(await res.text());
-      assert.equal(finish, "content_filter");
-      assert.match(reasoning, /Claude declined this request \(cyber\): This looks like malware development\./);
-      assert.doesNotMatch(reasoning, /declined to answer/);
+      const { first, queries, retries } = await turnOf(["refusal"]);
+      assert.equal(first.status, 200);
+      const reasoning = first.reply!.reasoning;
+      assert.equal(reasoning.match(/\[refusal\] Claude declined this request/g)?.length, 1, `the refusal note once: ${JSON.stringify(reasoning)}`);
+      assert.doesNotMatch(reasoning, /declined to answer/, "no generic note next to it");
+      assert.doesNotMatch(reasoning, /safeguards stopped the response/, "the CLI's notice-level message stays hidden");
+      assert.equal(queries, 1);
+      assert.equal(retries, 0);
     }
 
-    // Refusal followed by a failed turn: a non-retryable 400 with the reason.
-    for (const stream of [true, false]) {
-      turn([
-        refusal,
-        {
-          type: "assistant",
-          error: "invalid_request",
-          message: { content: [{ type: "text", text: "API Error: Claude Code is unable to respond to this request." }] },
-        },
-        { type: "result", subtype: "success", is_error: true, result: "API Error: Claude Code is unable to respond to this request." },
-      ]);
-      const res = await post(`refused-failed-${stream}`, { stream, messages: [{ role: "user", content: "x" }] });
-      assert.equal(res.status, 400);
-      const body = (await res.json()) as any;
-      assert.equal(body.error.code, "refusal");
-      assert.match(body.error.message, /This looks like malware development/);
+    // The API's reason for the refusal reaches the note.
+    claude.state.refusalDetails = { category: "cyber", explanation: "This looks like malware development." };
+    {
+      const { first } = await turnOf(["refusal"]);
+      assert.equal(first.status, 200);
+      assert.match(first.reply!.reasoning, /Claude declined this request \(cyber\): This looks like malware development\./);
+      assert.doesNotMatch(first.reply!.reasoning, /declined to answer/);
+    }
+
+    // The refused calls wrote nothing: a non-retryable 400 with the reason.
+    claude.state.refusalDetails = { category: "cyber", explanation: "This looks like malware development.", text: "" };
+    {
+      const { turn, first, queries, retries } = await turnOf(["refusal"]);
+      claude.state.refusalDetails = undefined;
+      assert.equal(first.status, 400, `a refusal before any output: ${first.reply?.raw}`);
+      const error = JSON.parse(first.reply!.raw!).error;
+      assert.equal(error.code, "refusal");
+      assert.match(error.message, /This looks like malware development/);
+      assert.ok(!turn.ok);
+      assert.equal(turn.failure?.kind, "content-policy", "OpenCode reads it as a content-policy block");
+      assert.equal(queries, 1);
+      assert.equal(retries, 0, "OpenCode does not send it again");
     }
 
     // CLI notices: once per key, only the levels worth seeing.
-    const notification = (key: string, priority: string, text: string) => ({ type: "system", subtype: "notification", key, priority, text });
-    turn([
-      notification("ctx", "high", "Context is 95% full"),
-      notification("ctx", "high", "Context is 95% full"),
-      notification("tip", "low", "Tip: try /agents"),
-      { type: "system", subtype: "informational", level: "warning", content: "Stop hook prevented continuation" },
-      { type: "system", subtype: "informational", level: "info", content: "Loaded 3 skills" },
-      textDelta("answer"),
-      { type: "result", is_error: false, usage: {} },
-    ]);
+    claude.state.notices = [
+      { subtype: "notification", key: "ctx", priority: "high", text: "Context is 95% full" },
+      { subtype: "notification", key: "ctx", priority: "high", text: "Context is 95% full" },
+      { subtype: "notification", key: "auth", priority: "immediate", text: "Sign-in expires soon" },
+      { subtype: "notification", key: "tip", priority: "low", text: "Tip: try /agents" },
+      { subtype: "notification", key: "update", priority: "medium", text: "Update available" },
+      { subtype: "informational", level: "warning", content: "Stop hook prevented continuation", prevent_continuation: true },
+      { subtype: "informational", level: "info", content: "Loaded 3 skills" },
+      { subtype: "informational", level: "suggestion", content: "Try plan mode" },
+    ];
     {
-      const res = await post("notices", { stream: true, messages: [{ role: "user", content: "x" }] });
-      const { reasoning } = reasoningOf(await res.text());
-      assert.equal(reasoning.match(/Context is 95% full/g)?.length, 1);
+      const { turn, first } = await turnOf();
+      assert.ok(turn.ok);
+      const reasoning = first.reply!.reasoning;
+      assert.equal(reasoning.match(/Context is 95% full/g)?.length, 1, `the high-priority notification once: ${JSON.stringify(reasoning)}`);
+      assert.match(reasoning, /Sign-in expires soon/, "an immediate one too");
       assert.match(reasoning, /Stop hook prevented continuation/);
-      assert.doesNotMatch(reasoning, /try \/agents|Loaded 3 skills/);
+      assert.doesNotMatch(reasoning, /try \/agents|Update available|Loaded 3 skills|Try plan mode/);
     }
+
+    const journal = world.journal();
+    assert.ok(journal.some((line) => /turn failed fast/.test(line) && /"kind":"refusal"/.test(line)), "the journal names the refusal");
+    assert.deepEqual(journal.filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
   console.log("ok — refusal and notices regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

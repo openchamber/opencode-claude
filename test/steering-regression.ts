@@ -6,162 +6,109 @@
  * it as an injected instruction. OpenCode's promoted-media
  * marker message is not steering. (Ported from the fork's 4ca2338.)
  *
- * Run: bun test/steering-regression.ts
+ * On the simulators (test/simulators/): the user sends a message while
+ * OpenCode runs the tool (`turn`'s `steer`: the message after the tool
+ * results, once a turn); Claude Code reads the turn's open input as it comes
+ * and takes a message of priority "next" into the turn as a `queued_command`
+ * attachment (CLI 2.1.312 against a local stub of the API). OpenCode 2.0.32 sends
+ * a tool's files as a text-less user message after the results (BEHAVIOR.md
+ * "The HTTP body"). Two calls of one message to a tool that is not read-only
+ * run one after the other (CLI 2.1.312), so their results reach the plugin in
+ * two requests. The query's whole input is the turn's: main starts no
+ * transcript with records of its own, and its records are not named after
+ * OpenCode's messages (both: steering-regression.ts).
+ *
+ * Run: bun test/steering-main-regression.ts
  */
-import {
-  assert,
-  bashTool,
-  callTool,
-  mockHandle,
-  startMockedProxy,
-  textDelta,
-} from "./helpers.ts";
+import assert from "node:assert/strict";
+
+import { contentText } from "./simulators/claude-code.ts";
+import { testPng } from "./simulators/opencode.ts";
+import { createWorld } from "./simulators/world.ts";
 
 async function main() {
-  const { collectSteering, SYNTHETIC_TOOL_MEDIA_PROMPT } = await import(
-    "../src/prompt.ts"
-  );
-  const texts = (messages: unknown[]) =>
-    collectSteering(messages as any).map((b) => (b.type === "text" ? b.text : b.type));
-  assert.deepEqual(texts([{ role: "user", content: "hi" }]), []);
-  assert.deepEqual(texts([{ role: "user", content: "old" }, { role: "tool", content: "r" }]), []);
-  assert.deepEqual(
-    texts([
-      { role: "user", content: "old" },
-      { role: "tool", content: "r" },
-      { role: "user", content: [{ type: "text", text: "use port 8080" }] },
-      { role: "user", content: "and skip tests" },
-    ]),
-    ["use port 8080", "and skip tests"],
-  );
-  assert.deepEqual(
-    texts([
-      { role: "user", content: "old" },
-      { role: "tool", content: "r" },
-      { role: "user", content: SYNTHETIC_TOOL_MEDIA_PROMPT },
-    ]),
-    [],
-  );
-
-  const { post, proxy } = await startMockedProxy("steer");
-
-  /** Messages the turn's input carries after its prompt, as the SDK reads them. */
-  function drainInput(params: { prompt: unknown }, sink: any[]) {
-    const prompt = params.prompt as AsyncIterable<any>;
-    assert.ok(typeof prompt !== "string" && Symbol.asyncIterator in prompt, "a chat turn with tools keeps its input open");
-    void (async () => {
-      let first = true;
-      for await (const m of prompt) {
-        if (!first) sink.push(m);
-        first = false;
-      }
-    })();
-  }
-  const inputText = (sink: any[]) =>
-    sink.map((m) => (typeof m.message.content === "string" ? m.message.content : JSON.stringify(m.message.content))).join("\n");
-
-  async function run(session: string, afterResult: unknown[], sink: any[] = []) {
-    let received: string | null = null;
-    proxy.setClaudeQueryStarter(async (params) => {
-      drainInput(params, sink);
-      return mockHandle(
-        (async function* () {
-          yield { type: "system", subtype: "init", session_id: `${session}-sess` };
-          const res = await callTool(params, "bash", { command: "sleep 40" });
-          received = res.content.map((b) => b.text ?? "").join("\n");
-          // Like the real SDK, the tool result comes back as a user message
-          // before the next assistant output.
-          yield { type: "user", message: { role: "user", content: [] } };
-          yield textDelta("DONE");
-          yield { type: "result", is_error: false, usage: {} };
-        })(),
-      );
-    });
-    const first = (await (await post(session, {
-      tools: [bashTool],
-      messages: [{ role: "user", content: "run it" }],
-    })).json()) as any;
-    const call = first.choices[0].message.tool_calls[0];
-    assert.equal(call.function.name, "bash");
-    const resume = (await (await post(session, {
-      tools: [bashTool],
-      messages: [
-        { role: "user", content: "run it" },
-        { role: "assistant", content: null, tool_calls: [call] },
-        { role: "tool", tool_call_id: call.id, content: "exit 0" },
-        ...afterResult,
-      ],
-    })).json()) as any;
-    assert.match(String(resume.choices[0].message.content), /DONE/);
-    return received as string | null;
+  const world = await createWorld("steer");
+  const { opencode, claude } = world;
+  /** One tool step: the user's ask, bash, the answer; what Claude got. */
+  async function run(ask: string, options: { steer?: string; toolFiles?: Array<{ mime: string; data: string }> } = {}) {
+    const chat = opencode.newChat();
+    await opencode.say(chat, ask);
+    claude.state.toolSteps = [[{ name: "bash", input: { command: "sleep 40" } }]];
+    const from = claude.queries.length;
+    const turn = await opencode.turn(chat, { toolOutput: "exit 0", ...options });
+    assert.ok(turn.ok, `${ask}: the turn answered`);
+    assert.equal(turn.requests.length, 2);
+    assert.equal(turn.requests[1]!.counted[1] - turn.requests[1]!.counted[0], 0, `${ask}: the result resumed the parked turn`);
+    assert.equal(claude.queries.length - from, 1);
+    const query = claude.queries[from]!;
+    const results = claude.records(query.name).filter((r) => r.toolUseResult).map((r) => r.toolUseResult as Array<Record<string, any>>);
+    assert.equal(results.length, 1);
+    const forwarded = world.journal().filter((line) => line.includes("forwarding mid-turn user messages") && line.includes(`"${chat}"`));
+    return { chat, query, result: results[0]!, forwarded };
   }
 
   try {
-    const sink: any[] = [];
-    const steered = await run("steer-yes", [
-      { role: "user", content: "Actually, the secret word is PINEAPPLE." },
-    ], sink);
-    assert.equal(steered, "exit 0", "the tool result stays the tool's own");
-    assert.equal(sink.length, 1);
-    assert.equal(sink[0].message.content, "Actually, the secret word is PINEAPPLE.");
-    assert.equal(sink[0].priority, "next", "added after the running tool, within the turn");
+    await opencode.startPlugin();
 
-    const plain = await run("steer-no", []);
-    assert.equal(plain, "exit 0");
+    const steer = "Actually, the secret word is PINEAPPLE.";
+    const steered = await run("run it", { steer });
+    assert.equal(contentText(steered.result), "exit 0", "the tool result stays the tool's own");
+    assert.equal(steered.query.input.length, 2, "the prompt, then the message sent while the tool ran");
+    assert.equal(contentText(steered.query.input[1]!.content), steer);
+    assert.equal(steered.query.input[1]!.noTurn, false);
+    assert.equal(steered.query.input[1]!.priority, "next", "added after the running tool, within the turn");
+    const absorbed = claude.records(steered.query.name).filter((r) => r.attachment?.type === "queued_command");
+    assert.deepEqual(absorbed.map((r) => r.attachment.prompt), [steer], "Claude Code took it into the running turn");
+    assert.equal(steered.forwarded.length, 1);
 
-    // Results of one park arriving over two resume requests: the queued
-    // message rides the first resolved result only, never both.
-    const got: string[] = [];
-    const splitSink: any[] = [];
-    proxy.setClaudeQueryStarter(async (params) => {
-      drainInput(params, splitSink);
-      return mockHandle(
-        (async function* () {
-          yield { type: "system", subtype: "init", session_id: "steer-split-sess" };
-          yield { type: "stream_event", event: { type: "message_start" } };
-          const a = callTool(params, "bash", { command: "a" });
-          const b = callTool(params, "bash", { command: "b" });
-          yield { type: "stream_event", event: { type: "message_stop" } };
-          for (const res of await Promise.all([a, b])) {
-            got.push(res.content.map((c) => c.text ?? "").join("\n"));
-          }
-          yield textDelta("DONE");
-          yield { type: "result", is_error: false, usage: {} };
-        })(),
-      );
-    });
-    const turn = [{ role: "user", content: "run both" }];
-    const parked = (await (await post("steer-split", { tools: [bashTool], messages: turn })).json()) as any;
-    const calls = parked.choices[0].message.tool_calls;
-    assert.equal(calls.length, 2);
-    const asst = { role: "assistant", content: null, tool_calls: calls };
-    const steer = { role: "user", content: "Use MANGO instead." };
-    const partial = (await (await post("steer-split", {
-      tools: [bashTool],
-      messages: [...turn, asst, { role: "tool", tool_call_id: calls[0].id, content: "ra" }, steer],
-    })).json()) as any;
-    assert.equal(partial.choices[0].finish_reason, "tool_calls");
-    const done = (await (await post("steer-split", {
-      tools: [bashTool],
-      messages: [
-        ...turn,
-        asst,
-        { role: "tool", tool_call_id: calls[0].id, content: "ra" },
-        { role: "tool", tool_call_id: calls[1].id, content: "rb" },
-        steer,
-      ],
-    })).json()) as any;
-    assert.match(String(done.choices[0].message.content), /DONE/);
-    assert.equal(inputText(splitSink).match(/MANGO/g)?.length, 1, "steering forwarded once");
-    assert.ok(!got.join("\n").includes("MANGO"), "never inside a tool result");
+    const plain = await run("plain");
+    assert.equal(contentText(plain.result), "exit 0");
+    assert.equal(plain.query.input.length, 1, "nothing but the prompt");
+    assert.deepEqual(plain.forwarded, []);
+
+    // The tool's file reaches OpenCode's request as a text-less user message
+    // after the results: tool output, not the user's.
+    const png = testPng("steer-media");
+    const media = await run("screenshot", { toolFiles: [{ mime: "image/png", data: png }], steer: "and crop it" });
+    assert.deepEqual(media.result.map((b) => b.type), ["text", "image", "text"], "the image rides the tool result");
+    assert.equal(media.query.input.length, 2, "only the user's own message is steering");
+    assert.equal(contentText(media.query.input[1]!.content), "and crop it");
+
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+
+    // Two calls of one message, run one after the other: their results come
+    // in two requests, and the message sent while the first ran reaches
+    // Claude once, never inside a tool result.
+    {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "run both");
+      claude.state.toolSteps = [2];
+      const from = claude.queries.length;
+      const turn = await opencode.turn(chat, { toolOutput: (call) => `r${opencode.session(chat).messages.filter((m) => m.toolCalls).length}-${call.id.slice(-2)}`, steer: "Use MANGO instead." });
+      assert.ok(turn.ok);
+      assert.equal(turn.requests.length, 3, "one call per response, then the answer");
+      assert.equal(claude.queries.length - from, 1, "one Claude Code turn");
+      const query = claude.queries[from]!;
+      const sent = opencode.session(chat).messages.filter((m) => m.type === "user" && m.text.includes("MANGO"));
+      assert.equal(sent.length, 1, "the user sent it once");
+      const input = query.input.map((m) => contentText(m.content)).join("\n");
+      assert.equal(input.match(/MANGO/g)?.length, 1, "steering forwarded once");
+      const results = claude.records(query.name).filter((r) => r.toolUseResult).map((r) => contentText(r.toolUseResult));
+      assert.equal(results.length, 2);
+      assert.ok(!results.join("\n").includes("MANGO"), "never inside a tool result");
+    }
+
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
   console.log("ok — steering regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);

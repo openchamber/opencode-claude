@@ -9,151 +9,143 @@
  *   point with the summary prompt.
  * - A chat with no resumable session gets the history as text, sized to the
  *   chat model, still on the chat's model.
+ * - The summary leaves the chat's binding (1.7.0): the compacted history the
+ *   next turn carries matches none of the session's turns, so that turn
+ *   starts a new session.
  *
- * Run: bun test/compaction-resume-regression.ts
+ * On the simulators (test/simulators/): three turns, then OpenCode compacts
+ * the chat (`opencode.compact`: OpenCode 2.2.0 summarizes the whole chat when
+ * it fits, its summary prompt after it, the reminder when a reply skips the
+ * template — `summaryReplies`), so the summarized part ends at the third
+ * answer; the summary's query is the one with `persistSession: false`. A chat
+ * whose turns another model answered (`otherModelAnswer`) has no Claude
+ * session to resume.
+ *
+ * main's summary: the session by its id, cut at the answer's own record;
+ * from chain/turn-by-names the transcript is named after the chat, the cut
+ * is the record a question's record continues, and the chat starts a new
+ * epoch after the compaction (compaction-resume-regression.ts).
+ *
+ * Run: bun test/compaction-resume-main-regression.ts
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { StartClaudeQueryParams } from "../src/query.ts";
-import { assert, bashTool, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-const user = (content: string) => ({ role: "user", content });
-const assistant = (content: string) => ({ role: "assistant", content });
-const SUMMARY_PROMPT = "Create a detailed summary for continuing this coding session.";
-const NUDGE =
-  "The previous response did not fill in the required summary template. Do not call tools.";
+import { contentText, type ClaudeQuery } from "./simulators/claude-code.ts";
+import { SUMMARY_NUDGE, SUMMARY_PROMPT } from "./simulators/opencode.ts";
+import { createWorld } from "./simulators/world.ts";
 
-async function promptText(prompt: StartClaudeQueryParams["prompt"]): Promise<string> {
-  if (typeof prompt === "string") return prompt;
-  let text = "";
-  for await (const part of prompt) {
-    const content = (part as { message?: { content?: unknown } }).message?.content;
-    text += typeof content === "string" ? content : JSON.stringify(content);
-    // A chat turn's input stays open while the turn runs: only the first
-    // message is the prompt.
-    break;
-  }
-  return text;
-}
+/** The text of a query's prompt messages, in order. */
+const promptOf = (query: ClaudeQuery) => query.input.map((m) => contentText(m.content)).join("\n");
 
 async function main() {
-  const claudeConfig = mkdtempSync(join(tmpdir(), "opencode-claude-compact-cfg-"));
-  process.env.CLAUDE_CONFIG_DIR = claudeConfig;
-  const projectDir = join(claudeConfig, "projects", "proj");
-  mkdirSync(projectDir, { recursive: true });
-  const files = new Map<string, string[]>();
-  const append = (session: string, uuid: string) => {
-    const uuids = [...(files.get(session) ?? []), uuid];
-    files.set(session, uuids);
-    writeFileSync(
-      join(projectDir, `${session}.jsonl`),
-      uuids
-        .map((u, i) => JSON.stringify({ type: "assistant", uuid: u, parentUuid: i > 0 ? uuids[i - 1] : null }))
-        .join("\n") + "\n",
-    );
+  const world = await createWorld("compaction-resume");
+  const { opencode, claude } = world;
+  const summaries = () => claude.queries.filter((q) => q.kind === "summary");
+  const chats = () => claude.queries.filter((q) => q.kind === "chat");
+  /** A chat of three turns Claude answered; returns it with the answers of the second and the third turn. */
+  const threeTurns = async () => {
+    const chat = opencode.newChat();
+    const tokens: string[] = [];
+    for (const text of ["one", "two", "three"]) {
+      await opencode.say(chat, text);
+      const turn = await opencode.turn(chat);
+      assert.ok(turn.ok, `${text}: the turn answered`);
+      tokens.push(turn.answer!.text.replace(/^answer /, ""));
+    }
+    return { chat, second: claude.answers.get(tokens[1]!)!, third: claude.answers.get(tokens[2]!)! };
   };
 
-  const { post, proxy } = await startMockedProxy("compaction-resume");
-  const { getForeignSessionId } = await import("../src/session-store.ts");
+  try {
+    await opencode.startPlugin();
+    {
+      const { chat, second, third } = await threeTurns();
+      const chatParams = chats().at(-1)!.params as Record<string, any>;
+      const asked = summaries().length;
+      const done = await opencode.compact(chat);
+      assert.equal(done.status, "completed", JSON.stringify(done.error ?? ""));
+      assert.equal(summaries().length, asked + 1, "one summary query");
+      const summary = summaries().at(-1)!;
+      const params = summary.params as Record<string, any>;
+      // OpenCode 2.2.0 summarizes the whole chat: the part ends at the third answer.
+      assert.equal(params.resume, third.name, "resumes the chat's Claude session");
+      assert.equal(params.resumeSessionAt, third.uuid, "cut where the summarized part ends");
+      assert.equal(params.forkSession, true);
+      assert.equal(params.persistSession, false, "nothing written to the session");
+      assert.equal(params.model, chatParams.model, "the chat's model, not haiku");
+      assert.deepEqual(params.systemPrompt, chatParams.systemPrompt, "same system prompt as the chat turn");
+      assert.ok(params.mcpServers, "same tools as the chat turn");
+      assert.equal(params.permissionMode, "dontAsk", "tool calls are refused");
+      // No OpenCode tool allowed ahead (the SDK itself allows "Skill" for the chat's skills; no built-in tool is on).
+      assert.deepEqual((params.allowedTools ?? []).filter((tool: string) => tool.startsWith("mcp__")), [], `no tool allowed ahead: ${params.allowedTools}`);
+      assert.equal(params.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined, "keeps the chat's memory");
+      const text = promptOf(summary);
+      assert.ok(text.includes(SUMMARY_PROMPT), "the summary prompt reaches Claude");
+      assert.ok(!text.includes("<conversation_history>"), "no text copy of the chat");
+      assert.match(summary.view, /one[\s\S]*answer L1[\s\S]*two[\s\S]*answer L2[\s\S]*three[\s\S]*answer L3/, "Claude read the summarized part from its session");
+      assert.ok(!claude.records(second.name).some((r) => contentText(r.message?.content).includes(SUMMARY_PROMPT)), "the summary left no record in the chat's transcript");
 
-  let seen: StartClaudeQueryParams | null = null;
-  let chatParams: StartClaudeQueryParams | null = null;
-  let fresh = 0;
-  proxy.setClaudeQueryStarter(async (params) => {
-    seen = params;
-    const summary = params.persistSession === false;
-    if (!summary) chatParams = params;
-    const session = params.resume ?? (summary ? "none" : `chat-sess-${++fresh}`);
-    const leaf = `L${(files.get(session) ?? []).length + 1}`;
-    if (!summary) append(session, leaf);
-    return mockHandle(
-      (async function* () {
-        yield { type: "system", subtype: "init", session_id: summary ? "fork-sess" : session };
-        if (!summary) {
-          yield { type: "assistant", uuid: leaf, session_id: session, parent_tool_use_id: null, message: { content: [] } };
-        }
-        yield textDelta(summary ? "## Objective\n- the summary" : `answer ${leaf}`);
-        yield { type: "result", is_error: false, usage: {}, session_id: session };
-      })(),
-    );
-  });
+      // The summary leaves the binding; the compacted history the next turn carries starts a new session.
+      await opencode.say(chat, "four");
+      const after = await opencode.turn(chat);
+      assert.ok(after.ok);
+      const next = chats().at(-1)!;
+      assert.notEqual(next.params.resume, second.name, "the turn after the compaction does not resume the old session");
+      assert.notEqual(next.name, second.name);
+    }
 
-  const turn = async (messages: unknown[]) => {
-    const res = await post("chat", { tools: [bashTool], messages });
-    assert.equal(res.status, 200);
-    await res.text();
-  };
-  const h1 = [user("one")];
-  const h2 = [...h1, assistant("answer L1"), user("two")];
-  const h3 = [...h2, assistant("answer L2"), user("three")];
-  await turn(h1);
-  await turn(h2);
-  await turn(h3);
-  assert.equal(getForeignSessionId("chat"), "chat-sess-1");
+    // No Claude session for this chat: the history goes as text, on the chat's model.
+    {
+      const model = chats().at(-1)!.params.model;
+      const chat = opencode.newChat();
+      for (const n of ["ONE", "TWO", "THREE"]) {
+        await opencode.say(chat, `OTHER-ASK-${n}`);
+        opencode.otherModelAnswer(chat, `OTHER-ANSWER-${n}`);
+      }
+      const asked = summaries().length;
+      const done = await opencode.compact(chat);
+      assert.equal(done.status, "completed", JSON.stringify(done.error ?? ""));
+      const summary = summaries().at(-1)!;
+      assert.equal(summaries().length, asked + 1);
+      assert.equal(summary.params.resume, undefined, "nothing to resume");
+      assert.equal(summary.params.model, model, "the chat's model");
+      assert.equal((summary.params as Record<string, any>).env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1", "no memory in a text-copy summary");
+      const text = promptOf(summary);
+      assert.ok(text.includes("<conversation_history>"), "the history as text");
+      assert.ok(text.includes("OTHER-ANSWER-TWO"), "the summarized part's answers in it");
+      assert.ok(text.includes(SUMMARY_PROMPT));
+    }
+    const fromSession = (lines: string[]) => lines.filter((line) => /summarizing from the chat's Claude session/.test(line)).length;
+    const fromText = (lines: string[]) => lines.filter((line) => /summarizing from the history text/.test(line)).length;
+    assert.equal(fromSession(world.journal()), 1, "the journal: the first summary from the session");
+    assert.equal(fromText(world.journal()), 1, "the journal: the other chat's summary from text");
 
-  // OpenCode keeps "three" verbatim and summarizes the turns before it.
-  const older = [...h2, assistant("answer L2")];
-  const summarize = async (session: string, messages: unknown[]) => {
-    seen = null;
-    const res = await post(session, { tools: [bashTool], messages });
-    assert.equal(res.status, 200);
-    const body = (await res.json()) as any;
-    assert.match(body.choices[0].message.content, /the summary/);
-    return seen!;
-  };
+    // Another chat, with a reminder after a reply that missed the template.
+    {
+      const { chat, third } = await threeTurns();
+      const asked = summaries().length;
+      const seen = world.journal().length;
+      claude.state.summaryReplies = ["not a summary", "## Objective\n- after the reminder"];
+      const done = await opencode.compact(chat);
+      assert.equal(done.status, "completed", JSON.stringify(done.error ?? ""));
+      assert.equal(done.requests.length, 2, "the summary, then the reminder");
+      const [first, reminded] = summaries().slice(asked);
+      assert.ok(first && reminded, "two summary queries");
+      assert.equal(first.params.resumeSessionAt, third.uuid);
+      const lines = world.journal().slice(seen);
+      assert.deepEqual([fromSession(lines), fromText(lines)], [2, 0], "the journal: the summary and its reminder both from the session");
+      assert.equal(reminded.params.resume, third.name, "the reminder resumes the chat's Claude session");
+      assert.equal(reminded.params.resumeSessionAt, first.params.resumeSessionAt, "the reminder resumes at the same point");
+      const text = promptOf(reminded);
+      assert.ok(text.includes(SUMMARY_PROMPT), "the summary prompt, not only the reminder");
+      assert.ok(!text.includes("<conversation_history>"), "no text copy of the chat");
+      assert.ok(!contentText(reminded.input[0]?.content).startsWith(SUMMARY_NUDGE), "the prompt starts with the summary prompt, not the reminder");
+    }
 
-  {
-    const params = await summarize("chat", [...older, user(SUMMARY_PROMPT)]);
-    assert.equal(params.resume, "chat-sess-1", "resumes the chat's Claude session");
-    assert.equal(params.resumeSessionAt, "L2", "cut where the summarized part ends");
-    assert.equal(params.forkSession, true);
-    assert.equal(params.persistSession, false, "nothing written to the session");
-    assert.equal(params.model, chatParams!.model, "the chat's model, not haiku");
-    assert.deepEqual(params.systemPrompt, chatParams!.systemPrompt, "same system prompt as the chat turn");
-    assert.ok(params.mcpServers, "same tools as the chat turn");
-    assert.equal(params.permissionMode, "dontAsk", "tool calls are refused");
-    assert.equal(params.allowedTools, undefined);
-    assert.equal(params.autoCompactEnabled, false);
-    assert.equal(params.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined, "keeps the chat's memory");
-    const text = await promptText(params.prompt);
-    assert.ok(text.includes(SUMMARY_PROMPT));
-    assert.ok(!text.includes("<conversation_history>"), "no text copy of the chat");
-    // The chat keeps its session: with background compaction it goes on
-    // with its full history until the summary is swapped in.
-    assert.equal(getForeignSessionId("chat"), "chat-sess-1", "the summary leaves the chat's binding");
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
+  } finally {
+    await world.dispose();
   }
-
-  // Same chat again, with a reminder after a reply that missed the template.
-  await turn(h1);
-  await turn(h2);
-  await turn(h3);
-  {
-    const params = await summarize("chat", [
-      ...older,
-      user(SUMMARY_PROMPT),
-      assistant("not a summary"),
-      user(NUDGE),
-    ]);
-    assert.equal(params.resumeSessionAt, "L2");
-    const text = await promptText(params.prompt);
-    assert.ok(text.includes(SUMMARY_PROMPT), "the summary prompt, not only the reminder");
-    assert.ok(!text.includes(NUDGE));
-  }
-
-  // No Claude session for this chat: the history goes as text, on the chat's model.
-  {
-    const params = await summarize("other", [...older, user(SUMMARY_PROMPT)]);
-    assert.equal(params.resume, undefined);
-    assert.equal(params.model, chatParams!.model);
-    assert.equal(params.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1", "no memory in a text-copy summary");
-    const text = await promptText(params.prompt);
-    assert.ok(text.includes("<conversation_history>"));
-    assert.ok(text.includes("answer L2"));
-  }
-
-  console.log("compaction-resume regression ok");
-  await proxy.stopProxy?.();
+  console.log("ok — compaction resume regression passed");
 }
 
 main().then(

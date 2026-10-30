@@ -5,156 +5,113 @@
  * and with history transfer (not duplicated in the transcript) — and the
  * following normal turn must still resume. (Ported from the fork's cf93c7e.)
  *
- * Run: bun test/queued-turns-regression.ts
+ * On the simulators (test/simulators/): the user queues messages while a
+ * turn runs (`queue`: the prompt hook now, `deliver` after the turn), and
+ * OpenCode's next request ends with them; a turn another model answered
+ * (`otherModelAnswer`) leaves the chat with no Claude session, so its
+ * history is transferred. A queued message may carry attachments, taken as
+ * OpenCode takes them when it accepts the message. The queued messages go as
+ * one prompt, the transferred history as `<conversation_history>` text ahead
+ * of "Latest user message:" (main's form; a record per message:
+ * queued-turns-regression.ts).
+ *
+ * Run: bun test/queued-turns-main-regression.ts
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { latestUserPrompt, priorMessagesOf } from "../src/prompt.ts";
-import type { StartClaudeQueryParams } from "../src/query.ts";
-import { assert, mockHandle, startMockedProxy, textDelta } from "./helpers.ts";
+import assert from "node:assert/strict";
 
-const SESSION_ID = "sess-queued";
-
-async function promptText(prompt: StartClaudeQueryParams["prompt"]): Promise<string> {
-  if (typeof prompt === "string") return prompt;
-  let text = "";
-  for await (const part of prompt) {
-    const content = (part as { message?: { content?: unknown } }).message?.content;
-    text += typeof content === "string" ? content : JSON.stringify(content);
-    // A chat turn's input stays open while the turn runs: only the first
-    // message is the prompt.
-    break;
-  }
-  return text;
-}
+import { contentText } from "./simulators/claude-code.ts";
+import { testPng } from "./simulators/opencode.ts";
+import { createWorld } from "./simulators/world.ts";
 
 async function main() {
-  // Resume requires the Claude transcript on disk.
-  const claudeConfig = mkdtempSync(join(tmpdir(), "opencode-claude-queued-cfg-"));
-  mkdirSync(join(claudeConfig, "projects", "proj"), { recursive: true });
-  writeFileSync(join(claudeConfig, "projects", "proj", `${SESSION_ID}.jsonl`), "");
-  process.env.CLAUDE_CONFIG_DIR = claudeConfig;
-
-  const user = (content: unknown) => ({ role: "user", content });
-  const assistant = (content: string) => ({ role: "assistant", content });
-  const png = "iVBORw0KGgo=";
-  const image = { type: "image_url", image_url: { url: `data:image/png;base64,${png}` } };
-
-  // Single message: unchanged, text and multimodal.
-  assert.equal(latestUserPrompt([user("u1"), assistant("a1"), user("u2")]), "u2");
-  assert.deepEqual(
-    latestUserPrompt([user("u1"), assistant("a1"), user([{ type: "text", text: "see" }, image])]),
-    {
-      type: "user",
-      message: {
-        role: "user",
-        content: [
-          { type: "text", text: "see" },
-          { type: "image", source: { type: "base64", media_type: "image/png", data: png } },
-        ],
-      },
-      parent_tool_use_id: null,
-    },
-  );
-  // A tool step after the last assistant message falls back to the newest
-  // real user message; OpenCode's promoted-media marker is never the prompt.
-  assert.equal(
-    latestUserPrompt([
-      user("ask"),
-      { role: "assistant", content: null, tool_calls: [{ id: "c1" }] },
-      { role: "tool", tool_call_id: "c1", content: "r" },
-      user("Attached media from tool result:"),
-    ]),
-    "ask",
-  );
-
-  // Queued multimodal: every message, in order, attachments in place.
-  const queued = latestUserPrompt([
-    user("u1"),
-    assistant("a1"),
-    user("first ask"),
-    user([{ type: "text", text: "second ask" }, image]),
-    user("third ask"),
-  ]);
-  assert.ok(typeof queued !== "string");
-  assert.deepEqual(
-    (queued.message.content as Array<{ type: string; text?: string }>).map(
-      (b) => b.text ?? b.type,
-    ),
-    ["first ask", "second ask", "image", "third ask"],
-  );
-  assert.deepEqual(
-    priorMessagesOf([user("u1"), assistant("a1"), user("q1"), user("q2")]),
-    [user("u1"), assistant("a1")],
-    "prior history ends before the first queued message",
-  );
-
-  const { post, proxy } = await startMockedProxy("queued");
-
-  const calls: Array<{ resume?: string; prompt: string }> = [];
-  proxy.setClaudeQueryStarter(async (params) => {
-    calls.push({ resume: params.resume, prompt: await promptText(params.prompt) });
-    return mockHandle(
-      (async function* () {
-        yield { type: "system", subtype: "init", session_id: SESSION_ID };
-        yield { ...textDelta("ok"), session_id: SESSION_ID };
-        yield { type: "result", is_error: false, usage: {}, session_id: SESSION_ID };
-      })(),
-    );
-  });
-
-  const turn = async (session: string, messages: unknown[]) => {
-    const res = await post(session, { messages });
-    assert.equal(res.status, 200, await res.clone().text());
-    return calls.at(-1)!;
-  };
+  const world = await createWorld("queued");
+  const { opencode, claude } = world;
   const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
+  /** The queued messages delivered after the running turn, then OpenCode's next turn; the query it started. */
+  async function deliverAndTurn(chat: string, queued: string[]) {
+    for (const id of queued) opencode.deliver(chat, id);
+    const from = claude.queries.length;
+    const turn = await opencode.turn(chat);
+    assert.ok(turn.ok, `the turn answered: ${turn.requests.at(-1)?.status}`);
+    assert.equal(claude.queries.length - from, 1);
+    const query = claude.queries[from]!;
+    return { query, prompt: query.input.map((m) => contentText(m.content)).join("\n") };
+  }
 
   try {
-    // Resumed session: both queued messages are the request.
-    await turn("resumed", [user("hello")]);
-    const resumed = await turn("resumed", [
-      user("hello"),
-      assistant("hi"),
-      user("QUEUED-ONE"),
-      user("QUEUED-TWO"),
-    ]);
-    assert.equal(resumed.resume, SESSION_ID, "queued turn resumes");
-    assert.equal(resumed.prompt, "QUEUED-ONE\n\nQUEUED-TWO");
-    const next = await turn("resumed", [
-      user("hello"),
-      assistant("hi"),
-      user("QUEUED-ONE"),
-      user("QUEUED-TWO"),
-      assistant("both done"),
-      user("NEXT"),
-    ]);
-    assert.equal(next.resume, SESSION_ID, "turn after queued messages resumes");
-    assert.equal(next.prompt, "NEXT");
+    await opencode.startPlugin();
 
-    // History transfer (no session bound yet): queued messages are the
-    // request, not history.
-    const transferred = await turn("transfer", [
-      user("EARLIER-ASK"),
-      assistant("EARLIER-ANSWER"),
-      user("QUEUED-ONE"),
-      user("QUEUED-TWO"),
-    ]);
-    assert.equal(transferred.resume, undefined);
-    const [history, request] = transferred.prompt.split("</conversation_history>");
-    assert.match(history!, /EARLIER-ASK[\s\S]*EARLIER-ANSWER/);
-    assert.doesNotMatch(history!, /QUEUED/, "queued messages are not history");
-    assert.match(request!, /Latest user message:\nQUEUED-ONE\n\nQUEUED-TWO$/);
-    assert.equal(occurrences(transferred.prompt, "QUEUED-ONE"), 1);
+    // Resumed session: both messages queued during a turn are the next request.
+    {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "hello");
+      let release!: () => void;
+      claude.state.hold = new Promise<void>((resolve) => (release = resolve));
+      const running = opencode.turn(chat);
+      const queued = [await opencode.queue(chat, "QUEUED-ONE"), await opencode.queue(chat, "QUEUED-TWO")];
+      release();
+      assert.ok((await running).ok);
+      assert.ok(!JSON.stringify((await running).requests[0]!.body.messages).includes("QUEUED"), "queued messages wait for their turn");
+      const first = claude.queries.at(-1)!;
+      const resumed = await deliverAndTurn(chat, queued);
+      assert.equal(resumed.query.params.resume, first.name, "queued turn resumes");
+      assert.equal(resumed.prompt, "QUEUED-ONE\n\nQUEUED-TWO");
+      const records = claude.records(first.name).filter((r) => r.type === "user" && contentText(r.message?.content).includes("QUEUED-ONE"));
+      assert.equal(records.length, 1, "written once in the transcript");
+
+      await opencode.say(chat, "NEXT");
+      const next = await deliverAndTurn(chat, []);
+      assert.equal(next.query.params.resume, first.name, "turn after queued messages resumes");
+      assert.equal(next.prompt, "NEXT");
+    }
+
+    // History transfer (no Claude session for the chat yet): the queued
+    // messages are the request, not history.
+    {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "EARLIER-ASK");
+      const queued = [await opencode.queue(chat, "QUEUED-ONE"), await opencode.queue(chat, "QUEUED-TWO")];
+      opencode.otherModelAnswer(chat, "EARLIER-ANSWER");
+      const { query, prompt } = await deliverAndTurn(chat, queued);
+      assert.equal(query.params.resume, undefined);
+      const [history, request] = prompt.split("</conversation_history>");
+      assert.ok(request !== undefined, `the history is transferred: ${prompt}`);
+      assert.match(history!, /EARLIER-ASK[\s\S]*EARLIER-ANSWER/);
+      assert.doesNotMatch(history!, /QUEUED/, "queued messages are not history");
+      assert.match(request!, /Latest user message:\nQUEUED-ONE\n\nQUEUED-TWO$/);
+      assert.equal(occurrences(prompt, "QUEUED-ONE"), 1);
+      const records = claude.records(query.name).filter((r) => r.type === "user" && contentText(r.message?.content).includes("QUEUED-ONE"));
+      assert.equal(records.length, 1, "written once in the transcript");
+    }
+
+    // Queued with an attachment: every message, in order, the image in place.
+    {
+      const chat = opencode.newChat();
+      await opencode.say(chat, "u1");
+      assert.ok((await opencode.turn(chat)).ok);
+      const png = testPng("queued");
+      const queued = [
+        await opencode.queue(chat, "first ask"),
+        await opencode.queue(chat, "second ask", [{ mediaType: "image/png", data: png }]),
+        await opencode.queue(chat, "third ask"),
+      ];
+      const { query } = await deliverAndTurn(chat, queued);
+      const blocks = query.input[0]!.content as Array<{ type: string; text?: string }>;
+      assert.ok(Array.isArray(blocks), `a multimodal prompt: ${JSON.stringify(query.input[0]!.content).slice(0, 200)}`);
+      assert.deepEqual(blocks.map((b) => b.text ?? b.type), ["first ask", "second ask", "image", "third ask"]);
+    }
+
+    assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
   } finally {
-    proxy.setClaudeQueryStarter(null);
-    await proxy.stopProxy();
+    await world.dispose();
   }
   console.log("ok — queued turns regression passed");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0),
+  (err) => {
+    console.error(err);
+    process.exit(1);
+  },
+);
