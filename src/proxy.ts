@@ -16,6 +16,7 @@ import {
   sessionContextBlocks,
 } from "./opencode-context.js";
 import {
+  acquireChatLock,
   bridgeRuntime,
   clearAllBridges,
   deleteBridge,
@@ -1021,7 +1022,7 @@ async function handleChatCompletions(
 
   // Everything from here spawns a claude process. One chat spawns one at a
   // time: a second request waits, then stops what the first one started.
-  const releaseSpawnLock = await acquireSpawnLock(conversationKey);
+  const releaseSpawnLock = await acquireChatLock(conversationKey);
   try {
     return await startNewTurn({
       req,
@@ -1040,28 +1041,6 @@ async function handleChatCompletions(
   } finally {
     releaseSpawnLock();
   }
-}
-
-const spawnLocks = new Map<string, Promise<void>>();
-
-/**
- * Serialize turn starts per conversation. Resolves with an idempotent
- * release; the lock is held only until the new turn is in the bridge pool.
- */
-async function acquireSpawnLock(key: string): Promise<() => void> {
-  const previous = spawnLocks.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  const tail = previous.then(() => held);
-  spawnLocks.set(key, tail);
-  await previous;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    release();
-    if (spawnLocks.get(key) === tail) spawnLocks.delete(key);
-  };
 }
 
 async function startNewTurn(input: {

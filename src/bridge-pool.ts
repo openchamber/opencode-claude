@@ -50,15 +50,43 @@ type BridgeRuntime = {
   holders: number;
   /** Stop of every turn scheduled after the last instance released. */
   shutdownTimer?: ReturnType<typeof setTimeout>;
+  /** The last operation queued per chat (acquireChatLock). */
+  chatLocks: Map<string, Promise<void>>;
 };
 
 const RUNTIME_KEY = Symbol.for("@openchamber/opencode-claude/bridge-runtime/v1");
 
 export const bridgeRuntime: BridgeRuntime = ((globalThis as Record<symbol, unknown>)[
   RUNTIME_KEY
-] ??= { bridges: new Map(), stopping: new Map(), holders: 0 }) as BridgeRuntime;
+] ??= { bridges: new Map(), stopping: new Map(), holders: 0, chatLocks: new Map() }) as BridgeRuntime;
+// A runtime left by an older copy of this module, before the chat locks.
+bridgeRuntime.chatLocks ??= new Map();
 
 const bridges = bridgeRuntime.bridges;
+
+/**
+ * Run the turn starts of one chat one at a time. Resolves with an
+ * idempotent release once every earlier operation of the chat released.
+ * The place in the queue is taken before the wait. In the process, not in
+ * this module: a reloaded copy of the plugin and another location's
+ * instance queue on the same chat.
+ */
+export async function acquireChatLock(key: string): Promise<() => void> {
+  const locks = bridgeRuntime.chatLocks;
+  const previous = locks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const tail = previous.then(() => held);
+  locks.set(key, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release();
+    if (locks.get(key) === tail) locks.delete(key);
+  };
+}
 
 export function putBridge(bridge: ParkedBridge): void {
   // One active bridge per conversation. Callers stop the previous turn
