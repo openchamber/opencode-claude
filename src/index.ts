@@ -430,11 +430,16 @@ async function probeCliPresence(): Promise<boolean> {
   if (cliPresentAt && Date.now() - cliPresentAt < CLI_PRESENT_TTL_MS) return true;
   if (cliProbe) return cliProbe;
   const probe = (async () => {
+    // The cap is cleared once the probe settles: a timer left pending keeps a
+    // short-lived host process (a test, a script) alive for its 3 seconds.
+    let cap: ReturnType<typeof setTimeout> | undefined;
     try {
       const detection = await Promise.race([
         detectClaudeCode(),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
-      ]);
+        new Promise<null>((resolve) => {
+          cap = setTimeout(() => resolve(null), 3000);
+        }),
+      ]).finally(() => clearTimeout(cap));
       const present = detection ? detection.status !== "missing-cli" : true;
       // A missing CLI is not remembered, so a fresh install shows at once.
       if (detection && present) cliPresentAt = Date.now();
