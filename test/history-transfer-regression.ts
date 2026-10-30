@@ -1,20 +1,21 @@
 /**
- * The history transferred as text, as fix/whole-history-transfer builds it
- * (and the chain up to chain/content-from-list): a chat another model
- * answered so far has no Claude session to resume, so its first Claude turn
- * carries the history ahead of the latest message in `<conversation_history>`,
- * whole — tool output uncut, nothing dropped for length (OpenCode sized the
- * request), an image of the history as an image block in its place. main's
- * form: history-transfer-main-regression.ts; the series' final one (a record
- * of the chat, chain/record-per-message): history-transfer-regression.ts.
+ * The history transferred as text: a chat another model answered so far has
+ * no Claude session to resume, so its first Claude turn carries a record of
+ * the chat from its start (`[User]:` and `[Assistant]:` lines, the tool calls
+ * as OpenCode labels them, closed by `</recent-context>`) ahead of the latest
+ * message — whole: tool output uncut, nothing dropped for length (OpenCode
+ * sized the request), an image of the history as an image block in its
+ * place. Earlier forms: history-transfer-main-regression.ts (main 1.6.0),
+ * history-transfer-whole-regression.ts (fix/whole-history-transfer up to
+ * chain/content-from-list).
  *
  * On the simulators (BEHAVIOR.md "Writing a test"): the chat's earlier turns
  * answered by another model (`otherModelAnswer`), so the chat has no Claude
- * transcript and Claude's first turn carries the history, built from what
- * OpenCode sent, before the latest message. Independent cases
+ * transcript and Claude's first turn carries the history, built from
+ * OpenCode's list, before the latest message. Independent cases
  * (test/simulators/cases.ts).
  *
- * Run: bun test/history-transfer-whole-regression.ts (trees: where.md)
+ * Run: bun test/history-transfer-regression.ts (trees: where.md)
  */
 import assert from "node:assert/strict";
 
@@ -22,7 +23,7 @@ import { testCases } from "./simulators/cases.ts";
 import { testPng } from "./simulators/opencode.ts";
 import { createWorld } from "./simulators/world.ts";
 
-const world = await createWorld("history-transfer-whole");
+const world = await createWorld("history-transfer");
 const { opencode, claude } = world;
 await opencode.startPlugin();
 const cases = testCases();
@@ -40,12 +41,15 @@ const transferred = async (history: (chat: string) => Promise<void>) => {
   assert.equal(prompts.length, 1, "one prompt");
   return { chat, content: prompts[0]!.content as string | Block[] };
 };
-const injected = (chat: string) => world.journal().some((line) => line.includes("injecting transferred conversation history") && line.includes(chat));
+/** The journal names the transfer, and the history rides the turn's record. */
+const injected = (chat: string) =>
+  world.journal().some((line) => line.includes("transferring history") && line.includes(chat)) &&
+  world.journal().some((line) => line.includes("turn records") && line.includes(chat) && !line.includes('"historyChars":0'));
 const image = (label: string) => ({ mediaType: "image/png", data: testPng(label) });
 
-await cases.run("a history without files is text ending with the answer, the latest message after it, no system prompt", async () => {
-  // The earlier messages as User: and Assistant: lines, ending with the answer before the latest user turn, which
-  // follows as the latest message; the system prompt never leaks in.
+await cases.run("a history without files is a text record ending with the answer, the question after it, no system prompt", async () => {
+  // The record of the chat from its start, the earlier messages as [User]: and [Assistant]: lines, ending with the
+  // answer before the latest user turn, which follows the record; the system prompt never leaks in.
   const { chat, content } = await transferred(async (chat) => {
     await opencode.say(chat, "remember the codename AXIOM-9042");
     opencode.otherModelAnswer(chat, "Got it — codename AXIOM-9042 noted.");
@@ -53,20 +57,21 @@ await cases.run("a history without files is text ending with the answer, the lat
   });
   assert.equal(typeof content, "string", "a history without files is text");
   const text = content as string;
-  const [history, latest] = text.split("Latest user message:\n");
-  assert.match(history!, /<conversation_history>/);
+  assert.match(text, /<\/recent-context>\n\nwhat is the codename\?$/, "the record ahead of the question");
+  const [history, latest] = text.split("</recent-context>\n\n");
+  assert.match(history!, /^The following is a serialized record of this conversation from its start/);
   assert.match(history!, /AXIOM-9042/);
-  assert.match(history!, /^User:/m);
-  assert.match(history!, /^Assistant:/m);
-  assert.match(history!, /Assistant:\nGot it — codename AXIOM-9042 noted\.\n<\/conversation_history>/, "the history ends with the answer");
+  assert.match(history!, /^\[User\]: remember/m);
+  assert.match(history!, /^\[Assistant\]: Got it/m);
+  assert.match(history!, /\[Assistant\]: Got it — codename AXIOM-9042 noted\.\n$/, "the history ends with the answer");
   assert.doesNotMatch(history!, /what is the codename\?/, "the latest user turn is not history");
   assert.equal(latest, "what is the codename?");
   assert.doesNotMatch(text, /You are OpenCode\./, "the system prompt never leaks into the transfer");
   assert.ok(injected(chat), "the journal names the transfer");
 });
 
-await cases.run("tool calls and their results, the output whole, labelled with the tool", async () => {
-  // The result is labelled with the tool it answers, not the call id.
+await cases.run("tool calls and their results, the output whole, labelled as OpenCode labels them", async () => {
+  // The call with its input, then its result.
   const { content } = await transferred(async (chat) => {
     await opencode.say(chat, "run tests");
     opencode.otherModelAnswer(chat, "running", {
@@ -78,8 +83,8 @@ await cases.run("tool calls and their results, the output whole, labelled with t
     await opencode.say(chat, "and now?");
   });
   const text = String(content);
-  assert.match(text, /\[called tool: bash\]/);
-  assert.match(text, /Tool result \(bash\):/);
+  assert.match(text, /\[Assistant tool call\]: bash\(\{\}\)/);
+  assert.match(text, /\[Tool result\]: x/);
   assert.ok(text.includes("x".repeat(5000)), "the tool output goes whole");
 });
 
@@ -95,7 +100,7 @@ await cases.run("nothing is dropped for length", async () => {
   assert.match(String(content), /NEW-MESSAGE-MARKER/);
 });
 
-await cases.run("an image in the history goes as an image block in its place", async () => {
+await cases.run("an image in the history goes as an image block in its place, the question after the record", async () => {
   const look = image("look");
   const { content } = await transferred(async (chat) => {
     await opencode.say(chat, "look", [look]);
@@ -103,19 +108,20 @@ await cases.run("an image in the history goes as an image block in its place", a
     await opencode.say(chat, "what was it?");
   });
   assert.ok(Array.isArray(content), "a history with files is blocks");
-  assert.deepEqual(content.map((b) => b.type), ["text", "image", "text"]);
+  assert.deepEqual(content.map((b) => b.type), ["text", "image", "text", "text"]);
   assert.equal(content[1]!.source?.data, look.data);
+  assert.equal(content[3]!.text, "what was it?", "the question after the record");
   assert.doesNotMatch(JSON.stringify(content), /omitted/);
 });
 
-await cases.run("a chat without history: the prompt is the message untouched", async () => {
+await cases.run("a chat without history: no record, the prompt is the message untouched", async () => {
   const { content } = await transferred(async (chat) => {
     await opencode.say(chat, "hi");
   });
   assert.equal(content, "hi");
 });
 
-await cases.run("a text history and a latest message with an image: the history's text block first, the attachment kept", async () => {
+await cases.run("a text history and a latest message with an image: the record first, the attachment kept", async () => {
   const seen = image("see this");
   const { content } = await transferred(async (chat) => {
     await opencode.say(chat, "remember the codename AXIOM-9042");
@@ -124,13 +130,12 @@ await cases.run("a text history and a latest message with an image: the history'
   });
   assert.ok(Array.isArray(content), "a prompt of blocks");
   assert.equal(content[0]!.type, "text");
-  assert.match(content[0]!.text!, /<conversation_history>[\s\S]*AXIOM-9042/);
+  assert.match(content[0]!.text!, /serialized record of this conversation from its start[\s\S]*AXIOM-9042/);
   assert.equal(content[2]!.type, "image");
   assert.equal(content[2]!.source?.data, seen.data);
 });
 
-await cases.run("a history with files and a latest message with one: the history's image in place, the latest one after", async () => {
-  // One prompt of blocks, the history's image before "Latest user message:", the latest message's own after it.
+await cases.run("a history with files and a latest message with one: the history's image in place, the latest one after the record", async () => {
   const look = image("AA");
   const next = image("BB");
   const { content } = await transferred(async (chat) => {
@@ -139,11 +144,12 @@ await cases.run("a history with files and a latest message with one: the history
     await opencode.say(chat, "and this one?", [next]);
   });
   const fw = content as Block[];
-  assert.deepEqual(fw.map((b) => b.type), ["text", "image", "text", "image"]);
-  assert.match(fw[0]!.text!, /<conversation_history>[\s\S]*User:\nlook/);
+  assert.deepEqual(fw.map((b) => b.type), ["text", "image", "text", "text", "image"]);
+  assert.match(fw[0]!.text!, /\[User\]: look/);
   assert.equal(fw[1]!.source!.data, look.data);
-  assert.match(fw[2]!.text!, /a square\n<\/conversation_history>\n\nLatest user message:\nand this one\?$/);
-  assert.equal(fw[3]!.source!.data, next.data);
+  assert.match(fw[2]!.text!, /\[Assistant\]: a square\n<\/recent-context>$/);
+  assert.equal(fw[3]!.text, "and this one?");
+  assert.equal(fw[4]!.source!.data, next.data);
   assert.deepEqual(world.journal().filter((line) => /level=error/.test(line)), [], "no error in the plugin's journal");
 });
 

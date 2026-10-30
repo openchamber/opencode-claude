@@ -4,12 +4,12 @@
  * OpenCode's message list (context-list.ts) names the records the transcript
  * should hold (names.ts). The transcript is read, the last of those records
  * is found by name, and the turn resumes at the end of that record's turn
- * with `resumeSessionAt`: everything the list holds after it is sent as
- * text. That one rule covers a plain continuation (the point is the end of
- * the transcript), a revert or an edit (the point is earlier, and the CLI
- * branches the transcript there, as its own /rewind does), turns another
- * provider answered or that failed before Claude wrote anything (missed:
- * sent as text), and a retry of the same message (its record is already in
+ * with `resumeSessionAt`: what the list holds after it is missed, and goes
+ * ahead of the prompt as one record. That one rule covers a plain
+ * continuation (the point is the end of the transcript), a revert or an edit
+ * (the point is earlier, and the CLI branches the transcript there, as its
+ * own /rewind does), turns another provider answered or that failed before
+ * Claude wrote anything (missed), and a retry of the same message (its record is already in
  * the transcript: the point is the end of the turn before it, and the new
  * record gets the next attempt number). Every transcript starts with a
  * blank record without a turn (names.ts TRANSCRIPT_START_NAME): when none
@@ -177,11 +177,15 @@ function isInterruptRecord(record: TranscriptRecord): boolean {
   return INTERRUPT_TEXTS.has(text.trim());
 }
 
-/** What the list says a record is: a user message, a checkpoint, or a rebuilt tool step. */
+/**
+ * What the list says a record is: a user message, a checkpoint, a rebuilt
+ * tool step, or an answer the transcript never saw (another model's, sent
+ * as a record of its own without a turn).
+ */
 export type ChainEntry = {
   /** Position in the list. */
   index: number;
-  kind: "message" | "checkpoint" | "step";
+  kind: "message" | "checkpoint" | "step" | "reply";
   /** The OpenCode id the names are made of (a message id, or the tool call ids of a step). */
   source: string;
   /** The record's name for each attempt, attempt 1 first; shared between chains, never written to. */
@@ -285,7 +289,8 @@ function namesOf(key: string, name: (attempt: number) => string): readonly strin
 /**
  * The records the transcript should hold for this list, in list order:
  * one per user message (a fork's copy named after the original), one per
- * checkpoint, one per tool step (only present when the step was rebuilt).
+ * checkpoint, one per tool step (only present when the step was rebuilt),
+ * one per answer with an id (only present when it went as a missed record).
  */
 export function expectedChain(messages: readonly ListMessage[]): ChainEntry[] {
   const chain: ChainEntry[] = [];
@@ -302,6 +307,8 @@ export function expectedChain(messages: readonly ListMessage[]): ChainEntry[] {
       return;
     }
     if (message.role === "assistant") {
+      const id = messageIdOf(message);
+      if (id) chain.push({ index, kind: "reply", source: id, names: namesOf(`message:${id}`, (a) => userRecordName(id, a)) });
       const ids = toolCallIdsOf(message);
       if (ids.length === 0) return;
       // The key in the form the name itself hashes (sorted, JSON): ids joined with commas could collide.
@@ -310,6 +317,19 @@ export function expectedChain(messages: readonly ListMessage[]): ChainEntry[] {
     }
   });
   return chain;
+}
+
+/** The entry of the record a turn is about: the last one that is not an answer. */
+function launchingAt(chain: readonly ChainEntry[]): number {
+  for (let i = chain.length - 1; i >= 0; i--) {
+    if (chain[i]!.kind !== "reply") return i;
+  }
+  return -1;
+}
+
+/** The entry a turn's record is named by: the list's last message, checkpoint or step. */
+export function launchingEntry(chain: readonly ChainEntry[]): ChainEntry | undefined {
+  return chain[launchingAt(chain)];
 }
 
 export type FoundRecord = { record: TranscriptRecord; entry: ChainEntry; attempt: number };
@@ -448,7 +468,7 @@ export type ResumePlan =
   | { kind: "none" }
   /** Every attempt's name of the message the turn is about is taken: the turn is refused. */
   | { kind: "exhausted" }
-  /** Resume at `point`; list messages after `coveredIndex` are missed (sent as text). */
+  /** Resume at `point`; list messages after `coveredIndex` are missed (see missedFrom). */
   | {
       kind: "resume";
       point: string;
@@ -556,12 +576,13 @@ export function planResume(
   messages: readonly ListMessage[],
   chain: readonly ChainEntry[] = expectedChain(messages),
 ): ResumePlan {
-  if (chain.length === 0) return { kind: "none" };
-  const launching = chain[chain.length - 1]!;
+  const at = launchingAt(chain);
+  if (at < 0) return { kind: "none" };
+  const launching = chain[at]!;
   const index = indexRecords(records);
   const attempt = nextAttempt(records, launching, index.names);
   if (attempt > MAX_ATTEMPTS) return { kind: "exhausted" };
-  const plan = pointIn(records, messages, chain, attempt, index);
+  const plan = pointIn(records, messages, chain, at, attempt, index);
   if (plan.kind !== "resume") return plan;
   // The CLI refuses a point off its leaf chain. The turn is planned again on
   // the records down to where the point's branch leaves it: the point lands
@@ -572,21 +593,25 @@ export function planResume(
   const ancestor = leafChainAncestor(records, plan.point, index);
   if (!ancestor || ancestor.uuid === plan.point) return plan;
   const cut = chainTo(records, ancestor.uuid!, index);
-  const moved = pointIn(cut, messages, chain, attempt, indexRecords(cut));
+  const moved = pointIn(cut, messages, chain, at, attempt, indexRecords(cut));
   if (moved.kind !== "resume") return plan;
   return { ...moved, offLeafChain: { point: plan.point, ancestor: ancestor.uuid! } };
 }
 
-/** The point of a chat turn among `records` (planResume), for an attempt counted already. */
+/**
+ * The point of a chat turn among `records` (planResume), for an attempt
+ * counted already; `at` is the launching entry's place in the chain.
+ */
 function pointIn(
   records: readonly TranscriptRecord[],
   messages: readonly ListMessage[],
   chain: readonly ChainEntry[],
+  at: number,
   attempt: number,
   index: RecordIndex,
 ): ResumePlan {
   // The point is among the entries before the launching one.
-  const found = findLastChainRecord(records, chain, chain.length - 1);
+  const found = findLastChainRecord(records, chain, at);
   if (!found) {
     // None of them in the transcript: the turn resumes at the record the
     // transcript starts with (the chat's first message, its retry, a revert
@@ -595,14 +620,28 @@ function pointIn(
     if (!start) return { kind: "none" };
     return { kind: "resume", point: start.uuid!, coveredIndex: -1, attempt, stepDelivered: false, answered: false };
   }
-  const end = withinList(records, messages, found, endOfTurn(records, found.record, chainIndex(chain), index), index);
+  const end = endOfTurn(records, found.record, chainIndex(chain), index);
+  if (found.entry.kind === "reply") {
+    // A record of missed messages, named after the last answer in it: it
+    // holds that answer's tool step too (a tool message has no id of its
+    // own), results included.
+    return {
+      kind: "resume",
+      point: end.uuid!,
+      coveredIndex: replyCoverage(messages, found.entry.index),
+      attempt,
+      stepDelivered: true,
+      answered: false,
+    };
+  }
+  const turnEnd = withinList(records, messages, found, end, index);
   return {
     kind: "resume",
-    point: end.uuid!,
+    point: turnEnd.uuid!,
     coveredIndex: found.entry.index,
     attempt,
-    stepDelivered: stepDelivered(records, end, index),
-    answered: turnAnswered(records, found.record, end, index),
+    stepDelivered: stepDelivered(records, turnEnd, index),
+    answered: turnAnswered(records, found.record, turnEnd, index),
   };
 }
 
@@ -631,6 +670,8 @@ function withinList(
   end: TranscriptRecord,
   index: RecordIndex = indexRecords(records),
 ): TranscriptRecord {
+  // A record of missed messages holds its answer as text: nothing to cut there.
+  if (found.entry.kind === "reply") return end;
   const path = pathBetween(found.record, end, index);
   if (!listAnswers(messages, found.entry.index)) {
     const answer = path.findIndex((record) => record.type === "assistant" && !record.isApiErrorMessage);
@@ -706,6 +747,17 @@ export function answerCutShort(path: readonly TranscriptRecord[], screenText: st
 }
 
 /**
+ * The last list message a record of missed messages named after the answer
+ * at `index` holds: that answer and the tool messages after it (its
+ * results; a tool message has no id), up to the next message of another kind.
+ */
+function replyCoverage(messages: readonly ListMessage[], index: number): number {
+  let covered = index;
+  while (covered + 1 < messages.length && messages[covered + 1]!.role === "tool") covered++;
+  return covered;
+}
+
+/**
  * Plan a summary: the list is the part OpenCode summarizes, all of it
  * already answered. Usable only when its last named message is in the
  * transcript; the point is the end of that turn.
@@ -715,10 +767,10 @@ export function planSummaryResume(
   messages: readonly ListMessage[],
   chain: readonly ChainEntry[] = expectedChain(messages),
 ): { point: string } | null {
-  // A step's record exists only when the step was rebuilt: the last message
-  // or checkpoint is what the transcript must hold; a later step, if found,
-  // is better still.
-  const required = [...chain].reverse().find((entry) => entry.kind !== "step");
+  // A step's record exists only when the step was rebuilt, an answer's only
+  // when it went as a missed record: the last message or checkpoint is what
+  // the transcript must hold; a later step or answer, if found, is better still.
+  const required = [...chain].reverse().find((entry) => entry.kind === "message" || entry.kind === "checkpoint");
   if (!required) return null;
   const found = findLastChainRecord(records, chain);
   if (!found || found.entry.index < required.index) return null;
@@ -726,7 +778,9 @@ export function planSummaryResume(
   const end = withinList(records, messages, found, endOfTurn(records, found.record, chainIndex(chain), index), index);
   // The transcript has no answer to that message (its turn failed), but the
   // part goes on after it (another model answered): the transcript lacks it.
-  if (!turnAnswered(records, found.record, end, index) && found.entry.index < messages.length - 1) return null;
+  // A record of missed messages holds its answer's tool results too.
+  const covered = found.entry.kind === "reply" ? replyCoverage(messages, found.entry.index) : found.entry.index;
+  if (!turnAnswered(records, found.record, end, index) && covered < messages.length - 1) return null;
   return { point: end.uuid! };
 }
 
@@ -781,16 +835,38 @@ export function leafChainAncestor(
 }
 
 /**
- * The messages of a history the transcript never saw: after the turn of the
- * message at `coveredIndex` (its answers and tool steps are in the
- * transcript), from the next message that starts a turn on; when the
- * transcript has no answer to that message, everything after it. Empty when
- * nothing follows.
+ * Where the messages of a history the transcript never saw start: after the
+ * turn of the message at `coveredIndex` (its answers and tool steps are in
+ * the transcript), at the next message that starts a turn; when the
+ * transcript has no answer to that message, right after it. `history.length`
+ * when nothing follows.
  */
-export function missedAfter<T extends ListMessage>(history: readonly T[], coveredIndex: number, answered: boolean): T[] {
-  if (!answered) return history.slice(coveredIndex + 1);
+export function missedFrom(history: readonly ListMessage[], coveredIndex: number, answered: boolean): number {
+  if (!answered) return Math.min(coveredIndex + 1, history.length);
   for (let i = coveredIndex + 1; i < history.length; i++) {
-    if (startsTurn(history[i]!)) return history.slice(i);
+    if (startsTurn(history[i]!)) return i;
   }
-  return [];
+  return history.length;
+}
+
+/**
+ * The name of each list message's record for this transcript, by list
+ * index: the first attempt the transcript does not hold (the CLI drops a
+ * record whose uuid it has). An answer is named by its own id, not as a
+ * step. No name when every attempt is taken. `chain`: the list's expected
+ * chain when the caller has built it already.
+ */
+export function recordNames(
+  records: readonly TranscriptRecord[],
+  messages: readonly ListMessage[],
+  chain: readonly ChainEntry[] = expectedChain(messages),
+): Map<number, string> {
+  const names = new Map<number, string>();
+  const present = namesIn(records);
+  for (const entry of chain) {
+    if (entry.kind === "step") continue;
+    const attempt = nextAttempt(records, entry, present);
+    if (attempt <= MAX_ATTEMPTS) names.set(entry.index, entry.names[attempt - 1]!);
+  }
+  return names;
 }

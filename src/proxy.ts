@@ -67,10 +67,13 @@ import { OPENCODE_IMAGE_REMOVED } from "./removed-images.js";
 import { FIRST_EPOCH, MAX_ATTEMPTS, TRANSCRIPT_START_NAME, epochOfList, userRecordName, type ListMessage } from "./names.js";
 import {
   expectedChain,
-  missedAfter,
+  launchingEntry,
+  toolCallIdsOf,
+  missedFrom,
   planResume,
   planSummaryResume,
   readTranscript,
+  recordNames,
 } from "./turn-point.js";
 import { contentOfBody, contentOfEvent, toolsOfEvent, type BodyTool } from "./list-content.js";
 import {
@@ -94,25 +97,27 @@ import {
 import {
   answeredToolStepIndex,
   answeredToolStepPrompt,
-  buildConversationTranscript,
   collectSteeringMessages,
   collectToolResults,
   extractTextContent,
   isSyntheticToolMediaMessage,
   latestUserPrompt,
   latestUserTurn,
+  missedMessageContent,
+  type MissedLine,
   priorMessagesOf,
   promptAsStream,
+  promptRecord,
   createTurnInput,
+  userMessagePrompt,
   startsTurn,
-  transcriptFiles,
-  transcriptText,
   userTextIdentity,
-  withConversationContext,
   withLeadingText,
   withTranscriptStart,
+  recordsOneByOne,
   withUuid,
   buildRuntimeInstructions,
+  type AnthropicContentBlock,
   type ConversationMessage,
   type McpToolResultContent,
   type SdkUserPrompt,
@@ -802,6 +807,10 @@ type ChatTurnPlan = {
   resumeSessionAt?: string;
   newSessionId?: string;
   missedMessages: ConversationMessage[];
+  /** List index of the first missed message (missedMessages start there). */
+  missedStart?: number;
+  /** The record name of each list message the turn may write, by list index (turn-point.ts recordNames). */
+  recordNames: Map<number, string>;
   /** The last message of the request the transcript holds, up to the resume point. */
   coveredIndex?: number;
   /** The tool results of the request are in the transcript already: no rebuilt step. */
@@ -893,7 +902,7 @@ async function planChatTurn(input: {
   const list = event.messages;
   const epoch = epochOfList(list);
   const chain = expectedChain(list);
-  const launching = chain.at(-1);
+  const launching = launchingEntry(chain);
   if (!launching) {
     return refuseRequest("The request names no user message for Claude to answer.");
   }
@@ -907,7 +916,8 @@ async function planChatTurn(input: {
       transcript: fresh.name,
       version: fresh.version,
     });
-    return { newSessionId: fresh.name, missedMessages: [], promptUuid: launching.names[0]!, epoch, startedBecause: why };
+    // A new transcript holds nothing yet: every record takes its first attempt.
+    return { newSessionId: fresh.name, missedMessages: [], recordNames: recordNames([], list, chain), promptUuid: launching.names[0]!, epoch, startedBecause: why };
   };
   if (!transcript.file) {
     // A version past the first is there because the CLI refused the one before (markTranscriptUnusable).
@@ -936,20 +946,21 @@ async function planChatTurn(input: {
   }
   // Tool results with no parked turn are rebuilt into a step, unless the
   // transcript shows the CLI took them (the turn went on after them, and a
-  // revert since cut what followed): then the turn is a plain one. A point
-  // moved onto the leaf chain lies before the step's call, where no step can
-  // be rebuilt: a plain turn too, the step going as text with the rest.
-  const rebuildStep = input.rebuiltStep && !plan.stepDelivered && !plan.offLeafChain;
+  // revert since cut what followed), or never saw the turn the step is in
+  // (another model made the call after a message the transcript lacks: a
+  // batch whose first record was written and whose second was not), or the
+  // point moved onto the leaf chain before the step's call (no step can be
+  // rebuilt there): then the turn is a plain one, and the step goes with
+  // what was missed.
+  const rebuildStep =
+    input.rebuiltStep && !plan.stepDelivered && !plan.offLeafChain && plan.coveredIndex >= stepTurnStart(list);
   // What the list holds after the covered message's turn is what the
-  // transcript never saw. Also for a rebuilt tool step, in the history
-  // before the step: it is Claude's own only when no turn the transcript
-  // never saw comes before it; after a model switch it can be the other
-  // model's step, and the turns before it are the handover (startNewTurn
-  // relays the step as that model's).
+  // transcript never saw (missedFrom: everything after it when the
+  // transcript has no answer to it). A rebuilt tool step continues Claude's
+  // own turn, which it saw.
   const history = input.rebuiltStep && !rebuildStep ? priorMessagesOf(input.messages) : priorMessages;
-  const missedMessages = rebuildStep
-    ? missedAfter(priorMessages, plan.coveredIndex, true)
-    : missedAfter(history, plan.coveredIndex, plan.answered);
+  const missedStart = rebuildStep ? history.length : missedFrom(history, plan.coveredIndex, plan.answered);
+  const missedMessages = history.slice(missedStart);
   log.info("[opencode-claude] resuming the chat's Claude transcript", {
     conversationKey,
     transcript: transcript.name,
@@ -962,12 +973,195 @@ async function planChatTurn(input: {
     resume: transcript.name,
     resumeSessionAt: plan.point,
     missedMessages,
+    missedStart,
+    recordNames: recordNames(records, list, chain),
     coveredIndex: plan.coveredIndex,
     stepDelivered: input.rebuiltStep && !rebuildStep,
     promptUuid: launching.names[plan.attempt - 1]!,
     epoch,
     ...(plan.offLeafChain ? { offLeafChain: true } : {}),
   };
+}
+
+/**
+ * The list index of the user message whose turn the list's last tool step
+ * is in: the last one that starts a turn before the step. -1 without a step.
+ */
+function stepTurnStart(list: readonly ListMessage[]): number {
+  let step = -1;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]!.role === "assistant" && toolCallIdsOf(list[i]!).length > 0) {
+      step = i;
+      break;
+    }
+  }
+  for (let i = step - 1; i >= 0; i--) {
+    if (startsTurn(list[i]!)) return i;
+  }
+  return -1;
+}
+
+/** Prompt contents joined into one: texts by a blank line; with attachments, as blocks in order. */
+function joinContents(parts: Array<string | AnthropicContentBlock[]>): string | AnthropicContentBlock[] {
+  const kept = parts.filter((part) => part.length > 0);
+  if (kept.every((part) => typeof part === "string")) return kept.join("\n\n");
+  return kept.flatMap((part) => (typeof part === "string" ? [{ type: "text" as const, text: part }] : part));
+}
+
+/** Where a serialized record of a chat's messages starts. */
+type RecordFrom = "last-reply" | "start";
+
+const RECORD_INTRO: Record<RecordFrom, string> = {
+  "last-reply":
+    "The following is a serialized record of the latest part of this conversation, after your last reply in this session. It is part of this conversation's history; the assistant's replies in it are your own earlier replies.",
+  start:
+    "The following is a serialized record of this conversation from its start; this session does not hold it. It is part of this conversation's history; the assistant's replies in it are your own earlier replies.",
+};
+
+/**
+ * These messages as the paragraphs of a record: a message each, as OpenCode
+ * separates the messages of its checkpoint's recent part; a tool message's
+ * results stay under the call they answer, as OpenCode keeps them in the
+ * answer that made it.
+ */
+function recordParagraphs(messages: readonly ConversationMessage[]): MissedLine[][] {
+  const paragraphs: MissedLine[][] = [];
+  for (const message of messages) {
+    const lines = missedMessageContent(message);
+    if (lines.length === 0) continue;
+    if (message.role === "tool" && paragraphs.length > 0) paragraphs[paragraphs.length - 1]!.push(...lines);
+    else paragraphs.push(lines);
+  }
+  return paragraphs;
+}
+
+/** The record of these messages (missedRecordContent), or null when they hold nothing to pass on. */
+export function serializedRecord(messages: readonly ConversationMessage[], from: RecordFrom): string | AnthropicContentBlock[] | null {
+  const paragraphs = recordParagraphs(messages);
+  return paragraphs.length > 0 ? missedRecordContent(paragraphs, from) : null;
+}
+
+/** A prompt with a record ahead of it, in one message (a turn that is not sent as records). */
+export function withRecordFirst(prompt: string | SdkUserPrompt, record: string | AnthropicContentBlock[]): string | SdkUserPrompt {
+  if (typeof prompt === "string") {
+    const content = joinContents([record, prompt]);
+    return typeof content === "string" ? content : promptRecord(content, undefined, false);
+  }
+  return { ...prompt, message: { role: "user", content: joinContents([record, prompt.message.content]) } };
+}
+
+/** The text length of a record, files left out: for the journal. */
+function recordChars(record: string | AnthropicContentBlock[] | null): number {
+  if (record === null) return 0;
+  if (typeof record === "string") return record.length;
+  return record.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 0), 0);
+}
+
+/**
+ * The record of the messages a transcript never saw (another model's turns,
+ * a turn that broke off): OpenCode's own form for a serialized part of a
+ * conversation (the recent part of its checkpoint, to-llm-message.ts), its
+ * messages labelled as OpenCode labels them (missedMessageContent). The opening
+ * sentence says where the text comes from, not who wrote it: without it
+ * Claude takes assistant lines inside a user message for a forged
+ * transcript; told that another model wrote them, it sets itself against
+ * that model. Told they are its own earlier replies, it carries on with them
+ * as OpenCode's other providers do with theirs (checked live on Opus 5.5,
+ * before and after a compaction).
+ *
+ * `paragraphs`: a message each, its lines (missedMessageContent). Text only:
+ * one string. With files: text blocks, each file's blocks where its line
+ * put it. `from` names where the record starts: after Claude's last reply
+ * (the turns it missed) or at the chat's start (the history of a chat this
+ * transcript never held); the record is the same otherwise.
+ */
+function missedRecordContent(paragraphs: MissedLine[][], from: RecordFrom = "last-reply"): string | AnthropicContentBlock[] {
+  const blocks: AnthropicContentBlock[] = [];
+  let text = RECORD_INTRO[from] + "\n\n<recent-context>\n";
+  // Whether the text so far ends a line: the next line goes after a newline.
+  let lineOpen = false;
+  paragraphs.forEach((lines, index) => {
+    // Messages apart by a blank line, as OpenCode's recent part has them.
+    if (index > 0 && lineOpen) {
+      text += "\n\n";
+      lineOpen = false;
+    }
+    for (const line of lines) {
+      if (typeof line === "string") {
+        text += (lineOpen ? "\n" : "") + line;
+        lineOpen = true;
+        continue;
+      }
+      blocks.push({ type: "text", text });
+      blocks.push(...line);
+      text = "";
+      lineOpen = false;
+    }
+  });
+  text += "\n</recent-context>";
+  if (blocks.length === 0) return text;
+  blocks.push({ type: "text", text });
+  return blocks;
+}
+
+/**
+ * The records of a chat turn, each named after an OpenCode message
+ * (turn-point.ts recordNames), so the next turn finds them and reads them
+ * from the cache:
+ * - the messages the transcript never saw, one record without a turn
+ *   (missedRecordContent), named after the last of them that has an id;
+ * - the user messages of the latest turn (queued together, a checkpoint and
+ *   the question after it), each a record of its own, the last one with the
+ *   turn; a new transcript gets the history before them as text in the first.
+ * A message of the latest turn without a name goes with the record after it,
+ * and those after the message the turn is named after go with the record
+ * that has the turn. Null when the latest turn is not after the missed part (the newest user
+ * message stands in for a step that holds only tool output): one record, as
+ * before.
+ */
+function chatTurnRecords(input: {
+  messages: ConversationMessage[];
+  names: Map<number, string>;
+  missedStart: number;
+  missedEnd: number;
+  tail: number[];
+  promptUuid: string;
+  /** The record of the history before the latest turn (serializedRecord, from the start): a new transcript's. */
+  history: string | AnthropicContentBlock[] | null;
+}): SdkUserPrompt[] | null {
+  const { messages, names, tail } = input;
+  if (tail.length === 0 || tail[0]! < input.missedEnd) return null;
+
+  // The missed part, one record named after the last of its messages that
+  // has an id and something to pass on.
+  let missedName: string | undefined;
+  for (let i = input.missedStart; i < input.missedEnd; i++) {
+    if (missedMessageContent(messages[i]!).length > 0) missedName = names.get(i) ?? missedName;
+  }
+  const missed = serializedRecord(messages.slice(input.missedStart, input.missedEnd), "last-reply");
+  const records = missed !== null ? [promptRecord(missed, missedName, true)] : [];
+
+  // The record with the turn holds the message the turn is named after and
+  // every message of the turn after it: one without an id there (a system
+  // update OpenCode added after the question) has no name of its own, and
+  // a record of its own under the question's name would be dropped by the CLI.
+  let launchAt = tail.findIndex((index) => names.get(index) === input.promptUuid);
+  if (launchAt < 0) launchAt = tail.length - 1;
+  let waiting: Array<string | AnthropicContentBlock[]> = [];
+  tail.forEach((index, position) => {
+    const last = position === tail.length - 1;
+    waiting.push(userMessagePrompt(messages[index]!.content));
+    if (position >= launchAt && !last) return;
+    const name = last ? input.promptUuid : names.get(index);
+    if (!name && !last) return;
+    let content = joinContents(waiting);
+    waiting = [];
+    // A new transcript: the history before the latest turn rides its first record.
+    if (input.history !== null && records.length === 0) content = joinContents([input.history, content]);
+    if (!last && content.length === 0) return;
+    records.push(promptRecord(content, name, !last));
+  });
+  return records;
 }
 
 const UTILITY_SYSTEM_PROMPT =
@@ -1658,12 +1852,15 @@ async function startNewTurn(input: {
   let newSessionId: string | undefined;
   // Turns after the resume point that the transcript never saw: the user
   // switched to another model for them, or they failed before Claude ran. A
-  // resume alone would skip them, so they go into the prompt as text. A
-  // summary resumed before the chat's live turn reads that turn so.
+  // resume alone would skip them, so they go ahead of the prompt, a record
+  // per message (chatTurnRecords). A summary resumed before the chat's live
+  // turn reads that turn so, in one record.
   let missedMessages: typeof priorMessages = summaryResume?.liveTurn ?? [];
   // The uuid of this turn's record in the transcript (names.ts).
   let promptUuid: string | undefined;
   let epoch: string | undefined;
+  // A chat turn's records, one per message (chatTurnRecords); unset: one record.
+  let turnRecords: SdkUserPrompt[] | null = null;
   // Lines above the answer that say how the turn ran (TURN_NOTES).
   const notes: string[] = [];
   const outsideTranscript = !isMetaRequest && input.unmatchedList === true;
@@ -1713,36 +1910,56 @@ async function startNewTurn(input: {
     ) {
       prompt = latestUserPrompt(messages, planned.coveredIndex);
     }
+    if (answeredStep === null) {
+      const missedStart = planned.missedStart ?? priorMessages.length;
+      const history = resume ? null : serializedRecord(priorMessages, "start");
+      turnRecords = chatTurnRecords({
+        messages,
+        names: planned.recordNames,
+        missedStart,
+        missedEnd: missedStart + missedMessages.length,
+        tail: latestUserTurn(messages).filter((i) => i > (planned.coveredIndex ?? -1)),
+        promptUuid: planned.promptUuid,
+        history,
+      });
+      if (turnRecords) {
+        log.info("[opencode-claude] turn records", {
+          conversationKey,
+          records: turnRecords.length,
+          withoutTurn: turnRecords.length - 1,
+          missed: missedMessages.length,
+          historyChars: recordChars(history),
+        });
+      }
+    }
   }
 
   // The step is still rebuilt (the plan found its results missing from the transcript).
   if (answeredStep !== null && !isMetaRequest) notes.push(TURN_NOTES.rebuiltStep);
 
   // No resumable Claude session (first claude-code turn of this chat, model
-  // switch mid-conversation, lost store): serialize the prior OpenCode
-  // messages into the prompt so Claude sees the whole conversation, with
-  // its images and documents. A summary that can't resume gets it the same
-  // way: OpenCode already fit the request to the model.
-  // A resumed session gets only the turns it missed, if any.
-  const transcript = buildConversationTranscript(resume ? missedMessages : priorMessages);
-  if (transcript.length > 0) {
+  // switch mid-conversation, lost store): the prior OpenCode messages go
+  // ahead of the prompt as a record of the chat from its start, with its
+  // images and documents, the form the missed turns take (serializedRecord).
+  // A summary that can't resume gets it the same way: OpenCode already fit
+  // the request to the model. A resumed session gets only the turns it
+  // missed, if any. A turn sent as records (chatTurnRecords) carries the
+  // missed part and the history in them.
+  const record = turnRecords ? null : serializedRecord(resume ? missedMessages : priorMessages, resume ? "last-reply" : "start");
+  if (record !== null) {
     log.info(
       resume
         ? "[opencode-claude] injecting turns the resumed Claude session missed"
         : "[opencode-claude] injecting transferred conversation history",
       {
         conversationKey,
-        transcriptChars: transcriptText(transcript).length,
-        transcriptFiles: transcriptFiles(transcript),
+        transcriptChars: recordChars(record),
+        transcriptFiles: typeof record === "string" ? 0 : record.filter((block) => block.type !== "text").length,
         historyMessages: resume ? missedMessages.length : priorMessages.length,
       },
     );
   }
-  const turnPrompt =
-    answeredStep !== null && missedMessages.length > 0
-      ? answeredToolStepPrompt(messages, answeredStep, { otherModel: true })
-      : prompt;
-  const contextualPrompt = withConversationContext(turnPrompt, transcript, Boolean(resume));
+  const contextualPrompt = record !== null ? withRecordFirst(prompt, record) : prompt;
 
   const mcpServers =
     (!isMetaRequest || summaryResume) && openCodeTools.length > 0
@@ -1816,7 +2033,7 @@ async function startNewTurn(input: {
   // A chat turn that can park on tools keeps its input open, so a message
   // the user sends while a tool runs reaches Claude as their own message.
   const turnInput = bridgeOpenCodeTools
-    ? createTurnInput(typeof mainPrompt === "string" ? mainPrompt || " " : mainPrompt)
+    ? createTurnInput(turnRecords ?? (typeof mainPrompt === "string" ? mainPrompt || " " : mainPrompt))
     : undefined;
   // The host's title agent prompt (OpenChamber's title style, or the user's
   // own `agents.title.system`) decides the title; OpenCode already frames its
@@ -1843,6 +2060,8 @@ async function startNewTurn(input: {
         ].join("\n")
     : turnInput
       ? turnInput.stream
+      : turnRecords
+        ? promptAsStream(turnRecords)
       : typeof mainPrompt === "string"
         ? mainPrompt || " "
         : promptAsStream(mainPrompt);
@@ -1910,6 +2129,10 @@ async function startNewTurn(input: {
   // that came meanwhile found no turn to stop.
   const droppedPlanning = droppedBeforeStart(req, conversationKey, true);
   if (droppedPlanning) return droppedPlanning;
+  // A new transcript starts with a record of its own, before the turn's; a
+  // chat turn's records go to the CLI one by one, so each keeps its name.
+  const chatPrompt = !isMetaRequest && newSessionId ? withTranscriptStart(queryPrompt, TRANSCRIPT_START_NAME) : queryPrompt;
+  const oneByOne = !isMetaRequest && typeof chatPrompt !== "string" ? recordsOneByOne(chatPrompt) : undefined;
   handle = withGracefulStop(await queryStarter(
     summaryResume
       ? {
@@ -1945,8 +2168,7 @@ async function startNewTurn(input: {
           },
         }
       : {
-    // A new transcript starts with a record of its own, before the turn's.
-    prompt: !isMetaRequest && newSessionId ? withTranscriptStart(queryPrompt, TRANSCRIPT_START_NAME) : queryPrompt,
+    prompt: oneByOne?.stream ?? chatPrompt,
     cwd,
     model: queryModel,
     resume: isMetaRequest ? undefined : resume,
@@ -1984,6 +2206,7 @@ async function startNewTurn(input: {
     // ~15x smaller. Chat turns keep the Claude Code preset untouched.
     systemPrompt: isMetaRequest ? UTILITY_SYSTEM_PROMPT : chatSystemPrompt,
   }));
+  if (oneByOne) handle.onEvent(oneByOne.observe);
 
   const bridge: ParkedBridge = {
     id: bridgeId,
@@ -2153,7 +2376,8 @@ async function startNewTurn(input: {
         if (isTurnResult(event)) turnInput?.end();
         trackMessageState(event);
         retryWaitMs = apiRetryDelayMs(event);
-        logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
+        // The empty result of a record without a turn carries no model call.
+        if (isTurnResult(event)) logTurnUsage(event, { conversationKey, metaKind, model: queryModel });
         const fallback = event as {
           type?: string;
           subtype?: string;

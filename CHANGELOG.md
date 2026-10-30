@@ -29,6 +29,20 @@
   the session could not be continued), `[claude-code]` for an expected
   step (messages Claude had not seen went as text, the first turn after a
   compaction, a rebuilt tool step).
+- **One record per message**: queued messages, turns another model answered
+  and the checkpoint after a compaction used to reach Claude glued into one
+  prompt, and only the last message got a record of its own, so the next turn
+  could not tell where they ended. Each queued message and the checkpoint now
+  go as a record of their own without a turn (`shouldQuery: false`), named
+  after their OpenCode message, the last one with the turn; the turns another
+  model answered go as one such record, in OpenCode's own form for a
+  serialized part of a conversation (`<recent-context>` with `[User]:` and
+  `[Assistant]:` lines), with the assistant's replies as Claude's own. The
+  records go to Claude Code one at a time, each after it confirms the one
+  before (sent together, it joins them into one under the last one's name).
+  The next turn finds them all and reads them from the cache. Images and
+  documents in those turns reach Claude as themselves, not as
+  "[image/png omitted]".
 - **A chat turn reads OpenCode's message list**: the prompt, the turns the
   transcript missed, tool results, messages sent while a tool ran, the system
   prompt and the tools now come from the list OpenCode's `context` hook hands

@@ -9,6 +9,7 @@
  * read from its OpenAI body, put into the same form first (list-content.ts).
  */
 import { currentHost } from "./host.js";
+import { log } from "./log.js";
 import { ORIGINAL_ID_KEY } from "./names.js";
 
 /** A content part of a list message: `text`, `media`, `tool-call`, `tool-result`, `reasoning`. */
@@ -688,7 +689,7 @@ export function latestUserTurn(messages: readonly ConversationMessage[]): number
  * a `file://` image), says so instead of going silent; a truly empty
  * message yields "".
  */
-function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
+export function userMessagePrompt(content: unknown): string | AnthropicContentBlock[] {
   const blocks = contentHasAttachments(content)
     ? listContentToBlocks(content)
     : [];
@@ -898,9 +899,94 @@ function toolStepBlocks(
   return { blocks, userBlocks };
 }
 
+/** A line of a missed message's record, or the content blocks of a file it holds. */
+export type MissedLine = string | AnthropicContentBlock[];
+
+/**
+ * A message the transcript never saw, as the lines of its record: each part
+ * on a line of its own, labelled the way OpenCode labels messages when it
+ * turns them into text itself (compaction.ts `flattenMessage`), so Claude
+ * reads who said what without being told which model it was. The labels are
+ * OpenCode's, not ours: [User], [Assistant], [Assistant tool call],
+ * [Tool result], [Tool error], and [Attached <media type>: <name>] for a
+ * file. Unlike OpenCode, which turns them into text only when it compacts,
+ * nothing is cut: tool output goes whole, and an image or a document (the
+ * user's or one a tool returned) follows its label as itself, since the
+ * other model saw it (OpenCode's list always carries a file's data). Reasoning
+ * is left out, as OpenCode does.
+ */
+export function missedMessageContent(message: ConversationMessage): MissedLine[] {
+  if (message.role === "system") return [];
+  const speaker = message.role === "user" ? "User" : "Assistant";
+  const lines: MissedLine[] = [];
+  for (const part of message.content ?? []) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text") {
+      if (part.text) lines.push(`[${speaker}]: ${part.text}`);
+      continue;
+    }
+    if (part.type === "media") {
+      const media = part.media as { mediaType?: unknown; source?: { mediaType?: unknown } } | undefined;
+      const mediaType = String(media?.mediaType ?? media?.source?.mediaType ?? "file");
+      const blocks = listContentToBlocks([part]);
+      const name = typeof part.filename === "string" ? `: ${part.filename}` : "";
+      lines.push(`[${speaker}]: [Attached ${mediaType}${name}]`);
+      if (blocks.length > 0) lines.push(blocks);
+      continue;
+    }
+    if (part.type === "tool-call") {
+      lines.push(`[Assistant tool call]: ${part.name}(${JSON.stringify(part.input) ?? ""})`);
+      continue;
+    }
+    if (part.type === "tool-result") {
+      const result = part.result as { type?: unknown; value?: unknown } | undefined;
+      const failed = part.resultType === "error" || result?.type === "error";
+      lines.push(`[${failed ? "Tool error" : "Tool result"}]: ${toolResultLine(result)}`);
+      const files = toolResultToBlocks(part).filter((block) => block.type !== "text");
+      if (files.length > 0) lines.push(files);
+    }
+  }
+  return lines;
+}
+
+/** A tool result as OpenCode writes it in text: its texts, and a note per file (serializeToolContent). */
+function toolResultLine(result: { type?: unknown; value?: unknown } | undefined): string {
+  if (!result) return "";
+  if (result.type === "content" && Array.isArray(result.value)) {
+    return result.value
+      .map((item) => {
+        const i = item as { type?: unknown; text?: unknown; mime?: unknown; name?: unknown };
+        if (i?.type === "text") return String(i.text ?? "");
+        return `[Attached ${String(i?.mime ?? "file")}${typeof i?.name === "string" ? `: ${i.name}` : ""}]`;
+      })
+      .join("\n");
+  }
+  if (typeof result.value === "string") return result.value;
+  return JSON.stringify(result.value) ?? "";
+}
+
+/** A record of the prompt: its content, its uuid, and whether it starts the turn. */
+export function promptRecord(
+  content: string | AnthropicContentBlock[],
+  uuid: string | undefined,
+  noTurn: boolean,
+): SdkUserPrompt {
+  return {
+    type: "user",
+    message: { role: "user", content: typeof content === "string" ? content || " " : content },
+    parent_tool_use_id: null,
+    ...(uuid ? { uuid } : {}),
+    ...(noTurn ? { shouldQuery: false as const } : {}),
+  };
+}
+
 export async function* promptAsStream(
-  prompt: string | SdkUserPrompt,
+  prompt: string | SdkUserPrompt | SdkUserPrompt[],
 ): AsyncGenerator<SdkUserPrompt, void, unknown> {
+  if (Array.isArray(prompt)) {
+    yield* prompt;
+    return;
+  }
   if (typeof prompt === "string") {
     yield {
       type: "user",
@@ -910,79 +996,6 @@ export async function* promptAsStream(
     return;
   }
   yield prompt;
-}
-
-/**
- * Conversation-history transfer.
- *
- * The Agent SDK turn only receives the latest user turn; earlier context
- * comes from resuming the sticky Claude session. When no session can be
- * resumed (first claude-code turn after a model switch, lost store, deleted
- * session file), the proxy injects the serialized prior conversation instead
- * so Claude still sees the whole chat.
- */
-
-/**
- * The history as Claude gets it: text, or text with the images and
- * documents of the chat in their places. It goes whole: OpenCode already
- * fit the request to the model (and replaced old images over its budget),
- * and a history that still does not fit comes back as "Prompt is too long",
- * which OpenCode compacts on.
- */
-export type ConversationTranscript = string | AnthropicContentBlock[];
-
-/** A user message's attachment that could not be turned into a Claude block. */
-const UNRELAYABLE_ATTACHMENT = "[an attachment that could not be passed on]";
-
-/** One message of the history: its text lines, and its files as blocks where they stand. */
-type HistoryPiece = string | AnthropicContentBlock;
-
-function serializeHistoryMessage(msg: ConversationMessage): HistoryPiece[] | null {
-  if (!msg || typeof msg !== "object") return null;
-  const role = msg.role;
-  // System prompts are OpenCode-internal and huge; the Claude Code preset
-  // supplies the agent system prompt instead.
-  if (role === "system") return null;
-
-  if (role === "user") {
-    const text = extractTextContent(msg.content).trim();
-    const hasAttach = contentHasAttachments(msg.content);
-    if (!text && !hasAttach) return null;
-    if (!hasAttach) return [`User:\n${text}`];
-    const blocks = listContentToBlocks(msg.content);
-    const pieces: HistoryPiece[] = ["User:"];
-    for (const block of blocks) pieces.push(block.type === "text" ? block.text : block);
-    if (!blocks.some((block) => block.type !== "text")) pieces.push(UNRELAYABLE_ATTACHMENT);
-    return pieces;
-  }
-
-  if (role === "assistant") {
-    const parts: string[] = [];
-    const text = extractTextContent(msg.content).trim();
-    if (text) parts.push(text);
-    for (const call of partsOf(msg, "tool-call")) {
-      if (typeof call.name === "string" && call.name) parts.push(`[called tool: ${call.name}]`);
-    }
-    if (parts.length === 0) return null;
-    return [`Assistant:\n${parts.join("\n")}`];
-  }
-
-  if (role === "tool") {
-    // Each result with its own text, whole, and the files it returned: the
-    // list keeps them on the result they belong to.
-    const pieces: HistoryPiece[] = [];
-    for (const part of partsOf(msg, "tool-result")) {
-      const text = toolResultText(part.result).trim();
-      const files = toolResultToBlocks(part).filter((block) => block.type !== "text");
-      if (!text && files.length === 0) continue;
-      const label = (typeof part.name === "string" && part.name) || part.id || "tool";
-      // Results apart by a blank line, as messages are.
-      pieces.push(`${pieces.length > 0 ? "\n" : ""}Tool result (${label}):${text ? `\n${text}` : ""}`, ...files);
-    }
-    return pieces.length > 0 ? pieces : null;
-  }
-
-  return null;
 }
 
 /**
@@ -1001,140 +1014,6 @@ export function priorMessagesOf(messages: readonly ConversationMessage[]): Conve
     .slice(start + 1)
     .some((m) => m?.role === "assistant" || m?.role === "tool");
   return answeredAfter ? messages.slice() : messages.slice(0, start);
-}
-
-/**
- * Serialize prior conversation into a transcript, whole: messages apart by a
- * blank line, a message's lines by a newline, its files where they stand.
- * Text only while the history has no files.
- */
-export function buildConversationTranscript(
-  messages: readonly ConversationMessage[],
-): ConversationTranscript {
-  const blocks: AnthropicContentBlock[] = [];
-  let text = "";
-  // Whether the next line goes after a blank line (a new message) or a newline.
-  let separator = "";
-  messages.forEach((msg) => {
-    const pieces = serializeHistoryMessage(msg);
-    if (!pieces) return;
-    if (blocks.length > 0 || text) separator = "\n\n";
-    for (const piece of pieces) {
-      if (typeof piece === "string") {
-        text += separator + piece;
-        separator = "\n";
-        continue;
-      }
-      // No empty text block between two files: the API refuses one.
-      if (text + separator) blocks.push({ type: "text", text: text + separator });
-      blocks.push(piece);
-      text = "";
-      separator = "";
-    }
-  });
-  if (blocks.length === 0) return text;
-  if (text) blocks.push({ type: "text", text });
-  return blocks;
-}
-
-/** The text of a transcript, files left out: for the journal's length. */
-export function transcriptText(transcript: ConversationTranscript): string {
-  if (typeof transcript === "string") return transcript;
-  return transcript.map((block) => (block.type === "text" ? block.text : "")).join("");
-}
-
-/** How many images and documents a transcript carries. */
-export function transcriptFiles(transcript: ConversationTranscript): number {
-  return typeof transcript === "string" ? 0 : transcript.filter((block) => block.type !== "text").length;
-}
-
-function historyIntro(missed: boolean): string {
-  return missed
-    ? "These messages were added to this chat after your last turn, without you " +
-      "(for example, the user switched to another model for them). Treat them as part " +
-      "of the conversation — do not re-do completed work — and respond to the user's " +
-      "latest message, which follows them.\n\n"
-    : "The earlier conversation of this chat is included below because the previous " +
-      "Claude session could not be resumed. Treat it as established context — do not " +
-      "re-do completed work — and respond to the user's latest message, which follows " +
-      "the history.\n\n";
-}
-
-const HISTORY_END = "\n</conversation_history>\n\nLatest user message:\n";
-
-/**
- * withConversationContext for a history with files: one prompt of blocks,
- * the history's text and files in order, then the latest user message.
- */
-function withFilesInContext(
-  prompt: string | SdkUserPrompt,
-  transcript: AnthropicContentBlock[],
-  missed: boolean,
-): SdkUserPrompt {
-  let latest: AnthropicContentBlock[];
-  if (typeof prompt === "string") latest = [{ type: "text", text: prompt }];
-  else if (typeof prompt.message.content === "string") latest = [{ type: "text", text: prompt.message.content }];
-  else latest = prompt.message.content;
-  const content = joinTextBlocks([
-    { type: "text", text: "<conversation_history>\n" + historyIntro(missed) },
-    ...transcript,
-    { type: "text", text: HISTORY_END },
-    ...latest,
-  ]);
-  if (typeof prompt === "string") {
-    return { type: "user", message: { role: "user", content }, parent_tool_use_id: null };
-  }
-  return { ...prompt, message: { role: "user", content } };
-}
-
-/** Adjacent text blocks as one, so the text reads as it does in a text prompt. */
-function joinTextBlocks(blocks: AnthropicContentBlock[]): AnthropicContentBlock[] {
-  const joined: AnthropicContentBlock[] = [];
-  for (const block of blocks) {
-    const last = joined[joined.length - 1];
-    if (block.type === "text" && last?.type === "text") {
-      joined[joined.length - 1] = { type: "text", text: last.text + block.text };
-      continue;
-    }
-    joined.push(block);
-  }
-  return joined;
-}
-
-/**
- * Prepend a transferred-history block to a prompt. Text prompts get a plain
- * prefix; multimodal prompts get an extra leading text block so attachments
- * still reach Claude. A history with files makes one prompt of blocks.
- *
- * `missed` marks a transcript of only the turns a resumed session never saw
- * (another model answered them, or they failed before Claude ran).
- */
-export function withConversationContext(
-  prompt: string | SdkUserPrompt,
-  transcript: ConversationTranscript,
-  missed = false,
-): string | SdkUserPrompt {
-  if (typeof transcript !== "string") return withFilesInContext(prompt, transcript, missed);
-  const body = transcript.trim();
-  if (!body) return prompt;
-  const prefix =
-    "<conversation_history>\n" +
-    historyIntro(missed) +
-    body +
-    HISTORY_END;
-  if (typeof prompt === "string") {
-    return prefix + prompt;
-  }
-  const content = Array.isArray(prompt.message.content)
-    ? prompt.message.content
-    : [];
-  return {
-    ...prompt,
-    message: {
-      role: "user",
-      content: [{ type: "text", text: prefix }, ...content],
-    },
-  };
 }
 
 /** Put a text block ahead of the prompt, keeping any image/PDF blocks. */
@@ -1182,7 +1061,7 @@ export type TurnInput = {
 
 const TURN_INPUT_TAKE_MS = 2000;
 
-export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
+export function createTurnInput(first: string | SdkUserPrompt | SdkUserPrompt[]): TurnInput {
   type Entry = { prompt: SdkUserPrompt; taken: () => void };
   const queue: Entry[] = [];
   let wake: (() => void) | null = null;
@@ -1191,13 +1070,18 @@ export function createTurnInput(first: string | SdkUserPrompt): TurnInput {
     wake?.();
     wake = null;
   };
-  const firstPrompt: SdkUserPrompt =
-    typeof first === "string"
-      ? { type: "user", message: { role: "user", content: first }, parent_tool_use_id: null }
-      : first;
+  // The records the turn starts with: those without a turn first, then the
+  // one that starts it.
+  const firstPrompts: SdkUserPrompt[] = Array.isArray(first)
+    ? first
+    : [
+        typeof first === "string"
+          ? { type: "user", message: { role: "user", content: first }, parent_tool_use_id: null }
+          : first,
+      ];
   async function* stream(): AsyncGenerator<SdkUserPrompt, void, unknown> {
     try {
-      yield firstPrompt;
+      yield* firstPrompts;
       while (!done) {
         const entry = queue.shift();
         if (entry) {
@@ -1261,4 +1145,84 @@ export async function* withTranscriptStart(
 ): AsyncGenerator<SdkUserPrompt, void, unknown> {
   yield { type: "user", message: { role: "user", content: " " }, parent_tool_use_id: null, uuid, shouldQuery: false };
   yield* typeof prompt === "string" ? promptAsStream(prompt) : prompt;
+}
+
+/**
+ * How long a record without a turn waits for the CLI to confirm the one
+ * before it; then it goes anyway. The CLI confirms in about 10 ms (up to
+ * about 400 ms as it starts), and records sent 300 ms apart or more were
+ * never joined (Claude Code 2.1.311).
+ */
+const RECORD_WRITTEN_WAIT_MS = 1000;
+
+/** A turn's input that hands the CLI its records so that each keeps its name. */
+export type RecordsOneByOne = {
+  stream: AsyncGenerator<SdkUserPrompt, void, unknown>;
+  /**
+   * Every event of the turn's stream: an empty result (`num_turns: 0`)
+   * confirms the record without a turn named in its `user_message_uuid`.
+   */
+  observe(event: unknown): void;
+};
+
+/**
+ * Hand the CLI a turn's records so that each keeps its own name. The CLI
+ * takes everything waiting in its input at once and joins consecutive
+ * records without a turn (`shouldQuery: false`) into one record, under the
+ * last one's uuid: the names of the others are lost (how many it joins
+ * depends on timing; test/cli-contract-live.ts, check 5.1). It answers every
+ * record without a turn it wrote with an empty result that names the record
+ * (`user_message_uuid`), so a record without a turn that follows another
+ * goes only after the result naming that one. A record that starts a turn is
+ * never joined and does not wait; neither does a message sent mid-turn.
+ * Without the confirmation (the CLI dropped the record as a repeated uuid, or
+ * a CLI that no longer answers) the record goes after RECORD_WRITTEN_WAIT_MS;
+ * a lost name then costs only the cut between the joined records: the lookup
+ * by names goes back to the last one it finds (turn-point.ts planResume).
+ */
+export function recordsOneByOne(
+  prompt: AsyncIterable<SdkUserPrompt>,
+  waitMs = RECORD_WRITTEN_WAIT_MS,
+): RecordsOneByOne {
+  /** The records without a turn the CLI confirmed, by uuid. */
+  const written = new Set<string>();
+  let wake: (() => void) | null = null;
+  const confirmed = async (uuid: string) => {
+    const deadline = Date.now() + waitMs;
+    while (!written.has(uuid)) {
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        log.warn("[opencode-claude] Claude Code did not confirm a record without a turn; sending the next one", { waitMs });
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, left);
+        timer.unref?.();
+        wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      wake = null;
+    }
+  };
+  async function* stream(): AsyncGenerator<SdkUserPrompt, void, unknown> {
+    let previous: SdkUserPrompt | undefined;
+    for await (const record of prompt) {
+      if (record.shouldQuery === false && previous?.shouldQuery === false && previous.uuid) await confirmed(previous.uuid);
+      previous = record;
+      yield record;
+    }
+  }
+  return {
+    stream: stream(),
+    observe(event) {
+      // Claude Code (2.1.300 and later) names the record in every such
+      // result (the 2.1.300 probe).
+      const e = event as { type?: unknown; num_turns?: unknown; is_error?: unknown; user_message_uuid?: string } | null;
+      if (e?.type !== "result" || e.num_turns !== 0 || e.is_error === true) return;
+      written.add(e.user_message_uuid!);
+      wake?.();
+    },
+  };
 }
